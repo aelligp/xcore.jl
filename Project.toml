@@ -1,0 +1,37 @@
+name = "xcore"
+uuid = "5c0a4f12-7e2b-4a31-9d18-7a3c8b1f0e22"
+version = "0.1.0"
+authors = ["Pascal Aellig <paellig@uni-mainz.de>, Tobias Keller <Tobias.Keller@glasgow.ac.uk>"]
+
+[deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+
+[weakdeps]
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+
+[extensions]
+xcoreMakieExt = "Makie"
+
+[compat]
+CairoMakie = "0.15.10"
+Dates = "1.11.0"
+FFTW = "1.10.0"
+Makie = "0.21, 0.22, 0.23, 0.24"
+StatsBase = "0.34.10"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
