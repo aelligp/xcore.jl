@@ -206,7 +206,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
 
         time += dt
         verbose && print_step!(step, time, dt, phase, fluid, ns, scales; elapsed)
-        callback !== nothing && callback(step, time, dt, phase, fluid, ns)
+        callback !== nothing && callback(step, time, dt, phase, fluid, ns, a1, a2, a3, b1, b2, b3)
         dt = update_dt(phase, fluid, grid, par, dt)
     end
     return time, dt

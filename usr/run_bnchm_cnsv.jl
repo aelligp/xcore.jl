@@ -68,12 +68,10 @@ for atol in ATOL
     hst    = History(Float64)
     initialize!(phase, fluid, ns, grid, par, scales)
 
-    # 5*nop time steps, matching MATLAB Nt = 5*nop
-    Nt = 5 * par.nop
     run!(phase, fluid, ns, grid, par, scales;
-         nsteps   = Nt,
-         verbose  = false,
-         callback = (step, t, dt, ph, fl, ns_) -> record_history!(hst, t, dt, ph, fl, ns_, grid))
+         nsteps   = par.Nt,
+         verbose  = true,
+         callback = (step, t, dt, ph, fl, ns_, a1, a2, a3, b1, b2, b3) -> record_history!(hst, t, dt, ph, fl, ns_, grid, a1, a2, a3, b1, b2, b3))
 
     # rms of d|E|/dt over the second half of the run (matches bnchm_cnsv.m:58-60)
     rms(x) = sqrt(mean(abs2, x))

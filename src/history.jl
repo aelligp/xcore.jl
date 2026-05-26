@@ -25,6 +25,9 @@ mutable struct History{T<:AbstractFloat}
     sumB::Vector{T};  sumM::Vector{T};  sumX::Vector{T}
     EB::Vector{T};    EM::Vector{T};    EX::Vector{T}
 
+    # conservation error
+    DB::Vector{T};    DM::Vector{T};    DX::Vector{T}
+
     # crystallinity x: min, mean, max, std
     x_min::Vector{T};  x_mean::Vector{T};  x_max::Vector{T};  x_std::Vector{T}
 
@@ -69,6 +72,7 @@ function History(::Type{T}) where {T<:AbstractFloat}
     return History{T}(
         v(), v(),                          # time, dt
         v(), v(), v(), v(), v(), v(),      # sumB/M/X, EB/EM/EX
+        v(), v(), v(),                     # DB/DM/DX
         v(), v(), v(), v(),                # x stats
         v(), v(), v(),                     # V stats
         v(), v(), v(), v(), v(), v(),      # vx, vm stats
@@ -88,17 +92,19 @@ may be `nothing`; in that case noise speeds are recorded as zero.
 function record_history!(hst::History{T},
                          time::Real, dt::Real,
                          phase::PhaseState{T}, fluid::FluidState{T},
-                         ns::NoiseState{T}, grid::Grid{T}) where {T<:AbstractFloat}
+                         ns::NoiseState{T}, grid::Grid{T},
+                         a1::Real = T(1), a2::Real = T(1), a3::Real = T(0),
+                         b1::Real = T(1), b2::Real = T(0), b3::Real = T(0)) where {T<:AbstractFloat}
     h2 = grid.h^2
 
     push!(hst.time, T(time))
     push!(hst.dt,   T(dt))
 
     # --- conservation ---
-    sB = sum(fluid.rho) * h2
-    sM = sum(phase.M)   * h2
-    sX = sum(phase.X)   * h2
-    push!(hst.sumB, sB);  push!(hst.sumM, sM);  push!(hst.sumX, sX)
+    sumB = sum(fluid.rho) * h2 * eps(T)
+    sumM = sum(phase.M)   * h2 * eps(T)
+    sumX = sum(phase.X)   * h2 * eps(T)
+    push!(hst.sumB, sumB);  push!(hst.sumM, sumM);  push!(hst.sumX, sumX)
 
     sB0 = hst.sumB[1];  sM0 = hst.sumM[1];  sX0 = hst.sumX[1]
     push!(hst.EB, (sB - sB0) / (sB0 + eps(T)))
