@@ -15,7 +15,7 @@ using Statistics
 # volume fractions, bulk density, mass densities, phase indicators
 # ----------------------------------------------------------------------------
 
-@kernel function compute_volfrac_kernel!(rho, chi, mu, X, M, hasx, hasm,
+@kernel function compute_volfrac_kernel!(rho, chi, mu, hasx, hasm,
                                   @Const(x), @Const(m), rhom0, rhox0, eps_t, one_meps)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
@@ -28,9 +28,6 @@ using Statistics
         mu_raw  = m_c * rho_c / rhom0
         chi[iz, ix] = clamp(chi_raw, eps_t, one_meps)
         mu[iz,  ix] = clamp(mu_raw,  eps_t, one_meps)
-        # phase densities for advection
-        X[iz, ix] = rho_c * x_c
-        M[iz, ix] = rho_c * m_c
         # phase presence indicators (≥ √ε to match update.m)
         hasx[iz, ix] = x_c >= sqrt(eps_t)
         hasm[iz, ix] = m_c >= sqrt(eps_t)
@@ -40,14 +37,18 @@ end
 """
     update_volume_fractions!(phase, fluid, par) -> nothing
 
-Compute `chi`, `mu`, `rho`, `X`, `M`, `hasx`, `hasm` from primary `x`, `m`
-fields. Mirrors lines 5–35 of `src/update.m`.
+Compute `chi`, `mu`, `rho`, `hasx`, `hasm` from primary `x`, `m` fields.
+Mirrors lines 5–35 of `src/update.m`. **Does not touch `X` or `M`** —
+those are the advected phase densities, owned and updated by `phsevo!`.
+Recomputing them here breaks the Picard iteration's WENO5 reconstruction
+because it injects the new `rho` into the field WENO5 sees on the next
+sweep, producing spot-wise undershoots at sharp fronts.
 """
 function update_volume_fractions!(phase::PhaseState{T}, fluid::FluidState{T},
                                   par::Parameters{T}) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.x)
     compute_volfrac_kernel!(backend, (16, 16))(fluid.rho, phase.chi, phase.mu,
-                                        phase.X, phase.M, phase.hasx, phase.hasm,
+                                        phase.hasx, phase.hasm,
                                         phase.x, phase.m,
                                         par.rhom0, par.rhox0,
                                         eps(T), one(T) - eps(T);
@@ -282,10 +283,9 @@ end
 # diffusivities + viscosity blend  (update.m lines 106–134)
 # ----------------------------------------------------------------------------
 
-@kernel function compute_viscblend_kernel!(eta, etae, ke, kx, ReL_arr, fReL_arr, ReD,
+@kernel function compute_viscblend_kernel!(etai_out, etae, ke, kx, ReL_arr, fReL_arr,
                                     @Const(etamix), @Const(eII), @Const(rho), @Const(V),
-                                    @Const(eta_prev),
-                                    L0, D0, etacntr_inv_floor, blend_w)
+                                    L0)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
         eII_c = eII[iz, ix]
@@ -296,21 +296,14 @@ end
         ReL_c = V[iz, ix] * L0 / (etamix[iz, ix] / rho_c)
         fReL_c = one(L0) - exp(-ReL_c)
         etae_c = fReL_c * ke_c * rho_c
-        # effective viscosity with eddy regularisation; kx falls back to ke
-        # until particle diffusivity ks lands with segregation
-        etai = etamix[iz, ix] + etae_c
-        # contrast limit: 1/eta_eff = 1/etamax + 1/etai, etamax = min_etai * cntr
-        # We can't reduce here, so apply a per-cell soft floor consistent with
-        # MATLAB's update.m: etai itself is already bounded below by etamix.
-        eta_new = etai
-        # Picard-style relaxation against the previous iterate
-        eta[iz, ix] = blend_w * eta_new + (one(L0) - blend_w) * eta_prev[iz, ix]
+        # effective viscosity with eddy regularisation; cap + Picard blend are
+        # applied host-side after a global min(etai) reduction (update.m:118-126)
+        etai_out[iz, ix] = etamix[iz, ix] + etae_c
         etae[iz, ix] = etae_c
         ke[iz, ix]   = ke_c
         kx[iz, ix]   = ke_c                # ks=0 placeholder until segregation lands
         ReL_arr[iz, ix] = ReL_c
         fReL_arr[iz, ix] = fReL_c
-        ReD[iz, ix] = V[iz, ix] * D0 / (eta[iz, ix] / rho_c)
     end
 end
 
@@ -325,27 +318,34 @@ function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
                            grid::Grid{T}, par::Parameters{T},
                            scales::Scales{T}) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.etamix)
-    # copy current eta as the "previous" iterate
+    # copy current eta as the "previous" iterate, write uncapped etai into fluid.eta
     eta_prev = copy(fluid.eta)
     compute_viscblend_kernel!(backend, (16, 16))(fluid.eta, phase.etae, phase.ke, phase.kx,
-                                          phase.ReL, phase.fReL, phase.ReD,
+                                          phase.ReL, phase.fReL,
                                           phase.etamix, phase.eII, fluid.rho, phase.V,
-                                          eta_prev,
-                                          scales.L0, scales.D0,
-                                          T(1) / par.etacntr, T(0.5);
+                                          scales.L0;
                                           ndrange = size(fluid.eta))
     KernelAbstractions.synchronize(backend)
+
+    # global contrast cap: etamax = min(etai) * etacntr, then harmonic-blend (update.m:118-120)
+    emax = minimum(fluid.eta) * T(par.etacntr)
+    @. fluid.eta = T(1) / (T(1) / emax + T(1) / fluid.eta)
+    # Picard relaxation against the previous iterate (update.m:126)
+    blend_w = T(0.5)
+    @. fluid.eta = blend_w * fluid.eta + (T(1) - blend_w) * eta_prev
+    # ReD uses the capped+blended eta
+    @. phase.ReD = phase.V * scales.D0 / (fluid.eta / fluid.rho)
+
     # corner-interpolated etaco from the geometric mean over 4 surrounding cells
     # (matches update.m line 130). Mirror-pad in z for closed BC; periodic in x.
     compute_corner_eta!(fluid.etaco, fluid.eta; xBC = :periodic, zBC = :closed)
     return nothing
 end
 
-@kernel function compute_segvisc_kernel!(Rel, fRel, ks, etat, etas, kx, Red, Rc,
+@kernel function compute_segvisc_kernel!(Rel, fRel, ks, etat, etasi_out, kx, Rc,
                                           @Const(vx), @Const(V), @Const(etamix),
                                           @Const(rho), @Const(ke), @Const(fReL),
-                                          @Const(etas_prev),
-                                          l0, d0, blend_w, eps_t)
+                                          l0, eps_t)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
         vx_c     = vx[iz, ix]
@@ -358,15 +358,13 @@ end
         ks_c   = vx_c * l0
         # turbulent drag viscosity contribution
         etat_c = fRel_c * ks_c * rho_c
-        # Picard blend of (etamix + etat) against previous etas
-        etas[iz, ix] = blend_w * (etamix_c + etat_c) +
-                        (one(l0) - blend_w) * etas_prev[iz, ix]
+        # uncapped etasi = etamix + etat; cap + Picard blend done host-side
+        etasi_out[iz, ix] = etamix_c + etat_c
         Rel[iz,  ix] = Rel_c
         fRel[iz, ix] = fRel_c
         ks[iz,   ix] = ks_c
         etat[iz, ix] = etat_c
         kx[iz,   ix] = ks_c + fReL[iz, ix] * ke[iz, ix]
-        Red[iz,  ix] = vx_c * d0 / (etas[iz, ix] / rho_c)
         Rc[iz,   ix] = V[iz, ix] / max(vx_c, eps_t)
     end
 end
@@ -384,15 +382,25 @@ function update_segregation_viscosity!(phase::PhaseState{T}, fluid::FluidState{T
                                        zBC::Symbol = :closed) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.etas)
     etas_prev = copy(phase.etas)
+    # kernel writes uncapped etasi into phase.etas
     compute_segvisc_kernel!(backend, (16, 16))(phase.Rel, phase.fRel, phase.ks,
                                                phase.etat, phase.etas,
-                                               phase.kx, phase.Red, phase.Rc,
+                                               phase.kx, phase.Rc,
                                                phase.vx, phase.V, phase.etamix,
                                                fluid.rho, phase.ke, phase.fReL,
-                                               etas_prev,
-                                               scales.l0, par.d0, T(0.5), eps(T);
+                                               scales.l0, eps(T);
                                                ndrange = size(phase.etas))
     KernelAbstractions.synchronize(backend)
+
+    # global contrast cap: etamax = min(etasi) * etacntr (update.m:122-123)
+    emax = minimum(phase.etas) * T(par.etacntr)
+    @. phase.etas = T(1) / (T(1) / emax + T(1) / phase.etas)
+    # Picard relaxation against previous etas (update.m:127)
+    blend_w = T(0.5)
+    @. phase.etas = blend_w * phase.etas + (T(1) - blend_w) * etas_prev
+    # Red uses the capped+blended etas
+    @. phase.Red = phase.vx * par.d0 / (phase.etas / fluid.rho)
+
     # etasw: geometric mean of etas across z-faces, (Nz+1, Nx).
     Nz = size(phase.etas, 1)
     icz = zBC === :periodic ? [Nz; collect(1:Nz); 1] : [1; collect(1:Nz); Nz]
@@ -474,15 +482,22 @@ end
 """
     update_dt(phase, fluid, grid, par, dt_prev; dtmax = par.dtmax) -> T
 
-CFL-limited time step from the current `kx` and `(W, U)` magnitudes.
-Matches `update.m` lines 160–164. Until particle settling lands, segregation
-speeds are zero so the advective bound uses only `(W, U)`.
+CFL-limited time step from the current `kx` and the **phase** velocities
+`(Wx, Wm, Ux, Um)`. Matches `update.m` line 162 exactly:
+`dta = h/2 / max(abs([Um(:); Wm(:); Ux(:); Wx(:)]))`.
+
+Using bulk `(W, U)` here would underestimate the advective speed of `X`/`M`
+whenever segregation (`wx`, `wm`) or noise (`ξ`) is non-negligible — the
+result was CFL violations at sharp crystallization fronts, manifesting as
+isolated cells whose `X` overshoots below the eps clamp.
 """
 function update_dt(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
                    par::Parameters{T}, dt_prev::Real) where {T<:AbstractFloat}
     h = grid.h
     dtk = (h / T(2))^2 / maximum(phase.kx)
-    dta = (h / T(2)) / (maximum(abs.(fluid.W)) + maximum(abs.(fluid.U)) + eps(T))
+    vmax = max(maximum(abs, phase.Wx), maximum(abs, phase.Wm),
+               maximum(abs, phase.Ux), maximum(abs, phase.Um)) + eps(T)
+    dta = (h / T(2)) / vmax
     return min(T(1.5) * T(dt_prev), min(dtk, par.CFL * dta), par.dtmax)
 end
 

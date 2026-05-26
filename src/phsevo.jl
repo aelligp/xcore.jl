@@ -23,13 +23,38 @@ function advect_centered!(adv::AbstractMatrix{T}, f::AbstractMatrix{T},
                           h::Real, scheme::Symbol;
                           xBC::Symbol = :periodic,
                           zBC::Symbol = :closed) where {T<:AbstractFloat}
-    halo = scheme === :centr ? 1 : scheme === :weno5 ? 3 :
-        throw(ArgumentError("advect_centered!: unsupported scheme :$scheme"))
+    halo = scheme_halo(scheme)
     f_halo = similar(f, size(f, 1) + 2halo, size(f, 2) + 2halo)
     fill!(f_halo, zero(T))
     embed_interior!(f_halo, f, halo)
     fill_ghosts!(f_halo, halo; xBC, zBC)
-    advect!(adv, f_halo, u, w, h, scheme)
+
+    # TVD needs one extra face on each side of u and w. Build padded velocity
+    # buffers with periodic-x / repeat-z BCs (matching the f_halo fill above).
+    if scheme === :tvdim
+        Nz, Nx = size(adv)
+        u_pad = similar(u, Nz, Nx + 3)
+        w_pad = similar(w, Nz + 3, Nx)
+        @views u_pad[:, 2:Nx+2] .= u
+        @views w_pad[2:Nz+2, :] .= w
+        if xBC === :periodic
+            @views u_pad[:, 1]    .= u[:, Nx]     # face 0 ↔ face Nx (periodic wrap)
+            @views u_pad[:, Nx+3] .= u[:, 2]      # face Nx+2 ↔ face 2
+        else
+            @views u_pad[:, 1]    .= u[:, 1]
+            @views u_pad[:, Nx+3] .= u[:, Nx+1]
+        end
+        if zBC === :periodic
+            @views w_pad[1,    :] .= w[Nz, :]
+            @views w_pad[Nz+3, :] .= w[2,  :]
+        else
+            @views w_pad[1,    :] .= w[1,    :]
+            @views w_pad[Nz+3, :] .= w[Nz+1, :]
+        end
+        advect!(adv, f_halo, u_pad, w_pad, h, scheme)
+    else
+        advect!(adv, f_halo, u, w, h, scheme)
+    end
     return adv
 end
 

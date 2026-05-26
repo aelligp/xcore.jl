@@ -24,6 +24,7 @@ include("phsevo.jl")
 include("history.jl")
 include("diagnose.jl")
 include("output.jl")
+include("restart.jl")
 include("run.jl")
 include("plotting.jl")
 
@@ -46,5 +47,6 @@ export StepResidual, snapshot!, compute_resnorm, report_iter, print_step!
 export plot_fluid, plot_phase, plot_diffuse, plot_dimensionless, plot_profiles,
        plot_history, save_output
 export plot_state, plot_mms_comparison
+export save_checkpoint, load_checkpoint!, restart_path, resolve_restart
 
 end # module xcore

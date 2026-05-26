@@ -68,7 +68,16 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
                      xBC::Symbol = :periodic,
                      zBC::Symbol = :closed) where {T<:AbstractFloat}
     Nz = grid.Nz;  Nx = grid.Nx
-    # Gaussian + random perturbation (init.m: x = xin * (1 + dxr*rp + dxg*gp))
+
+    # boundary taper for segregation speed (closed top/bot by default)
+    compute_bndtaperw!(phase, grid, par, scales)
+    # top-localised reaction shape for Gx = G0·(1-x)·bndshape — needed below
+    # to build the boundary-modulated base crystallinity `xin`
+    compute_bndshape!(phase, grid, scales)
+
+    # Gaussian + random perturbation (init.m:157-159):
+    #   xin = x0 + (Da - x0) * bndshape
+    #   x   = xin * (1 + dxr * rp + dxg * gp)
     rng_seed = par.seed
     rp = randn(MersenneTwister(rng_seed), T, Nz, Nx)
     rp .= (rp .- sum(rp) / length(rp)) ./ std(rp)
@@ -77,7 +86,8 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
         zc = (T(j) - T(0.5)) * grid.h / grid.D
         gp = exp(-((xc - T(0.5)) / T(0.125))^2) *
              exp(-((zc - T(0.5)) / T(0.125))^2)
-        phase.x[j, i] = max(par.x0, par.x0 * (one(T) + par.dxr * rp[j, i] + par.dxg * gp))
+        xin = par.x0 + (par.Da - par.x0) * phase.bndshape[j, i]
+        phase.x[j, i] = xin * (one(T) + par.dxr * rp[j, i] + par.dxg * gp)
     end
     phase.m .= one(T) .- phase.x
 
@@ -87,12 +97,11 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
     fill!(fluid.etaco, par.etam0)
     fill!(phase.etas,  par.etam0)
 
-    # boundary taper for segregation speed (closed top/bot by default)
-    compute_bndtaperw!(phase, grid, par, scales)
-    # top-localised reaction shape for Gx = G0·(1-x)·bndshape
-    compute_bndshape!(phase, grid, scales)
-
     update!(phase, fluid, grid, par, scales; xBC, zBC)
+    # seed phase densities X = rho·x, M = rho·m once (init.m:198-199). From
+    # here on `X`, `M` are owned by phsevo! — update! only refreshes rho/chi/mu.
+    @. phase.X = fluid.rho * phase.x
+    @. phase.M = fluid.rho * phase.m
     noise!(ns, phase, grid, par, scales, scales.dt0; first_iter=true)
     update_phase_velocities!(phase, fluid, ns, grid, par; xBC, zBC)
 
@@ -145,7 +154,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
     println("****************************************************************\n")
     println("********** RUN XCORE.jl MODEL | $(now()) ********\n")
     println("****************************************************************\n")
-    println("\n run ID: %s\n", par.runID)
+    println("\n run ID: $(par.runID) \n")
 
     time = T(0)
     dt   = T(dt)
@@ -180,6 +189,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                 # noise + phase velocities before update! — mirrors MATLAB main.m:
                 # fluidmech sets wx/wm/Wx/Ux/Wm/Um, THEN update uses them
                 # (update.m lines 26-29, 73-104 require current Wx/Wm)
+
                 noise!(ns, phase, grid, par, scales, dt; first_iter = (iter ≤ 1))
                 update_phase_velocities!(phase, fluid, ns, grid, par; xBC, zBC)
                 update!(phase, fluid, grid, par, scales; xBC, zBC)

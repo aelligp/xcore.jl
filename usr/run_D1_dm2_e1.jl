@@ -10,25 +10,20 @@ using KernelAbstractions: CPU
 # ---------------------------------------------------------------------------
 
 par = Parameters(Float64;
-    runID   = "D1_dm2_e1_N100_julia",
+    runID   = "D1_dm2_e1_N50",
     outdir  = joinpath(@__DIR__, "..", "out"),
     save_op = true,
     nop     = 10,          # save figures every nop steps
     nrh     = 1,            # record history every step
+    restart = 0,            # set to frame number to restart from a specific checkpoint; -1 for most recent
 
     # domain
     D  = 1e1,
-    N  = 100,
+    N  = 50,
     L  = 1e1 * 1.5,         # 1.5 × D
 
     # timing
     t0end = 2.0,            # stop at 2 dimensionless time units
-
-    # initial crystallinity
-    x0  = 0.05,
-    dxr = 0.3,              # random perturbation amplitude
-    dxg = 0.5,              # gaussian blob amplitude
-    seed = 15,
 
     # physics
     d0    = 1e-2,
@@ -40,7 +35,7 @@ par = Parameters(Float64;
 
     # numerics
     CFL   = 0.5,
-    rtol  = 1e-4,
+    rtol  = 1e-6,
     atol  = 1e-9,
     maxit = 15,
     alpha = 0.9,
@@ -75,9 +70,15 @@ function output_callback(step, time, dt, phase, fluid, ns)
     if par.save_op && step % par.nop == 0
         frame = step ÷ par.nop
         save_output(phase, fluid, ns, hst, grid, par, scales, time;
-                    outdir = par.outdir, runID = par.runID, frame)
+                    outdir = par.outdir, runID = par.runID,
+                    frame, dt, step)   # dt + step go into the JLD2 checkpoint
     end
 end
+
+# To restart from the most recent checkpoint, uncomment:
+# load_checkpoint!(restart_path(par.outdir, par.runID; frame = -1),
+#                  phase, fluid, ns, hst)
+# Or from a specific frame:  ...; frame = 12), phase, fluid, ns, hst)
 
 # ---------------------------------------------------------------------------
 # Run

@@ -68,7 +68,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     # Mirrors fluidmech.m lines 9-23. `phase.advn_rho` is produced by phsevo!
     # one or more Picard iterations earlier; we accumulate a correction into
     # MFS so the divergence equation enforces ∂_t ρ = -∇·(ρ v).
-    if !bnchm && phase !== nothing
+    if !bnchm
         rhoo   = Array(state.rhoo);   rhooo  = Array(state.rhooo)
         drhodt = Array(state.drhodt); drhodto = Array(state.drhodto); drhodtoo = Array(state.drhodtoo)
         advn_rho = Array(phase.advn_rho)
@@ -80,7 +80,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         state.drhodt .= drhodt
         state.MFS    .= MFS
     end
-    mean_MFS = (bnchm || phase === nothing) ? T(0) : T(mean(MFS))
+    MFSmean = T(mean(MFS))
 
 
     # ghost-index arrays — periodic-x always; periodic-z when `bnchm` (per
@@ -138,10 +138,10 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIL, ii); append!(JJL, jj2); append!(AAL, -oc .* rho2 .* invh)
         append!(IIL, ii); append!(JJL, jj3); append!(AAL,  oc .* rho3 .* invh)
         append!(IIL, ii); append!(JJL, jj4); append!(AAL, -oc .* rho4 .* invh)
-        # MFBG = mean_MFS · ZZw — for the closed-bottom case enters here as
-        # mean_MFS · D / h (constant in x). In MMS mean_MFS = 0 so this term
+        # MFBG = MFSmean · ZZw — for the closed-bottom case enters here as
+        # MFSmean · D / h (constant in x). In MMS MFSmean = 0 so this term
         # vanishes; in production it carries the depth-integrated divergence.
-        mfbg_bot = mean_MFS * grid.D / h
+        mfbg_bot = MFSmean * grid.D / h
         aa_bot = oc .* vec(MFS[end, :]) .+ (T(1) - oc) * mfbg_bot
         append!(IIR, ii); append!(AAR, aa_bot)
     end
@@ -268,6 +268,10 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         f_mx    = rhou .* U[2:end-1, :]
         advn_mx = similar(f_mx)
         advect_centered!(advn_mx, f_mx, u_mx, w_mx, h, par.ADVN; xBC, zBC)
+        # average the periodic-equivalent boundary columns (fluidmech.m:164)
+        col_avg = (advn_mx[:, 1] .+ advn_mx[:, end]) ./ T(2)
+        advn_mx[:, 1]   .= col_avg
+        advn_mx[:, end] .= col_avg
         rr = (a2 .* rhoUo .+ a3 .* rhoUoo) ./ T(dt) .- advn_mx
         if bnchm
             rr .+= bnchm_data.src_U[2:end-1, :]
