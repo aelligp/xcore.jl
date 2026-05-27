@@ -423,3 +423,376 @@ function advect!(adv::AbstractMatrix, f_halo::AbstractMatrix,
     KernelAbstractions.synchronize(backend)
     return adv
 end
+
+# ============================================================================
+# Per-face flux kernels — write face-centred fluxes using the same algebraic
+# formula as the divergence kernels above, evaluated once per face. The
+# discrete divergence in `_advect_*_kernel!` IS the divergence of these fluxes
+# (every face value matches bitwise), so mass conservation holds exactly when
+# the same f_halo and face velocities are used.
+#
+# Sizing:
+#   qx_int  (Nz,   Nx+1)   — x-face fluxes at face ix ∈ 1..Nx+1
+#   qz_int  (Nz+1, Nx  )   — z-face fluxes at face iz ∈ 1..Nz+1
+#
+# These are the interior face-flux buffers. `advect_with_flux!` pads them out
+# to MATLAB's (Nz+2, Nx+1) / (Nz+1, Nx+2) layout per `src/advect.m:144-161`.
+# ============================================================================
+
+# -------------------- centred ----------------------------------------------
+
+@kernel function _flux_centr_x_kernel!(qx_int, @Const(f), @Const(u), halo, half)
+    iz, ix = @index(Global, NTuple)
+    j = iz + halo
+    @inbounds begin
+        fL = f[j, ix + halo - 1]
+        fR = f[j, ix + halo    ]
+        qx_int[iz, ix] = u[iz, ix] * (fL + fR) * half
+    end
+end
+
+@kernel function _flux_centr_z_kernel!(qz_int, @Const(f), @Const(w), halo, half)
+    iz, ix = @index(Global, NTuple)
+    i = ix + halo
+    @inbounds begin
+        fT = f[iz + halo - 1, i]
+        fB = f[iz + halo,     i]
+        qz_int[iz, ix] = w[iz, ix] * (fT + fB) * half
+    end
+end
+
+# -------------------- upwind 1 --------------------------------------------
+
+@kernel function _flux_upwd1_x_kernel!(qx_int, @Const(f), @Const(u), halo, half)
+    iz, ix = @index(Global, NTuple)
+    j = iz + halo
+    @inbounds begin
+        fL = f[j, ix + halo - 1]
+        fR = f[j, ix + halo    ]
+        uv = u[iz, ix]
+        upos = (uv + abs(uv)) * half;  uneg = (uv - abs(uv)) * half
+        qx_int[iz, ix] = upos * fL + uneg * fR
+    end
+end
+
+@kernel function _flux_upwd1_z_kernel!(qz_int, @Const(f), @Const(w), halo, half)
+    iz, ix = @index(Global, NTuple)
+    i = ix + halo
+    @inbounds begin
+        fT = f[iz + halo - 1, i]
+        fB = f[iz + halo,     i]
+        wv = w[iz, ix]
+        wpos = (wv + abs(wv)) * half;  wneg = (wv - abs(wv)) * half
+        qz_int[iz, ix] = wpos * fT + wneg * fB
+    end
+end
+
+# -------------------- QUICK -----------------------------------------------
+# At face ix (between cells ix-1 and ix), in face-centred naming:
+#   fmm = f[ix-2], fm = f[ix-1] (left cell), fc = f[ix] (right cell), fp = f[ix+1]
+#   fppos = (2*fc + 5*fm - fmm)/6      (left-biased — for +flux)
+#   fpneg = (2*fm + 5*fc - fp )/6      (right-biased — for -flux)
+
+@kernel function _flux_quick_x_kernel!(qx_int, @Const(f), @Const(u), halo, half, sixth)
+    iz, ix = @index(Global, NTuple)
+    j = iz + halo
+    @inbounds begin
+        fmm = f[j, ix + halo - 2]
+        fm  = f[j, ix + halo - 1]
+        fc  = f[j, ix + halo    ]
+        fp  = f[j, ix + halo + 1]
+        fppos = sixth * (2 * fc + 5 * fm - fmm)
+        fpneg = sixth * (2 * fm + 5 * fc - fp )
+        uv = u[iz, ix]
+        upos = (uv + abs(uv)) * half;  uneg = (uv - abs(uv)) * half
+        qx_int[iz, ix] = upos * fppos + uneg * fpneg
+    end
+end
+
+@kernel function _flux_quick_z_kernel!(qz_int, @Const(f), @Const(w), halo, half, sixth)
+    iz, ix = @index(Global, NTuple)
+    i = ix + halo
+    @inbounds begin
+        fmm = f[iz + halo - 2, i]
+        fm  = f[iz + halo - 1, i]
+        fc  = f[iz + halo,     i]
+        fp  = f[iz + halo + 1, i]
+        fppos = sixth * (2 * fc + 5 * fm - fmm)
+        fpneg = sixth * (2 * fm + 5 * fc - fp )
+        wv = w[iz, ix]
+        wpos = (wv + abs(wv)) * half;  wneg = (wv - abs(wv)) * half
+        qz_int[iz, ix] = wpos * fppos + wneg * fpneg
+    end
+end
+
+# -------------------- Fromm -----------------------------------------------
+# fppos = fm + (fc - fmm)/4    fpneg = fc + (fm - fp)/4
+
+@kernel function _flux_fromm_x_kernel!(qx_int, @Const(f), @Const(u), halo, half, quarter)
+    iz, ix = @index(Global, NTuple)
+    j = iz + halo
+    @inbounds begin
+        fmm = f[j, ix + halo - 2]
+        fm  = f[j, ix + halo - 1]
+        fc  = f[j, ix + halo    ]
+        fp  = f[j, ix + halo + 1]
+        fppos = fm + quarter * (fc - fmm)
+        fpneg = fc + quarter * (fm - fp )
+        uv = u[iz, ix]
+        upos = (uv + abs(uv)) * half;  uneg = (uv - abs(uv)) * half
+        qx_int[iz, ix] = upos * fppos + uneg * fpneg
+    end
+end
+
+@kernel function _flux_fromm_z_kernel!(qz_int, @Const(f), @Const(w), halo, half, quarter)
+    iz, ix = @index(Global, NTuple)
+    i = ix + halo
+    @inbounds begin
+        fmm = f[iz + halo - 2, i]
+        fm  = f[iz + halo - 1, i]
+        fc  = f[iz + halo,     i]
+        fp  = f[iz + halo + 1, i]
+        fppos = fm + quarter * (fc - fmm)
+        fpneg = fc + quarter * (fm - fp )
+        wv = w[iz, ix]
+        wpos = (wv + abs(wv)) * half;  wneg = (wv - abs(wv)) * half
+        qz_int[iz, ix] = wpos * fppos + wneg * fpneg
+    end
+end
+
+# -------------------- WENO3 -----------------------------------------------
+# fppos = weno3_poly(fmm, fm, fc)    fpneg = weno3_poly(fp, fc, fm)
+
+@kernel function _flux_weno3_x_kernel!(qx_int, @Const(f), @Const(u), halo, half, eps_val)
+    iz, ix = @index(Global, NTuple)
+    j = iz + halo
+    @inbounds begin
+        fmm = f[j, ix + halo - 2]
+        fm  = f[j, ix + halo - 1]
+        fc  = f[j, ix + halo    ]
+        fp  = f[j, ix + halo + 1]
+        fppos = _weno3_poly(fmm, fm, fc, eps_val)
+        fpneg = _weno3_poly(fp,  fc, fm, eps_val)
+        uv = u[iz, ix]
+        upos = (uv + abs(uv)) * half;  uneg = (uv - abs(uv)) * half
+        qx_int[iz, ix] = upos * fppos + uneg * fpneg
+    end
+end
+
+@kernel function _flux_weno3_z_kernel!(qz_int, @Const(f), @Const(w), halo, half, eps_val)
+    iz, ix = @index(Global, NTuple)
+    i = ix + halo
+    @inbounds begin
+        fmm = f[iz + halo - 2, i]
+        fm  = f[iz + halo - 1, i]
+        fc  = f[iz + halo,     i]
+        fp  = f[iz + halo + 1, i]
+        fppos = _weno3_poly(fmm, fm, fc, eps_val)
+        fpneg = _weno3_poly(fp,  fc, fm, eps_val)
+        wv = w[iz, ix]
+        wpos = (wv + abs(wv)) * half;  wneg = (wv - abs(wv)) * half
+        qz_int[iz, ix] = wpos * fppos + wneg * fpneg
+    end
+end
+
+# -------------------- WENO5 -----------------------------------------------
+# At face ix: cells used are (ix-3, ix-2, ix-1, ix, ix+1, ix+2)
+#   fppos = weno5(f[ix-3], f[ix-2], f[ix-1], f[ix], f[ix+1])     (left-biased)
+#   fpneg = weno5(f[ix+2], f[ix+1], f[ix], f[ix-1], f[ix-2])     (right-biased)
+
+@kernel function _flux_weno5_x_kernel!(qx_int, @Const(f), @Const(u), halo, half, eps_val)
+    iz, ix = @index(Global, NTuple)
+    j = iz + halo
+    @inbounds begin
+        f0 = f[j, ix + halo - 3]
+        f1 = f[j, ix + halo - 2]
+        f2 = f[j, ix + halo - 1]
+        f3 = f[j, ix + halo    ]
+        f4 = f[j, ix + halo + 1]
+        f5 = f[j, ix + halo + 2]
+        fppos = _weno5_poly(f0, f1, f2, f3, f4, eps_val)
+        fpneg = _weno5_poly(f5, f4, f3, f2, f1, eps_val)
+        uv = u[iz, ix]
+        upos = (uv + abs(uv)) * half;  uneg = (uv - abs(uv)) * half
+        qx_int[iz, ix] = upos * fppos + uneg * fpneg
+    end
+end
+
+@kernel function _flux_weno5_z_kernel!(qz_int, @Const(f), @Const(w), halo, half, eps_val)
+    iz, ix = @index(Global, NTuple)
+    i = ix + halo
+    @inbounds begin
+        f0 = f[iz + halo - 3, i]
+        f1 = f[iz + halo - 2, i]
+        f2 = f[iz + halo - 1, i]
+        f3 = f[iz + halo,     i]
+        f4 = f[iz + halo + 1, i]
+        f5 = f[iz + halo + 2, i]
+        fppos = _weno5_poly(f0, f1, f2, f3, f4, eps_val)
+        fpneg = _weno5_poly(f5, f4, f3, f2, f1, eps_val)
+        wv = w[iz, ix]
+        wpos = (wv + abs(wv)) * half;  wneg = (wv - abs(wv)) * half
+        qz_int[iz, ix] = wpos * fppos + wneg * fpneg
+    end
+end
+
+# -------------------- TVD (superbee) --------------------------------------
+# Needs velocity halo: u_h sized (Nz, Nx+3), w_h sized (Nz+3, Nx).
+# u_h[iz, k+1] = u[iz, k] for k=1..Nx+1.
+#
+# At face ix (between cells ix-1 and ix) in face naming:
+#   fppos = _tvd_flux(fmm=f[ix-2], fm=f[ix-1], fc=f[ix],    vm=upos[face ix-1], vp=upos[face ix])
+#   fpneg = _tvd_flux(fmm=f[ix+1], fm=f[ix],   fc=f[ix-1],  vm=uneg[face ix+1], vp=uneg[face ix])
+# In u_h indices: face ix-1 → u_h[iz, ix], face ix → u_h[iz, ix+1], face ix+1 → u_h[iz, ix+2].
+
+@kernel function _flux_tvdim_x_kernel!(qx_int, @Const(f), @Const(u_h), halo, half)
+    iz, ix = @index(Global, NTuple)
+    j = iz + halo
+    @inbounds begin
+        fmm_p = f[j, ix + halo - 2]    # for fppos
+        fm_p  = f[j, ix + halo - 1]
+        fc_p  = f[j, ix + halo    ]
+        # for fpneg: stencil starts at f[ix+1] going toward f[ix-1]
+        fmm_n = f[j, ix + halo + 1]
+        fm_n  = f[j, ix + halo    ]
+        fc_n  = f[j, ix + halo - 1]
+
+        ul = u_h[iz, ix    ]    # face ix-1
+        uc = u_h[iz, ix + 1]    # face ix
+        ur = u_h[iz, ix + 2]    # face ix+1
+        ulpos = (ul + abs(ul)) * half
+        ucpos = (uc + abs(uc)) * half;  ucneg = (uc - abs(uc)) * half
+        urneg = (ur - abs(ur)) * half
+
+        fppos = _tvd_flux(fmm_p, fm_p, fc_p, ulpos, ucpos)
+        fpneg = _tvd_flux(fmm_n, fm_n, fc_n, urneg, ucneg)
+        qx_int[iz, ix] = ucpos * fppos + ucneg * fpneg
+    end
+end
+
+@kernel function _flux_tvdim_z_kernel!(qz_int, @Const(f), @Const(w_h), halo, half)
+    iz, ix = @index(Global, NTuple)
+    i = ix + halo
+    @inbounds begin
+        fmm_p = f[iz + halo - 2, i]
+        fm_p  = f[iz + halo - 1, i]
+        fc_p  = f[iz + halo,     i]
+        fmm_n = f[iz + halo + 1, i]
+        fm_n  = f[iz + halo,     i]
+        fc_n  = f[iz + halo - 1, i]
+
+        wt = w_h[iz,     ix]
+        wc = w_h[iz + 1, ix]
+        wb = w_h[iz + 2, ix]
+        wtpos = (wt + abs(wt)) * half
+        wcpos = (wc + abs(wc)) * half;  wcneg = (wc - abs(wc)) * half
+        wbneg = (wb - abs(wb)) * half
+
+        fppos = _tvd_flux(fmm_p, fm_p, fc_p, wtpos, wcpos)
+        fpneg = _tvd_flux(fmm_n, fm_n, fc_n, wbneg, wcneg)
+        qz_int[iz, ix] = wcpos * fppos + wcneg * fpneg
+    end
+end
+
+# ----------------------------------------------------------------------------
+# advect_with_flux! — writes adv AND the face-flux arrays qx/qz in
+# MATLAB sizing: qx (Nz+2, Nx+1), qz (Nz+1, Nx+2). Boundary rows/cols filled
+# per src/advect.m:144-161 using the specified BCs.
+# ----------------------------------------------------------------------------
+
+"""
+    advect_with_flux!(adv, qx, qz, f_halo, u, w, h, scheme; xBC, zBC) -> adv
+
+Same as `advect!` plus emits face-centred fluxes:
+* `qx` size `(Nz+2, Nx+1)` — x-face fluxes with z-boundary padding (rows 1, Nz+2)
+* `qz` size `(Nz+1, Nx+2)` — z-face fluxes with x-boundary padding (cols 1, Nx+2)
+
+Boundary rows/columns are filled per MATLAB `advect.m:144-161`:
+* periodic ⇒ wrap (e.g. `qz[:,1]=qz[:,end-1]`, `qz[:,end]=qz[:,2]`)
+* otherwise ⇒ repeat (e.g. `qz[:,1]=qz[:,2]`, `qz[:,end]=qz[:,end-1]`)
+
+Mass conservation: every interior face value in `qx`, `qz` equals the
+algebraic flux the divergence kernel uses, so `adv ≡ div(q)/h` bitwise.
+"""
+function advect_with_flux!(adv::AbstractMatrix, qx::AbstractMatrix, qz::AbstractMatrix,
+                           f_halo::AbstractMatrix,
+                           u::AbstractMatrix, w::AbstractMatrix,
+                           h::Real, scheme::Symbol;
+                           xBC::Symbol = :periodic,
+                           zBC::Symbol = :closed)
+    Nz = size(adv, 1);  Nx = size(adv, 2)
+    @assert size(qx) == (Nz + 2, Nx + 1)  "advect_with_flux!: qx must be (Nz+2, Nx+1)"
+    @assert size(qz) == (Nz + 1, Nx + 2)  "advect_with_flux!: qz must be (Nz+1, Nx+2)"
+
+    # First do the cell-centred adv (kernel checks halo/velocity sizes itself)
+    advect!(adv, f_halo, u, w, h, scheme)
+
+    halo = scheme_halo(scheme)
+    backend = KernelAbstractions.get_backend(adv)
+    T = eltype(adv)
+    half = T(0.5)
+
+    # Interior face-flux views: qx_int is (Nz, Nx+1), qz_int is (Nz+1, Nx)
+    qx_int = view(qx, 2:Nz+1, 1:Nx+1)
+    qz_int = view(qz, 1:Nz+1, 2:Nx+1)
+
+    if scheme === :centr
+        _flux_centr_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half;
+                                                  ndrange = size(qx_int))
+        _flux_centr_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half;
+                                                  ndrange = size(qz_int))
+    elseif scheme === :upwd1
+        _flux_upwd1_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half;
+                                                  ndrange = size(qx_int))
+        _flux_upwd1_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half;
+                                                  ndrange = size(qz_int))
+    elseif scheme === :quick
+        _flux_quick_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half, T(1//6);
+                                                  ndrange = size(qx_int))
+        _flux_quick_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half, T(1//6);
+                                                  ndrange = size(qz_int))
+    elseif scheme === :fromm
+        _flux_fromm_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half, T(0.25);
+                                                  ndrange = size(qx_int))
+        _flux_fromm_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half, T(0.25);
+                                                  ndrange = size(qz_int))
+    elseif scheme === :weno3
+        _flux_weno3_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half, T(1e-6);
+                                                  ndrange = size(qx_int))
+        _flux_weno3_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half, T(1e-6);
+                                                  ndrange = size(qz_int))
+    elseif scheme === :weno5
+        _flux_weno5_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half, eps(T);
+                                                  ndrange = size(qx_int))
+        _flux_weno5_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half, eps(T);
+                                                  ndrange = size(qz_int))
+    elseif scheme === :tvdim
+        _flux_tvdim_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half;
+                                                  ndrange = size(qx_int))
+        _flux_tvdim_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half;
+                                                  ndrange = size(qz_int))
+    else
+        throw(ArgumentError("advect_with_flux!: unsupported scheme = :$scheme"))
+    end
+    KernelAbstractions.synchronize(backend)
+
+    # ------------- MATLAB advect.m:144-161 boundary fills --------------------
+    # qz boundary cols (1 and Nx+2) — periodic wrap or repeat
+    if xBC === :periodic && Nx > 1
+        @views qz[:, 1]     .= qz[:, Nx + 1]
+        @views qz[:, Nx + 2] .= qz[:, 2]
+    else
+        @views qz[:, 1]     .= qz[:, 2]
+        @views qz[:, Nx + 2] .= qz[:, Nx + 1]
+    end
+    # qx boundary rows (1 and Nz+2)
+    if zBC === :periodic && Nz > 1
+        @views qx[1, :]     .= qx[Nz + 1, :]
+        @views qx[Nz + 2, :] .= qx[2, :]
+    else
+        @views qx[1, :]     .= qx[2, :]
+        @views qx[Nz + 2, :] .= qx[Nz + 1, :]
+    end
+
+    return adv
+end

@@ -4,6 +4,7 @@ using LinearAlgebra
 using Printf
 using Random
 using Statistics
+using TOML, Crayons
 
 include("parameters.jl")
 include("grid.jl")
@@ -48,5 +49,36 @@ export plot_fluid, plot_phase, plot_diffuse, plot_dimensionless, plot_profiles,
        plot_history, save_output
 export plot_state, plot_mms_comparison
 export save_checkpoint, load_checkpoint!, restart_path, resolve_restart
+
+function _print_banner(io::IO)
+    x = string(Crayon(foreground = (26, 12, 100)))
+    c = string(Crayon(foreground = (44, 81, 146)))
+    o = string(Crayon(foreground = (90, 139, 163)))
+    r = string(Crayon(foreground = (179, 172, 149)))
+    e = string(Crayon(foreground = (254, 242, 242)))
+    res = string(Crayon(reset = true))
+
+    str = """
+     $(x)██╗  ██╗ $(c)██████╗ $(o)██████╗ $(r)██████╗ $(e)███████╗$(res)
+     $(x)╚██╗██╔╝$(c)██╔════╝$(o)██╔═══██╗$(r)██╔══██╗$(e)██╔════╝$(res)
+     $(x) ╚███╔╝ $(c)██║     $(o)██║   ██║$(r)██████╔╝$(e)█████╗  $(res)
+     $(x) ██╔██╗ $(c)██║     $(o)██║   ██║$(r)██╔══██╗$(e)██╔══╝  $(res)
+     $(x)██╔╝ ██╗$(c)╚██████╗$(o)╚██████╔╝$(r)██║  ██║$(e)███████╗$(res)
+     $(x)╚═╝  ╚═╝ $(c)╚═════╝ $(o)╚═════╝ $(r)╚═╝  ╚═╝$(e)╚══════╝$(res)
+     """
+    printstyled(io, "\n\n", str, "\n",
+"""
+Version: $(TOML.parsefile(joinpath(@__DIR__, "..", "Project.toml"))["version"])
+Latest commit: $(try strip(read(`git log -1 --pretty=%B`, String)) catch _ "N/A" end)
+Commit date: $(try strip(read(`git log -1 --pretty=%cd`, String)) catch _ "N/A" end)
+""", bold=true, color=:default)
+    return nothing
+end
+
+function __init__(io::IO = stdout)
+    isa(stdout, Base.TTY) || return
+    _print_banner(io)
+    return nothing
+end
 
 end # module xcore

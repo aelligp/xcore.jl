@@ -10,7 +10,7 @@ using KernelAbstractions: CPU
 # ---------------------------------------------------------------------------
 
 par = Parameters(Float64;
-    runID   = "D1_dm2_e1_N50",
+    runID   = "D1_dm2_e1_N150",
     outdir  = joinpath(@__DIR__, "..", "out"),
     save_op = true,
     nop     = 10,          # save figures every nop steps
@@ -19,7 +19,7 @@ par = Parameters(Float64;
 
     # domain
     D  = 1e1,
-    N  = 50,
+    N  = 150,
     L  = 1e1 * 1.5,         # 1.5 × D
 
     # timing
@@ -57,44 +57,14 @@ phase  = PhaseState(Float64, CPU(), grid.Nz, grid.Nx)
 ns     = NoiseState(Float64, grid, scales)
 hst    = History(Float64)
 
-initialize!(phase, fluid, ns, grid, par, scales)
-
-# ---------------------------------------------------------------------------
-# Output callback: record history + save figures
-# ---------------------------------------------------------------------------
-
-function output_callback(step, time, dt, phase, fluid, ns)
-    if step % par.nrh == 0
-        record_history!(hst, time, dt, phase, fluid, ns, grid)
-    end
-    if par.save_op && step % par.nop == 0
-        frame = step ÷ par.nop
-        save_output(phase, fluid, ns, hst, grid, par, scales, time;
-                    outdir = par.outdir, runID = par.runID,
-                    frame, dt, step)   # dt + step go into the JLD2 checkpoint
-    end
-end
-
-# To restart from the most recent checkpoint, uncomment:
-# load_checkpoint!(restart_path(par.outdir, par.runID; frame = -1),
-#                  phase, fluid, ns, hst)
-# Or from a specific frame:  ...; frame = 12), phase, fluid, ns, hst)
-
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
+time0, dt0, step0 = initialize!(phase, fluid, ns, hst, grid, par, scales)
 
 tend   = par.t0end * scales.t0   # dimensional stop time
 nsteps = ceil(Int, tend / scales.dt0) + 10   # upper bound; driver exits early
 
-println("Running $(par.runID) for ≤ $nsteps steps (tend = $(round(tend, sigdigits=3)) s)")
+println("Running $(par.runID) for ≤ roughly $nsteps steps (tend = $(round(tend, sigdigits=3)) s)")
 
-final_time, final_dt = run!(phase, fluid, ns, grid, par, scales;
-    nsteps,
-    verbose  = true,
-    callback = (step, t, dt, ph, fl, ns_) -> begin
-        output_callback(step, t, dt, ph, fl, ns_)
-        t >= tend && error("stop")   # early exit when target time is reached
-    end)
-
+final_time, final_dt = run!(phase, fluid, ns, hst, grid, par, scales;
+                            time = time0, dt = dt0, step = step0,
+                            verbose = true)
 println("\nDone. final_time = $final_time s  ($(round(final_time/scales.t0, sigdigits=4)) t₀)")

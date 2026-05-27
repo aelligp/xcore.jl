@@ -1,6 +1,6 @@
 using xcore: StepResidual, snapshot!, compute_resnorm, report_iter,
              PhaseState, FluidState, NoiseState, Parameters, Grid, compute_scales,
-             initialize!
+             initialize!, History
 using KernelAbstractions: CPU
 
 function _make_diag_setup(T = Float64)
@@ -10,7 +10,8 @@ function _make_diag_setup(T = Float64)
     fluid  = FluidState(T, CPU(), grid.Nz, grid.Nx)
     phase  = PhaseState(T, CPU(), grid.Nz, grid.Nx)
     ns     = NoiseState(T, grid, scales)
-    initialize!(phase, fluid, ns, grid, par, scales)
+    hst    = History(T)
+    initialize!(phase, fluid, ns, hst, grid, par, scales)
     return phase, fluid, ns, grid, scales
 end
 

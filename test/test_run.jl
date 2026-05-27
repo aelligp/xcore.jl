@@ -32,7 +32,8 @@ end
     fluid = FluidState(T, CPU(), grid.Nz, grid.Nx)
     phase = PhaseState(T, CPU(), grid.Nz, grid.Nx)
     ns = NoiseState(T, grid, scales)
-    initialize!(phase, fluid, ns, grid, par, scales)
+    hst = xcore.History(T)
+    initialize!(phase, fluid, ns, hst, grid, par, scales)
 
     # mark a value, store, mark a new value, store again — verify the chain
     phase.X[1, 1] = 7.0
@@ -56,13 +57,12 @@ end
     fluid  = FluidState(T, CPU(), grid.Nz, grid.Nx)
     phase  = PhaseState(T, CPU(), grid.Nz, grid.Nx)
     ns     = NoiseState(T, grid, scales)
-    initialize!(phase, fluid, ns, grid, par, scales)
+    hst    = xcore.History(T)
+    initialize!(phase, fluid, ns, hst, grid, par, scales)
 
-    # silent callback for tests
-    silent(args...) = nothing
-    time, dt = run!(phase, fluid, ns, grid, par, scales;
+    time, dt = run!(phase, fluid, ns, hst, grid, par, scales;
                     nsteps = 5, dt = scales.dt0,
-                    verbose = false, callback = silent)
+                    verbose = false)
 
     @test isfinite(time) && time > 0
     @test isfinite(dt) && dt > 0

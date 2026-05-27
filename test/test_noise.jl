@@ -1,6 +1,6 @@
 using Statistics
 using xcore: NoiseState, PhaseState, FluidState, Parameters, Grid, compute_scales,
-             initialize!, noise!, store_noise!
+             initialize!, noise!, store_noise!, History
 using xcore: NoiseState   # re-import to access compute_fft_filter via module
 import xcore as XC
 using KernelAbstractions: CPU
@@ -13,7 +13,8 @@ function _make_noise_setup(T = Float64; N = 16)
     fluid  = FluidState(T, CPU(), grid.Nz, grid.Nx)
     phase  = PhaseState(T, CPU(), grid.Nz, grid.Nx)
     ns     = NoiseState(T, grid, scales; seed = 42)
-    initialize!(phase, fluid, ns, grid, par, scales)
+    hst    = History(T)
+    initialize!(phase, fluid, ns, hst, grid, par, scales)
     return ns, phase, fluid, grid, par, scales
 end
 

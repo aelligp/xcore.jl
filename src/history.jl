@@ -25,8 +25,15 @@ mutable struct History{T<:AbstractFloat}
     sumB::Vector{T};  sumM::Vector{T};  sumX::Vector{T}
     EB::Vector{T};    EM::Vector{T};    EX::Vector{T}
 
-    # conservation error
+    # BD2-integrated expected mass change (drift from boundary fluxes + reaction)
     DB::Vector{T};    DM::Vector{T};    DX::Vector{T}
+
+    # cached rates of change for BD2 (current, 1-step lagged, 2-step lagged).
+    # Shifted at the top of every call to record_history! exactly like the MATLAB
+    # globals in src/history.m:3-5.
+    dsumBdt::T;   dsumBdto::T;   dsumBdtoo::T
+    dsumMdt::T;   dsumMdto::T;   dsumMdtoo::T
+    dsumXdt::T;   dsumXdto::T;   dsumXdtoo::T
 
     # crystallinity x: min, mean, max, std
     x_min::Vector{T};  x_mean::Vector{T};  x_max::Vector{T};  x_std::Vector{T}
@@ -69,10 +76,12 @@ Construct an empty History accumulator.
 """
 function History(::Type{T}) where {T<:AbstractFloat}
     v() = T[]
+    z = zero(T)
     return History{T}(
         v(), v(),                          # time, dt
         v(), v(), v(), v(), v(), v(),      # sumB/M/X, EB/EM/EX
         v(), v(), v(),                     # DB/DM/DX
+        z, z, z, z, z, z, z, z, z,         # dsumBdt/dto/dtoo for B, M, X
         v(), v(), v(), v(),                # x stats
         v(), v(), v(),                     # V stats
         v(), v(), v(), v(), v(), v(),      # vx, vm stats
@@ -95,21 +104,81 @@ function record_history!(hst::History{T},
                          ns::NoiseState{T}, grid::Grid{T},
                          a1::Real = T(1), a2::Real = T(1), a3::Real = T(0),
                          b1::Real = T(1), b2::Real = T(0), b3::Real = T(0)) where {T<:AbstractFloat}
-    h2 = grid.h^2
+    h  = grid.h
+    h2 = h^2
+
+    # Shift cached rates BEFORE computing the new ones — exactly matching
+    # src/history.m:3-5. After this, dsumBdto holds the rate from the
+    # previous call, dsumBdtoo the call before that.
+    hst.dsumBdtoo = hst.dsumBdto;  hst.dsumBdto = hst.dsumBdt
+    hst.dsumMdtoo = hst.dsumMdto;  hst.dsumMdto = hst.dsumMdt
+    hst.dsumXdtoo = hst.dsumXdto;  hst.dsumXdto = hst.dsumXdt
 
     push!(hst.time, T(time))
     push!(hst.dt,   T(dt))
 
-    # --- conservation ---
-    sumB = sum(fluid.rho) * h2 * eps(T)
-    sumM = sum(phase.M)   * h2 * eps(T)
-    sumX = sum(phase.X)   * h2 * eps(T)
+    # --- total mass [kg per unit y-depth] (src/history.m:14-16) ---
+    # MATLAB adds a +eps to avoid div-by-zero in EB; preserve that exactly.
+    sumB = sum(fluid.rho) * h2 + eps(T)
+    sumM = sum(phase.M)   * h2 + eps(T)
+    sumX = sum(phase.X)   * h2 + eps(T)
     push!(hst.sumB, sumB);  push!(hst.sumM, sumM);  push!(hst.sumX, sumX)
 
-    sB0 = hst.sumB[1];  sM0 = hst.sumM[1];  sX0 = hst.sumX[1]
-    push!(hst.EB, (sB - sB0) / (sB0 + eps(T)))
-    push!(hst.EM, (sM - sM0) / (sB0 + eps(T)))
-    push!(hst.EX, (sX - sX0) / (sB0 + eps(T)))
+    # --- boundary flux integrals (src/history.m:19-28) ---
+    # qz_* are sized (Nz+1, Nx+2); row 1 = top face, row end = bottom face;
+    # interior x-columns are 2:end-1. Each `sum(qz[...,2:end-1]*h)` is the
+    # line integral of the z-flux across the top/bottom boundary, in [kg/s].
+    qzaX = phase.qz_advn_X;  qzaM = phase.qz_advn_M
+    qzdX = phase.qz_dffn_X;  qzdM = phase.qz_dffn_M
+    Nz1, Nxp2 = size(qzaX)
+    interior = 2:(Nxp2 - 1)
+
+    top_aX  = sum(@view qzaX[1,    interior]) * h
+    bot_aX  = sum(@view qzaX[Nz1,  interior]) * h
+    top_aM  = sum(@view qzaM[1,    interior]) * h
+    bot_aM  = sum(@view qzaM[Nz1,  interior]) * h
+    top_dX  = sum(@view qzdX[1,    interior]) * h
+    bot_dX  = sum(@view qzdX[Nz1,  interior]) * h
+    top_dM  = sum(@view qzdM[1,    interior]) * h
+    bot_dM  = sum(@view qzdM[Nz1,  interior]) * h
+
+    sumGx = sum(phase.Gx) * h2
+
+    # Net expected rates of change driven by boundary fluxes + reaction Gx.
+    # Sign convention from MATLAB: stored advection flux is signed v*f,
+    # diffusion flux is -k*∂f. The MATLAB formula sums (top - bottom) which
+    # corresponds to inflow at top minus outflow at bottom.
+    dsumBdt_new = (top_aX - bot_aX) + (top_aM - bot_aM) +
+                  (top_dX - bot_dX) + (top_dM - bot_dM)
+    dsumMdt_new = -sumGx + (top_aM - bot_aM) + (top_dM - bot_dM)
+    dsumXdt_new = +sumGx + (top_aX - bot_aX) + (top_dX - bot_dX)
+
+    hst.dsumBdt = dsumBdt_new
+    hst.dsumMdt = dsumMdt_new
+    hst.dsumXdt = dsumXdt_new
+
+    # --- BD2-integrated drift D{B,M,X} (src/history.m:30-32) ---
+    stp = length(hst.time)
+    if stp >= 2
+        DBo  = hst.DB[stp - 1];  DBoo  = hst.DB[max(1, stp - 2)]
+        DMo  = hst.DM[stp - 1];  DMoo  = hst.DM[max(1, stp - 2)]
+        DXo  = hst.DX[stp - 1];  DXoo  = hst.DX[max(1, stp - 2)]
+        DB_new = (T(a2)*DBo + T(a3)*DBoo +
+                  (T(b1)*dsumBdt_new + T(b2)*hst.dsumBdto + T(b3)*hst.dsumBdtoo) * T(dt)) / T(a1)
+        DM_new = (T(a2)*DMo + T(a3)*DMoo +
+                  (T(b1)*dsumMdt_new + T(b2)*hst.dsumMdto + T(b3)*hst.dsumMdtoo) * T(dt)) / T(a1)
+        DX_new = (T(a2)*DXo + T(a3)*DXoo +
+                  (T(b1)*dsumXdt_new + T(b2)*hst.dsumXdto + T(b3)*hst.dsumXdtoo) * T(dt)) / T(a1)
+        push!(hst.DB, DB_new); push!(hst.DM, DM_new); push!(hst.DX, DX_new)
+    else
+        push!(hst.DB, zero(T)); push!(hst.DM, zero(T)); push!(hst.DX, zero(T))
+    end
+
+    # --- fractional conservation error (src/history.m:35-37) ---
+    sumB0 = hst.sumB[1]
+    push!(hst.EB, (sumB - hst.DB[stp] - sumB0) / sumB0)
+    push!(hst.EM, (sumM - hst.DM[stp] - hst.sumM[1]) / sumB0)
+    push!(hst.EX, (sumX - hst.DX[stp] - hst.sumX[1]) / sumB0)
 
     # --- crystallinity ---
     push!(hst.x_min,  minimum(phase.x))

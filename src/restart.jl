@@ -69,7 +69,8 @@ function save_checkpoint(path::AbstractString,
             f["noise/$(name)"] = getfield(ns, name)
         end
         f["noise/rng"] = ns.rng
-        # ---- history
+        # ---- history (vectors and scalars; History is mutable so scalars
+        # round-trip as plain values)
         for name in fieldnames(typeof(hst))
             f["hst/$(name)"] = getfield(hst, name)
         end
@@ -110,12 +111,16 @@ function load_checkpoint!(path::AbstractString,
             getfield(ns, name) .= f["noise/$(name)"]
         end
         copy!(ns.rng, f["noise/rng"])
-        # ---- history: empty + repopulate so the mutable struct's vector fields
-        # become byte-equal to the checkpoint
+        # ---- history: vector fields get empty!+append!; scalar fields go
+        # through setfield! (History is `mutable struct`)
         for name in fieldnames(typeof(hst))
-            v = getfield(hst, name)
-            empty!(v)
-            append!(v, f["hst/$(name)"])
+            cur = getfield(hst, name)
+            val = f["hst/$(name)"]
+            if cur isa AbstractVector
+                empty!(cur);  append!(cur, val)
+            else
+                setfield!(hst, name, val)
+            end
         end
         return (time = f["meta/time"], dt = f["meta/dt"], step = f["meta/step"])
     end

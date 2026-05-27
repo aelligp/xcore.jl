@@ -92,7 +92,11 @@ given by `scales`.
 function print_step!(step::Int, time::Real, dt::Real,
                      phase::PhaseState, fluid::FluidState, ns::NoiseState,
                      scales::Scales;
-                     elapsed::Union{Nothing,Real} = nothing)
+                     elapsed::Union{Nothing,Real} = nothing,
+                     t_phs::Union{Nothing,Real} = nothing,
+                     t_fm::Union{Nothing,Real}  = nothing,
+                     t_upd::Union{Nothing,Real} = nothing,
+                     iter::Union{Nothing,Integer} = nothing)
 
     # unpack scales for readability
     W0  = Float64(scales.W0);   w0  = Float64(scales.w0)
@@ -100,10 +104,19 @@ function print_step!(step::Int, time::Real, dt::Real,
     r0  = Float64(scales.rho0)
     E0  = Float64(scales.eta0)
 
-    println()
+    println("\n")
     @printf("=== step %d | t = %.4e s | dt = %.4e s", step, Float64(time), Float64(dt))
     elapsed !== nothing && @printf(" | T2S = %.2f s", Float64(elapsed))
-    println()
+    println("\n")
+
+    # per-component timing (matches MATLAB diagnose.m:3-5). The "/iter" form
+    # mirrors MATLAB's `FMtime/(iter-1)`: average wall time per Picard sweep.
+    if t_phs !== nothing && t_fm !== nothing && t_upd !== nothing
+        n = max(1, Int(something(iter, 1)))
+        @printf("    fluid-mechanics solve = %1.3e s/iter\n", Float64(t_fm)  / n)
+        @printf("    phase evolution solve = %1.3e s/iter\n", Float64(t_phs) / n)
+        @printf("    coefficients update   = %1.3e s/iter\n\n", Float64(t_upd) / n)
+    end
 
     # crystallinity & melt fraction
     xv = Float64.(phase.x);  mv = Float64.(phase.m)

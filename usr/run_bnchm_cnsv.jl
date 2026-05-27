@@ -14,7 +14,7 @@ using Statistics
 using CairoMakie
 using Printf
 
-const ATOL = (1e-3, 1e-6, 1e-9)
+ATOL = (1e-3, 1e-6, 1e-9)
 
 # storage for the loglog convergence plot
 results = NamedTuple{(:atol, :EB, :EM, :EX), NTuple{4, Float64}}[]
@@ -35,6 +35,7 @@ for atol in ATOL
         L  = 10.0,                               # square box
 
         # timing
+        Nt = 5 * 10,                            # 5*nop steps, matching MATLAB
         t0end = 10.0,
 
         # initial crystallinity
@@ -66,12 +67,12 @@ for atol in ATOL
     phase  = PhaseState(Float64, CPU(), grid.Nz, grid.Nx)
     ns     = NoiseState(Float64, grid, scales)
     hst    = History(Float64)
-    initialize!(phase, fluid, ns, grid, par, scales)
+    time0, dt0, step0 = initialize!(phase, fluid, ns, hst, grid, par, scales)
 
-    run!(phase, fluid, ns, grid, par, scales;
-         nsteps   = par.Nt,
-         verbose  = true,
-         callback = (step, t, dt, ph, fl, ns_, a1, a2, a3, b1, b2, b3) -> record_history!(hst, t, dt, ph, fl, ns_, grid, a1, a2, a3, b1, b2, b3))
+    run!(phase, fluid, ns, hst, grid, par, scales;
+         nsteps  = par.Nt,
+         time = time0, dt = dt0, step = step0,
+         verbose = true)
 
     # rms of d|E|/dt over the second half of the run (matches bnchm_cnsv.m:58-60)
     rms(x) = sqrt(mean(abs2, x))

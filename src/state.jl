@@ -144,6 +144,10 @@ struct PhaseState{T<:AbstractFloat, A<:AbstractMatrix{T}, AB<:AbstractMatrix{Boo
     bndshape::A
     # phase evolution rates (current + history for BD2)
     advn_X::A;  advn_M::A;  advn_rho::A
+    # face-centred fluxes from advect/diffus (MATLAB sizing per src/advect.m, diffus.m):
+    #   qx_* : (Nz+2, Nx+1)   qz_* : (Nz+1, Nx+2)
+    qx_advn_X::A;  qz_advn_X::A;  qx_advn_M::A;  qz_advn_M::A
+    qx_dffn_X::A;  qz_dffn_X::A;  qx_dffn_M::A;  qz_dffn_M::A
     dffn_X::A;  Gx::A
     dXdt::A;    dXdto::A;   dXdtoo::A
 end
@@ -188,6 +192,11 @@ function PhaseState(::Type{T}, backend, Nz::Integer, Nx::Integer) where {T<:Abst
         z(Nz + 1, Nx + 2), z(Nz + 1, Nx + 2),          # wx, wm
         z(Nz + 1, Nx + 2), z(Nz, Nx),                  # bndtaperw, bndshape
         z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),               # advn_X, advn_M, advn_rho
+        # face fluxes (MATLAB sizing): qx (Nz+2, Nx+1), qz (Nz+1, Nx+2)
+        z(Nz + 2, Nx + 1), z(Nz + 1, Nx + 2),          # qx_advn_X, qz_advn_X
+        z(Nz + 2, Nx + 1), z(Nz + 1, Nx + 2),          # qx_advn_M, qz_advn_M
+        z(Nz + 2, Nx + 1), z(Nz + 1, Nx + 2),          # qx_dffn_X, qz_dffn_X
+        z(Nz + 2, Nx + 1), z(Nz + 1, Nx + 2),          # qx_dffn_M, qz_dffn_M (kept zero — no melt diffusion in MATLAB)
         z(Nz, Nx), z(Nz, Nx),                          # dffn_X, Gx
         z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),               # dXdt, dXdto, dXdtoo
     )

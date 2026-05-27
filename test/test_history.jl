@@ -10,7 +10,8 @@ function _make_small(T = Float64)
     fluid  = FluidState(T, CPU(), grid.Nz, grid.Nx)
     phase  = PhaseState(T, CPU(), grid.Nz, grid.Nx)
     ns     = NoiseState(T, grid, scales)
-    initialize!(phase, fluid, ns, grid, par, scales)
+    hst    = History(T)
+    initialize!(phase, fluid, ns, hst, grid, par, scales)
     return phase, fluid, ns, grid, scales
 end
 

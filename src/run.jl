@@ -55,19 +55,36 @@ function compute_bndshape!(phase::PhaseState{T}, grid::Grid{T},
 end
 
 """
-    initialize!(phase, fluid, par; perturbation_kind=:gaussian, perturbation_amp=0.1,
-                seed=15) -> nothing
+    initialize!(phase, fluid, ns, hst, grid, par, scales;
+                xBC=:periodic, zBC=:closed) -> (time, dt, step)
 
-Set up an initial state on a fresh `(phase, fluid)` pair. Seeds `x = x0` with a
-Gaussian or random perturbation (`dxr` / `dxg` from `par`), sets `m = 1 - x`,
-computes the initial volume fractions and densities. Mirrors the relevant
-lines of `src/init.m`.
+Set up an initial state on a fresh `(phase, fluid, ns, hst)` quartet, then
+record the t=0 entry into `hst` so the conservation baseline `HST.sumB[1]` is
+the true initial total mass (matches `src/init.m:264-267`'s
+`store; history; output;` block at t=0).
+
+If `par.restart != 0`, load from the corresponding checkpoint
+(`par.restart < 0` ⇒ most recent `_cont.jld2`; `par.restart > 0` ⇒
+`_<restart>.jld2`) and return `(time, dt, step)` to resume the time loop
+mid-run. Otherwise the fresh-init path returns `(0, scales.dt0, 0)`.
 """
 function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
+                     hst::History{T},
                      grid::Grid{T}, par::Parameters{T}, scales::Scales{T};
                      xBC::Symbol = :periodic,
                      zBC::Symbol = :closed) where {T<:AbstractFloat}
     Nz = grid.Nz;  Nx = grid.Nx
+
+    # ---- restart: short-circuit fresh init when par.restart != 0 ----------
+    if par.restart != 0
+        path = resolve_restart(par.outdir, par.runID, par.restart)
+        meta = load_checkpoint!(path, phase, fluid, ns, hst)
+        # rebuild the geometric shape functions (deterministic from grid; not
+        # checkpointed because they're cheap and might evolve with code changes)
+        compute_bndtaperw!(phase, grid, par, scales)
+        compute_bndshape!(phase, grid, scales)
+        return (T(meta.time), T(meta.dt), Int(meta.step))
+    end
 
     # boundary taper for segregation speed (closed top/bot by default)
     compute_bndtaperw!(phase, grid, par, scales)
@@ -112,34 +129,48 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
     fluid.rhoo .= fluid.rho;  fluid.rhooo .= fluid.rho
     store_noise!(ns)
 
-    return nothing
+    # t=0 record so `hst.sumB[1]` is the true initial baseline used by
+    # `EB/EM/EX` (mirrors src/init.m:264-267 `store; history; output;`).
+    # Use BE coefficients — no history exists yet, so dsumBdto/dsumBdtoo are
+    # zero and DB[1] becomes zero by design.
+    record_history!(hst, T(0), T(scales.dt0), phase, fluid, ns, grid,
+                    T(1), T(1), T(0), T(1), T(0), T(0))
+
+    return (T(0), T(scales.dt0), 0)
 end
 
 """
-    run!(phase, fluid, ns, grid, par, scales; nsteps, dt=scales.dt0,
+    run!(phase, fluid, ns, hst, grid, par, scales; nsteps=par.Nt, dt=scales.dt0,
          ADVN=:weno5, xBC=:periodic, zBC=:closed,
          sds=-1, top_cnv=1, bot_cnv=1, open_cnv=false,
-         verbose=true, callback=nothing)
+         verbose=true)
         -> (final_time, final_dt)
 
-Drive the coupled phase + Stokes system for `nsteps` outer time steps.
+Drive the coupled phase + Stokes system. Each outer step runs a Picard loop
+that mirrors MATLAB `main.m`: at least 3 sweeps of
+`phsevo! → fluidmech! → update! → update_phase_velocities!`, then exits when
+`resnorm/resnorm0 < par.rtol` or `resnorm < par.atol`, up to `par.maxit`
+iterations. After each step the time-step is refreshed via `update_dt`.
 
-Each outer step runs a Picard loop that mirrors MATLAB `main.m`: at least 3
-sweeps of `phsevo! → fluidmech! → update! → update_phase_velocities!`, then
-exits when `resnorm/resnorm0 < par.rtol` or `resnorm < par.atol`, up to
-`par.maxit` iterations. After each step the time-step is refreshed via
-`update_dt`.
+Termination — mirrors MATLAB main.m: stops on the first of
+* `step > nsteps`,
+* `time > par.tend` (dimensional cutoff),
+* `time/scales.t0 > par.t0end` (dimensionless cutoff).
 
-When `verbose = true` (default) the per-iteration convergence line and a full
-end-of-step diagnostic block are printed via `report_iter` / `print_step!`.
-
-`callback(step, time, dt, phase, fluid, ns)` is called after each step if
-provided; use it for output, history recording, etc.
+Per-step hooks (no callbacks — everything is parameter-driven):
+* `record_history!(hst, ...)` runs every `par.nrh` steps.
+* `save_output(phase, fluid, ns, hst, ...)` runs every `par.nop` steps when
+  `par.save_op` is true. PNGs land in `joinpath(par.outdir, par.runID)/`;
+  a JLD2 checkpoint is written alongside.
+* `print_step!` runs every step when `verbose=true`.
 """
 function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
+              hst::History{T},
               grid::Grid{T}, par::Parameters{T}, scales::Scales{T};
-              nsteps::Integer,
+              nsteps::Integer = par.Nt,
+              time::Real = 0,
               dt::Real = scales.dt0,
+              step::Integer = 0,
               ADVN::Symbol = :weno5,
               xBC::Symbol = :periodic,
               zBC::Symbol = :closed,
@@ -147,20 +178,31 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
               top_cnv::Integer = 1,
               bot_cnv::Integer = 1,
               open_cnv::Bool = false,
-              verbose::Bool = true,
-              callback = nothing) where {T<:AbstractFloat}
+              verbose::Bool = true) where {T<:AbstractFloat}
+
+    nsteps0 = ceil(Int, (par.t0end * scales.t0) / scales.dt0)
 
     println("\n\n")
     println("****************************************************************\n")
     println("********** RUN XCORE.jl MODEL | $(now()) ********\n")
     println("****************************************************************\n")
-    println("\n run ID: $(par.runID) \n")
+    printstyled("\n run ID: $(par.runID)  for approx. $nsteps0 timesteps \n"; bold=true)
 
-    time = T(0)
+    time = T(time)
     dt   = T(dt)
+    step = Int(step)
     res  = StepResidual(grid)
 
-    for step in 1:nsteps
+    tend_dim = T(par.tend)
+    tend_t0  = T(par.t0end) * T(scales.t0)
+    xend     = T(par.xend)
+
+    # x-criterion: most recent mean crystallinity (HST.x(end,2) in main.m).
+    # If no history exists yet, assume value < xend so the loop enters.
+    x_mean_last() = isempty(hst.x_mean) ? T(0) : hst.x_mean[end]
+
+    while step < nsteps && time < tend_dim && time < tend_t0 && x_mean_last() < xend
+        step += 1
         (a1, a2, a3, b1, b2, b3) = time_coefs(T, par.TINT, step)
         store_previous!(fluid, phase)
         store_noise!(ns)
@@ -168,6 +210,10 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
         resnorm  = T(1)
         resnorm0 = T(1)
         iter     = 0
+
+        # per-component timing accumulators (mirrors FMtime/XEtime/UDtime in
+        # MATLAB src/timing.m + diagnose.m). Reset every outer step.
+        t_phs = 0.0;  t_fm = 0.0;  t_upd = 0.0
 
         elapsed = @elapsed begin
             # mirror MATLAB: at least 3 sweeps, then exit on convergence or maxit
@@ -178,10 +224,10 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                 iter += 1
                 snapshot!(res, phase, fluid)
 
-                phsevo!(phase, fluid, grid, par, scales;
+                t_phs += @elapsed phsevo!(phase, fluid, grid, par, scales;
                         ADVN, xBC, zBC,
                         a1, a2, a3, b1, b2, b3, dt)
-                fluidmech!(fluid, grid, par;
+                t_fm  += @elapsed fluidmech!(fluid, grid, par;
                            phase = phase,
                            sds, top_cnv, bot_cnv, open_cnv,
                            xBC, zBC,
@@ -190,9 +236,11 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                 # fluidmech sets wx/wm/Wx/Ux/Wm/Um, THEN update uses them
                 # (update.m lines 26-29, 73-104 require current Wx/Wm)
 
-                noise!(ns, phase, grid, par, scales, dt; first_iter = (iter ≤ 1))
-                update_phase_velocities!(phase, fluid, ns, grid, par; xBC, zBC)
-                update!(phase, fluid, grid, par, scales; xBC, zBC)
+                t_upd += @elapsed begin
+                    noise!(ns, phase, grid, par, scales, dt; first_iter = (iter ≤ 1))
+                    update_phase_velocities!(phase, fluid, ns, grid, par; xBC, zBC)
+                    update!(phase, fluid, grid, par, scales; xBC, zBC)
+                end
 
                 resnorm, rm, rp = compute_resnorm(res, phase, fluid, dt)
                 # set reference on first sweep, or reset if residual increased
@@ -205,8 +253,24 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
         end
 
         time += dt
-        verbose && print_step!(step, time, dt, phase, fluid, ns, scales; elapsed)
-        callback !== nothing && callback(step, time, dt, phase, fluid, ns, a1, a2, a3, b1, b2, b3)
+        verbose && print_step!(step, time, dt, phase, fluid, ns, scales;
+                               elapsed, t_phs, t_fm, t_upd, iter)
+
+        # history — every par.nrh steps (mirrors main.m line 41)
+        if step % par.nrh == 0
+            record_history!(hst, time, dt, phase, fluid, ns, grid,
+                            a1, a2, a3, b1, b2, b3)
+        end
+
+        # output (figures + JLD2 checkpoint) — every par.nop steps when enabled
+        # (mirrors main.m line 47)
+        if par.save_op && step % par.nop == 0
+            frame = step ÷ par.nop
+            save_output(phase, fluid, ns, hst, grid, par, scales, time;
+                        outdir = par.outdir, runID = par.runID,
+                        frame, dt, step)
+        end
+
         dt = update_dt(phase, fluid, grid, par, dt)
     end
     return time, dt

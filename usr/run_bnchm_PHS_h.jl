@@ -43,7 +43,8 @@ function run_bnchm_phs_h(N::Int; D = 10.0, L = 10.0,
     fluid  = FluidState(Float64, CPU(), grid.Nz, grid.Nx)
     phase  = PhaseState(Float64, CPU(), grid.Nz, grid.Nx)
     ns     = NoiseState(Float64, grid, scales)
-    initialize!(phase, fluid, ns, grid, par, scales)
+    hst    = History(Float64)
+    initialize!(phase, fluid, ns, hst, grid, par, scales)
     force_constant_advection!(phase, fluid)
 
     # snapshot initial state and build the analytic shifted reference. The

@@ -79,6 +79,76 @@ function diffus_centered!(dff::AbstractMatrix{T}, f::AbstractMatrix{T},
 end
 
 """
+    advect_centered_with_flux!(adv, qx, qz, f, u, w, h, scheme; xBC, zBC) -> adv
+
+Convenience wrapper around `advect_with_flux!` that handles halo embedding
+for `f` and (for `:tvdim`) padding of `u`, `w`. Writes:
+* `adv`  `(Nz, Nx)`        — cell-centred `div(v·f)`
+* `qx`   `(Nz+2, Nx+1)`    — x-face fluxes (MATLAB sizing)
+* `qz`   `(Nz+1, Nx+2)`    — z-face fluxes (MATLAB sizing)
+"""
+function advect_centered_with_flux!(adv::AbstractMatrix{T},
+                                    qx::AbstractMatrix{T}, qz::AbstractMatrix{T},
+                                    f::AbstractMatrix{T},
+                                    u::AbstractMatrix{T}, w::AbstractMatrix{T},
+                                    h::Real, scheme::Symbol;
+                                    xBC::Symbol = :periodic,
+                                    zBC::Symbol = :closed) where {T<:AbstractFloat}
+    halo = scheme_halo(scheme)
+    f_halo = similar(f, size(f, 1) + 2halo, size(f, 2) + 2halo)
+    fill!(f_halo, zero(T))
+    embed_interior!(f_halo, f, halo)
+    fill_ghosts!(f_halo, halo; xBC, zBC)
+
+    if scheme === :tvdim
+        Nz, Nx = size(adv)
+        u_pad = similar(u, Nz, Nx + 3)
+        w_pad = similar(w, Nz + 3, Nx)
+        @views u_pad[:, 2:Nx+2] .= u
+        @views w_pad[2:Nz+2, :] .= w
+        if xBC === :periodic
+            @views u_pad[:, 1]    .= u[:, Nx]
+            @views u_pad[:, Nx+3] .= u[:, 2]
+        else
+            @views u_pad[:, 1]    .= u[:, 1]
+            @views u_pad[:, Nx+3] .= u[:, Nx+1]
+        end
+        if zBC === :periodic
+            @views w_pad[1,    :] .= w[Nz, :]
+            @views w_pad[Nz+3, :] .= w[2,  :]
+        else
+            @views w_pad[1,    :] .= w[1,    :]
+            @views w_pad[Nz+3, :] .= w[Nz+1, :]
+        end
+        advect_with_flux!(adv, qx, qz, f_halo, u_pad, w_pad, h, scheme; xBC, zBC)
+    else
+        advect_with_flux!(adv, qx, qz, f_halo, u, w, h, scheme; xBC, zBC)
+    end
+    return adv
+end
+
+"""
+    diffus_centered_with_flux!(dff, qx, qz, f, k, h; xBC, zBC) -> dff
+
+Wrapper around `diffus_with_flux!` that handles halo embedding for `f` and `k`.
+"""
+function diffus_centered_with_flux!(dff::AbstractMatrix{T},
+                                    qx::AbstractMatrix{T}, qz::AbstractMatrix{T},
+                                    f::AbstractMatrix{T}, k::AbstractMatrix{T},
+                                    h::Real;
+                                    xBC::Symbol = :periodic,
+                                    zBC::Symbol = :closed) where {T<:AbstractFloat}
+    halo = 1
+    f_halo = similar(f, size(f, 1) + 2halo, size(f, 2) + 2halo)
+    k_halo = similar(k, size(k, 1) + 2halo, size(k, 2) + 2halo)
+    fill!(f_halo, zero(T));  fill!(k_halo, zero(T))
+    embed_interior!(f_halo, f, halo);  embed_interior!(k_halo, k, halo)
+    fill_ghosts!(f_halo, halo; xBC, zBC);  fill_ghosts!(k_halo, halo; xBC, zBC)
+    diffus_with_flux!(dff, qx, qz, f_halo, k_halo, h; halo, xBC, zBC)
+    return dff
+end
+
+"""
     phsevo!(phase, fluid, grid, par, scales;
             ADVN=:weno5, xBC=:periodic, zBC=:closed,
             a1, a2, a3, b1, b2, b3, dt, alpha = par.alpha) -> nothing
@@ -109,13 +179,19 @@ function phsevo!(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
     Ux_face = @view phase.Ux[2:end-1, :]            # (Nz, Nx+1)
     Um_face = @view phase.Um[2:end-1, :]
 
-    advect_centered!(phase.advn_X, phase.X, Ux_face, Wx_face, h, ADVN; xBC, zBC)
-    advect_centered!(phase.advn_M, phase.M, Um_face, Wm_face, h, ADVN; xBC, zBC)
+    # phase advection — populate cell-centred rates AND face-centred fluxes
+    # (face fluxes are needed by record_history! to do exact boundary-flux
+    # accounting; matches MATLAB phsevo.m:8-9 returning [advn, qz, qx])
+    advect_centered_with_flux!(phase.advn_X, phase.qx_advn_X, phase.qz_advn_X,
+                               phase.X, Ux_face, Wx_face, h, ADVN; xBC, zBC)
+    advect_centered_with_flux!(phase.advn_M, phase.qx_advn_M, phase.qz_advn_M,
+                               phase.M, Um_face, Wm_face, h, ADVN; xBC, zBC)
     phase.advn_rho .= phase.advn_X .+ phase.advn_M
 
-    # diffusion: f = χ, k = X·k_x
+    # diffusion: f = χ, k = X·k_x. Emit fluxes too (matches phsevo.m:13).
     Xkx = phase.X .* phase.kx
-    diffus_centered!(phase.dffn_X, phase.chi, Xkx, h; xBC, zBC)
+    diffus_centered_with_flux!(phase.dffn_X, phase.qx_dffn_X, phase.qz_dffn_X,
+                               phase.chi, Xkx, h; xBC, zBC)
 
     # boundary crystallisation reaction (G0 = 0 when par.Da = 0)
     @. phase.Gx = T(scales.G0) * (one(T) - phase.x) * phase.bndshape
