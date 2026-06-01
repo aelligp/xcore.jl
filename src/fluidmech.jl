@@ -11,6 +11,42 @@ using Statistics
 # State fields are pulled to host via `Array(...)` if they happen to be on a
 # GPU backend; for the current pure-CPU path this is a no-op view.
 
+# FluidmechCache definition + constructor live in state.jl so FluidState can
+# include the field. Helpers (`_compute_nzmap`, `_scatter!`) are defined below.
+
+"""
+    _compute_nzmap(I, J, M) -> Vector{Int}
+
+For each triplet `k`, return the linear index into `M.nzval` where
+`M[I[k], J[k]]` lives. Uses the CSC invariant that `M.rowval` is sorted
+within each column.
+"""
+function _compute_nzmap(I::Vector{Int}, J::Vector{Int}, M::SparseMatrixCSC{T,Int}) where {T}
+    nz_map = Vector{Int}(undef, length(I))
+    @inbounds for k in eachindex(I)
+        col = J[k];  row = I[k]
+        lo = M.colptr[col];  hi = M.colptr[col + 1] - 1
+        # rowval[lo:hi] is sorted ascending
+        pos = searchsortedfirst(view(M.rowval, lo:hi), row) + lo - 1
+        nz_map[k] = pos
+    end
+    return nz_map
+end
+
+"""
+    _scatter!(M, nz_map, vals) -> M
+
+Zero `M.nzval` then accumulate `vals[k]` into `M.nzval[nz_map[k]]` for every
+`k`. Equivalent in effect to `sparse(I, J, vals, m, n)` but skips the sort.
+"""
+function _scatter!(M::SparseMatrixCSC{T,Int}, nz_map::Vector{Int}, vals::Vector{T}) where {T}
+    fill!(M.nzval, zero(T))
+    @inbounds for k in eachindex(vals)
+        M.nzval[nz_map[k]] += vals[k]
+    end
+    return M
+end
+
 """
     fluidmech!(state, grid, par;
                bnchm_data = nothing,
@@ -46,6 +82,14 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     Nz = grid.Nz;  Nx = grid.Nx;  h = grid.h
     g0 = par.g0;   gamma = par.gamma
     invh  = inv(h);  invh2 = inv(h)^2
+
+    # ---------------- solver cache (built lazily on first call) -------------
+    cache = state.solver
+    # Invalidate if grid size or MMS flag changed (different sparsity).
+    if cache.initialized && (cache.sig_Nz != Nz || cache.sig_Nx != Nx || cache.sig_bnchm != bnchm)
+        cache.initialized = false
+        cache.lu_F = nothing
+    end
 
     # ---------------- map arrays + flat sizes (matches MATLAB MapP/MapW/MapU)
     NP = (Nz + 2) * (Nx + 2)
@@ -279,8 +323,17 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIR, ii); append!(AAR, vec(rr))
     end
 
-    # assemble coefficient matrix & right-hand side vector
-    KV = sparse(IIL, JJL, AAL, NW + NU, NW + NU)
+    # assemble coefficient matrix & right-hand side vector — first call builds
+    # the sparsity, subsequent calls only scatter the new AAL values into the
+    # cached `cache.KV.nzval`.
+    if cache.initialized
+        _scatter!(cache.KV, cache.nz_KV, AAL)
+        KV = cache.KV
+    else
+        KV = sparse(IIL, JJL, AAL, NW + NU, NW + NU)
+        cache.KV = KV
+        cache.nz_KV = _compute_nzmap(IIL, JJL, KV)
+    end
     RV = sparsevec(IIR, AAR, NW + NU)
 
     # assemble coefficients for gradient operator
@@ -302,7 +355,14 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIL_g, ii); append!(JJL_g, jj2); append!(AAL_g, fill(+invh, aa))    # one to the right
     end
     # assemble coefficient matrix
-    GG = sparse(IIL_g, JJL_g, AAL_g, NW + NU, NP)
+    if cache.initialized
+        _scatter!(cache.GG, cache.nz_GG, AAL_g)
+        GG = cache.GG
+    else
+        GG = sparse(IIL_g, JJL_g, AAL_g, NW + NU, NP)
+        cache.GG = GG
+        cache.nz_GG = _compute_nzmap(IIL_g, JJL_g, GG)
+    end
 
     # assemble coefficients for divergence of matrix mass flux (DM)
 
@@ -325,7 +385,14 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIL_d, ii); append!(JJL_d, jWB); append!(AAL_d, +r4 .* invh)    # W one below
     end
     # Assemble coefficient matrix
-    DM = sparse(IIL_d, JJL_d, AAL_d, NP, NW + NU)
+    if cache.initialized
+        _scatter!(cache.DM, cache.nz_DM, AAL_d)
+        DM = cache.DM
+    else
+        DM = sparse(IIL_d, JJL_d, AAL_d, NP, NW + NU)
+        cache.DM = DM
+        cache.nz_DM = _compute_nzmap(IIL_d, JJL_d, DM)
+    end
 
     # assemble coefficients for matrix pressure diagonal and right-hand side
 
@@ -348,7 +415,33 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIL_p, ii); append!(JJL_p, ii);  append!(AAL_p, fill(T(1),  aa))
         append!(IIL_p, ii); append!(JJL_p, jj2); append!(AAL_p, fill(T(-1), aa))
     end
-    KP = sparse(IIL_p, JJL_p, AAL_p, NP, NP)
+    # Pre-add the pin diagonal entries (value 0) so the subsequent
+    # `KP[np0, np0] = T(1)` writes into an existing nzval slot instead of
+    # restructuring KP — required for `_scatter!` reuse on later calls.
+    if bnchm
+        nzp_pin = round(Int, (Nz + 2) * 3 / 8);  nxp_pin = round(Int, (Nx + 2) / 2)
+        push!(IIL_p, MapP[nzp_pin, nxp_pin])
+        push!(JJL_p, MapP[nzp_pin, nxp_pin])
+        push!(AAL_p, zero(T))
+    elseif open_cnv
+        for np0 in vec(MapP[Nz + 1, 1:(Nx + 2)])
+            push!(IIL_p, np0); push!(JJL_p, np0); push!(AAL_p, zero(T))
+        end
+    else
+        np0 = MapP[round(Int, Nz / 2), round(Int, Nx / 2)]
+        push!(IIL_p, np0); push!(JJL_p, np0); push!(AAL_p, zero(T))
+    end
+    if cache.initialized
+        _scatter!(cache.KP, cache.nz_KP, AAL_p)
+        KP = cache.KP
+    else
+        KP = sparse(IIL_p, JJL_p, AAL_p, NP, NP)
+        cache.KP = KP
+        cache.nz_KP = _compute_nzmap(IIL_p, JJL_p, KP)
+        # mark cache initialized after all four block patterns are built
+        cache.initialized = true
+        cache.sig_Nz = Nz;  cache.sig_Nx = Nx;  cache.sig_bnchm = bnchm
+    end
 
     # RHS for pressure: mass-flux source
     # MATLAB: RP = sparse(IIR, ones(size(IIR)), AAR, NP, 1) — scatter AAR into
@@ -413,7 +506,20 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     FF::Vector{T}  = collect(SCL * (LL * SOL .- Vector(RR)))
     LLs::SparseMatrixCSC{T,Int} = SCL * LL * SCL
 
-    UPD_perm = LLs \ FF
+    # UMFPACK numeric-refactor reuse: keep one UmfpackLU instance, refactor
+    # in-place via `lu!(F, LLs)` on subsequent calls (symbolic stays valid
+    # because LLs has the same sparsity each call).
+    if cache.lu_F === nothing
+        cache.lu_F = lu(LLs)
+    else
+        try
+            lu!(cache.lu_F, LLs)
+        catch err
+            err isa SparseArrays.UMFPACK.UMFPACKException || rethrow()
+            cache.lu_F = lu(LLs)
+        end
+    end
+    UPD_perm = cache.lu_F \ FF
     UPD      = scl .* UPD_perm
 
     # decode update (matching MATLAB sign convention)
