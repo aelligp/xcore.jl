@@ -1,3 +1,54 @@
+using SparseArrays
+
+# ----------------------------------------------------------------------------
+# FluidmechCache — preallocated storage for the Stokes solve. Sparsity of the
+# four block matrices (KV, GG, DM, KP) is fully determined by (Nz, Nx, bnchm);
+# only the entry VALUES change each Picard sweep.
+#
+# Strategy: the first call assembles the (I, J, V) triplets locally and builds
+# each block once with `sparse(...)`, then caches `nz_*[k]` = the position in
+# `M.nzval` where triplet k lands. Subsequent calls skip the sort+dedup
+# `sparse(...)` step and scatter the freshly computed values into `M.nzval` via
+# the cached maps (`_scatter!`). The UMFPACK numeric-refactor (`lu!`) reuses the
+# symbolic factorization stored in `lu_F`.
+#
+# Lives on `FluidState.solver`; automatically invalidated if `(Nz, Nx, bnchm)`
+# differs from the cached signature.
+# ----------------------------------------------------------------------------
+
+mutable struct FluidmechCache{T<:AbstractFloat}
+    initialized::Bool
+    sig_Nz::Int;  sig_Nx::Int;  sig_bnchm::Bool
+
+    # cached block matrices (built once, scattered into thereafter)
+    KV::SparseMatrixCSC{T,Int}
+    GG::SparseMatrixCSC{T,Int}
+    DM::SparseMatrixCSC{T,Int}
+    KP::SparseMatrixCSC{T,Int}
+
+    # nz_*[k] = linear index in M.nzval where triplet k contributes
+    nz_KV::Vector{Int}
+    nz_GG::Vector{Int}
+    nz_DM::Vector{Int}
+    nz_KP::Vector{Int}
+
+    # UMFPACK numeric-refactor cache (built lazily on first solve).
+    # Untyped on the matrix-element side because `SparseArrays.UMFPACK.UmfpackLU`
+    # only admits {Float64, ComplexF64}; using the bare UnionAll keeps the field
+    # type valid for `FluidmechCache{Float32}` too, even though Float32 sims
+    # can't actually invoke fluidmech! (UMFPACK won't accept Float32 input).
+    lu_F::Union{Nothing, SparseArrays.UMFPACK.UmfpackLU}
+end
+
+function FluidmechCache(::Type{T}) where {T<:AbstractFloat}
+    FluidmechCache{T}(
+        false, 0, 0, false,
+        spzeros(T, 0, 0), spzeros(T, 0, 0), spzeros(T, 0, 0), spzeros(T, 0, 0),
+        Int[], Int[], Int[], Int[],
+        nothing,
+    )
+end
+
 """
     FluidState{T,A}
 
@@ -35,6 +86,10 @@ struct FluidState{T<:AbstractFloat, A<:AbstractMatrix{T}}
     # momentum-flux history for the inertial RHS in fluidmech!
     rhoWo::A;   rhoWoo::A
     rhoUo::A;   rhoUoo::A
+    # preallocated Stokes-solve cache (sparse blocks + LU). Built lazily on
+    # the first `fluidmech!` call; reused thereafter via in-place nzval
+    # scatter and UMFPACK numeric refactor.
+    solver::FluidmechCache{T}
 end
 
 """
@@ -62,6 +117,7 @@ function FluidState(::Type{T}, backend, Nz::Integer, Nx::Integer) where {T<:Abst
         z(Nz + 1, Nx),      # rhoWoo
         z(Nz, Nx + 1),      # rhoUo
         z(Nz, Nx + 1),      # rhoUoo
+        FluidmechCache(T),  # solver cache (lazy-init on first fluidmech! call)
     )
 end
 

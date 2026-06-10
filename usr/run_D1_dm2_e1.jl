@@ -35,7 +35,7 @@ par = Parameters(Float64;
 
     # numerics
     CFL   = 0.5,
-    rtol  = 1e-6,
+    rtol  = 1e-4,
     atol  = 1e-9,
     maxit = 15,
     alpha = 0.9,
@@ -58,11 +58,6 @@ ns     = NoiseState(Float64, grid, scales)
 hst    = History(Float64)
 
 time0, dt0, step0 = initialize!(phase, fluid, ns, hst, grid, par, scales)
-
-tend   = par.t0end * scales.t0   # dimensional stop time
-nsteps = ceil(Int, tend / scales.dt0) + 10   # upper bound; driver exits early
-
-println("Running $(par.runID) for ≤ roughly $nsteps steps (tend = $(round(tend, sigdigits=3)) s)")
 
 final_time, final_dt = run!(phase, fluid, ns, hst, grid, par, scales;
                             time = time0, dt = dt0, step = step0,
