@@ -18,6 +18,10 @@ using JLD2
 # What is NOT saved:
 #   * `Parameters`, `Grid`, `Scales` — the run script reconstructs these
 #     from source so a checkpoint can't silently drift with code changes.
+#   * non-array solver caches on the states (e.g. `FluidState.solver`, the
+#     lazily-initialized sparse-LU `FluidmechCache`) — deterministic scratch,
+#     rebuilt on the first solve after restart. Only AbstractArray fields of
+#     fluid/phase round-trip.
 
 # Time-evolving fields of NoiseState that must be checkpointed. Everything
 # else in NoiseState (Gkpe, Gkps, padL0, padl0, fL, fl) is deterministic
@@ -56,13 +60,15 @@ function save_checkpoint(path::AbstractString,
                          time::Real, dt::Real, step::Integer)
     mkpath(dirname(path))
     jldopen(path, "w") do f
-        # ---- fluid arrays
+        # ---- fluid arrays (array fields only; solver caches are rebuilt lazily)
         for name in fieldnames(typeof(fluid))
-            f["fluid/$(name)"] = getfield(fluid, name)
+            val = getfield(fluid, name)
+            val isa AbstractArray && (f["fluid/$(name)"] = val)
         end
         # ---- phase arrays (hasx/hasm get recomputed by update!, but cheap to save)
         for name in fieldnames(typeof(phase))
-            f["phase/$(name)"] = getfield(phase, name)
+            val = getfield(phase, name)
+            val isa AbstractArray && (f["phase/$(name)"] = val)
         end
         # ---- noise dynamic state + RNG; static filter kernels are skipped
         for name in noise_dynamic_fields()
@@ -96,15 +102,20 @@ function load_checkpoint!(path::AbstractString,
                           ns::NoiseState, hst::History)
     isfile(path) || error("load_checkpoint!: file not found: $(path)")
     jldopen(path, "r") do f
-        # ---- fluid
+        # ---- fluid (array fields only: solver caches are not checkpointed and
+        # are rebuilt lazily on the first solve; missing keys are tolerated so
+        # checkpoints survive fields being added/retired across code versions)
         for name in fieldnames(typeof(fluid))
-            getfield(fluid, name) .= f["fluid/$(name)"]
+            arr = getfield(fluid, name)
+            arr isa AbstractArray || continue
+            haskey(f, "fluid/$(name)") && (arr .= f["fluid/$(name)"])
         end
         # ---- phase: skip bndtaperw/bndshape (recomputed in initialize!) only if
         # sizes don't match; otherwise overwrite for byte-exact restart.
         for name in fieldnames(typeof(phase))
             arr = getfield(phase, name)
-            arr .= f["phase/$(name)"]
+            arr isa AbstractArray || continue
+            haskey(f, "phase/$(name)") && (arr .= f["phase/$(name)"])
         end
         # ---- noise dynamic state + RNG (copy! preserves the immutable wrapper)
         for name in noise_dynamic_fields()

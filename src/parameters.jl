@@ -50,7 +50,7 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
     rhom0::T            = T(2700)
     rhox0::T            = T(3200)
     d0::T               = T(0.01)
-    g0::T               = T(10)
+    g0::T               = T(9.81)
 
     # --- rheology ---
     etam0::T            = T(1e1)
@@ -75,13 +75,42 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
     CFL::T              = T(0.50)
     rtol::T             = T(1e-4)
     atol::T             = T(1e-9)
-    maxit::Int          = 15
+    maxit::Int          = 25
     alpha::T            = T(0.9)
     gamma::T            = T(1e-3)
     kmin::T             = T(1e-16)
     kmax::T             = T(1e16)
     dtmax::T            = T(1e32)
     etacntr::T          = T(1e8)
+
+    # --- Stokes solver selection + DYREL (pseudo-transient) controls ---
+    solver::Symbol      = :direct           # :direct (sparse-LU) | :dyrel (pseudo-transient) | :gmg (geometric multigrid, dyrel sweep as smoother) | :mg (WIP scalar-Poisson projection)
+    maxit_PH::Int       = 100                # outer Powell-Hestenes iterations
+    maxit_PT::Int       = 50_000            # inner Dynamic-Relaxation iterations per PH step
+    total_iterMax_PT::Int = 50_000          # global DR-iteration cap per fluidmech_dyrel! call (JustRelax `total_iterMax`); accept & let the outer Picard loop continue
+    n_tune_PT::Int      = 25                # re-estimate λ (Gershgorin + Rayleigh) every n iters
+    CFL_PT::T           = T(0.99)           # DR pseudo-time CFL (< 1)
+    c_fact_PT::T        = T(0.5)            # damping scaling factor (Eq. 19, [1/2, 1])
+    γfact_PT::T         = T(50)             # DIMENSIONLESS augmented-Lagrangian over-penalisation factor. The penalty is operator-derived per-cell, γ_eff = γfact/s_P_phys (s_P = Schur diagonal, init.jl). It does double duty: (i) the multiplier/penalty step P_num=γ_eff·R_P, and (ii) the artificial-compressibility η_b=γ_eff in comp=(P−P0)/(η_b·dt). KEY (2026-06-11): comp ∝ 1/(γfact·dt) is a perturbation of each linear solve away from the EXACT (direct) solution — it vanishes only when P→P0 (matrix-free operator itself is identical to :direct, verified 1e-12). At FINITE dt in the inertial production regime a frozen entry-P0 leaves comp > the outer Picard rtol (1e-4) at the default γfact=50, so the Picard loop WOBBLES. TWO cures: (a) :gmg now uses PSEUDO-TRANSIENT P0-tracking (advances P0 each V-cycle, src/dyrel_GMG/vcycle.jl) ⇒ comp→0 at convergence ⇒ :gmg converges at the DEFAULT γfact=50 (no tuning) — PREFERRED for high-N production. (b) a LARGER γfact (≳1e3–5e3) shrinks comp directly and converges BOTH :dyrel and :gmg (use for :dyrel standalone, which can't P0-track without losing its restoring force). The default 50 is the steady/low-N sweet spot (dt→∞, comp≈0): 5→~40 iters, 20→~13, 50→~8, 200→~7.
+    rel_drop_PT::T      = T(1e-2)           # inner-DR tol = outer PH err × rel_drop
+    atol_PH::T          = atol              # per-fluidmech (linear) solve tolerance — AUTO-TRACKS the nonlinear `atol` by default. The outer Picard loop only needs each fluidmech solve as accurate as `atol`; the old fixed 1e-6 made the solver OVER-SOLVE when atol was looser (e.g. atol=1e-3 ⇒ ~1000× wasted work) — catastrophic for :gmg/:mg (each extra V-cycle is expensive) and the cause of dyrel's Picard wobble (linear looser than nonlinear target ⇒ can't reach atol). At matched atol_PH=atol, :gmg is ~21× faster than :dyrel on bnchm_cnsv (128², atol=1e-3). Override explicitly to decouple.
+    pres_relax_PT::T    = T(1.0)            # augmented-Lagrangian multiplier under-relaxation ω in P += ω·γ_eff·R_P (ω=1 = Newton-Uzawa step; <1 under-relaxes for robustness).
+    verbose_PH::Bool    = false             # print outer Powell-Hestenes itPH convergence (JustRelax-style)
+    verbose_DR::Bool    = false             # print inner Dynamic-Relaxation itDR convergence
+    linear_viscosity::Bool = false          # freeze η during the dyrel solve (constant-viscosity tests / MMS). false = recompute the strain-rate rheology η(eII) INSIDE the PT loop (the nonlinear, JustRelax-style path)
+    viscosity_relaxation::T = T(0.5)        # blend weight for the in-loop η update (JustRelax `viscosity_relaxation`; 0.5 = the update.m Picard blend)
+
+    # --- geometric-multigrid (:gmg) controls — the dyrel sweep is the per-level
+    # smoother; only the coarsest level is solved to tolerance. ---
+    mg_minlvl::Int      = 16                 # coarsen until min(Nz,Nx) would drop below this ⇒ coarsest stays ~16–31 cells/dim. 16² is the floor on purpose: the coarse grid must still RESOLVE the nonlinear rheology (power-law / T-dependent η) so the coarse correction sees the right operator (future development). Level count scales with N. GMG efficiency needs grids that coarsen cleanly to ~16 ⇒ resolution must be a multiple of 32 (asserted in build_hierarchy); awkward N (200=8·25) can't and is rejected.
+    mg_npre::Int        = 2                  # pre-smooth PH steps per level (V-cycle down)
+    mg_npost::Int       = 2                  # post-smooth PH steps per level (V-cycle up)
+    mg_ncoarse::Int     = 20                 # max coarsest-level PH steps (solve-to-tolerance budget)
+    mg_coarse_rtol::T   = T(1e-2)            # coarsest-level relative residual drop (solve-to-tolerance)
+    mg_inner::Int       = 32                 # DR iterations per smoothing PH step — an EXACT count (no polling/reductions inside the smoother). The old ~32 stability floor came from the smoother running UNDAMPED (Rayleigh c never computed within a short sweep); with the fixed per-level damping `mg_cfact` much smaller counts are stable — tune down for cheaper V-cycles.
+    mg_cfact::T         = T(1)               # per-level smoother damping scale: c_level = mg_cfact·√(mean λmax), the critical damping of the upper half-spectrum (λ ≳ λmax/4) the level must smooth (coarser levels handle the rest). 0 reproduces the old undamped smoother.
+    mg_gfact::T         = γfact_PT           # SMOOTHING-level AL over-penalization (coarsest always keeps γfact_PT). MEASURED (harness, step-1 state, N=128/256): REDUCING it below γfact_PT makes the V-cycle WORSE — ρ_cycle 0.55→1.8→3.7 for 50→2→1 at N=128 full depth — because the per-sweep multiplier update γ_eff·R_P is the only high-frequency PRESSURE smoothing the level has; weakening it starves intermediate levels (they neither smooth nor solve P) and the cycle amplifies. The "small γ inside MG" theory (grad-div spectrum compression) is falsified for this scheme; keep the penalty strong on all levels. Knob retained for experiments.
+    mg_gamma::T         = T(1.0)             # coarse-grid-correction damping γ_mg. γ_mg=1 = full (undamped) correction = textbook MG. HISTORY: with a FROZEN entry-P0 comp term, γ_mg=1 DIVERGED (ρ_cycle≈1.6 → 1e16) because the over-penalised, biased per-cycle system over-corrected; the workaround was γ_mg=0.5. The PSEUDO-TRANSIENT P0-tracking fix (vcycle.jl, advance P0 each V-cycle) makes each cycle solve a well-posed per-increment system, which STABILISES the full correction: measured at N=256 production, γ_mg=1.0 ⇒ a FLAT 6 V-cycles/solve (textbook), vs 0.5 ⇒ ~19–64 (the constant-0.87 factor mode). γ_mg=1.2 over-shoots/diverges, so 1.0 is the optimum. (Restoring γ_mg=1 is THE efficiency win that lets :gmg beat :direct at large N — O(N²·6) vs O(N³).)
 
     # --- modes ---
     bnchm::Bool         = false             # MMS benchmark mode

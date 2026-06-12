@@ -48,6 +48,65 @@ function _scatter!(M::SparseMatrixCSC{T,Int}, nz_map::Vector{Int}, vals::Vector{
 end
 
 """
+    _block_map(LL, B, roff, coff) -> Vector{Int}
+
+For block `B` placed at global offset `(roff, coff)` inside `LL`, return the
+position in `LL.nzval` of each of `B`'s structural nonzeros, in `B.nzval` order.
+The four blocks of `[KV GG; DM KP]` occupy disjoint quadrants, so later sweeps
+copy each `B.nzval` straight into `LL.nzval` via this map — no sparse concat.
+"""
+function _block_map(LL::SparseMatrixCSC{T,Int}, B::SparseMatrixCSC{T,Int},
+                    roff::Int, coff::Int) where {T}
+    map = Vector{Int}(undef, nnz(B))
+    k = 0
+    @inbounds for j in 1:size(B, 2)
+        gcol = j + coff
+        lo = LL.colptr[gcol];  hi = LL.colptr[gcol + 1] - 1
+        for p in B.colptr[j]:(B.colptr[j + 1] - 1)
+            grow = B.rowval[p] + roff
+            pos  = searchsortedfirst(view(LL.rowval, lo:hi), grow) + lo - 1
+            k += 1;  map[k] = pos
+        end
+    end
+    return map
+end
+
+"""Copy `B.nzval` into `LL.nzval` at the positions in `map` (from `_block_map`)."""
+function _fill_block!(LL::SparseMatrixCSC{T,Int}, map::Vector{Int},
+                      B::SparseMatrixCSC{T,Int}) where {T}
+    nz = B.nzval
+    @inbounds for k in eachindex(nz)
+        LL.nzval[map[k]] = nz[k]
+    end
+    return LL
+end
+
+"""Column index of every stored entry of `A`, in `A.nzval` order."""
+function _col_of_nzval(A::SparseMatrixCSC{T,Int}) where {T}
+    col = Vector{Int}(undef, nnz(A))
+    @inbounds for j in 1:size(A, 2), p in A.colptr[j]:(A.colptr[j + 1] - 1)
+        col[p] = j
+    end
+    return col
+end
+
+"""
+    _scale_into!(LLs, LL, Lcol, scl) -> LLs
+
+In-place symmetric Jacobi scaling `LLs = Diagonal(scl)·LL·Diagonal(scl)`,
+reusing `LLs`'s storage (which shares `LL`'s structure). Replaces forming the
+two sparse products `SCL*LL*SCL`.
+"""
+function _scale_into!(LLs::SparseMatrixCSC{T,Int}, LL::SparseMatrixCSC{T,Int},
+                      Lcol::Vector{Int}, scl::Vector{T}) where {T}
+    Lrow = LL.rowval;  Lnz = LL.nzval;  Snz = LLs.nzval
+    @inbounds for k in eachindex(Lnz)
+        Snz[k] = scl[Lrow[k]] * Lnz[k] * scl[Lcol[k]]
+    end
+    return LLs
+end
+
+"""
     fluidmech!(state, grid, par;
                bnchm_data = nothing,
                sds = -1, top_cnv = 1, bot_cnv = 1, open_cnv = false,
@@ -77,7 +136,8 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
                     zBC::Symbol = :closed,
                     dt::Real = T(1e32),
                     a1::Real = T(1), a2::Real = T(1), a3::Real = T(0),
-                    b1::Real = T(1), b2::Real = T(0), b3::Real = T(0)) where {T<:AbstractFloat}
+                    b1::Real = T(1), b2::Real = T(0), b3::Real = T(0),
+                    verbose = false) where {T<:AbstractFloat}
     bnchm = bnchm_data !== nothing
     Nz = grid.Nz;  Nx = grid.Nx;  h = grid.h
     g0 = par.g0;   gamma = par.gamma
@@ -88,6 +148,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     # Invalidate if grid size or MMS flag changed (different sparsity).
     if cache.initialized && (cache.sig_Nz != Nz || cache.sig_Nx != Nx || cache.sig_bnchm != bnchm)
         cache.initialized = false
+        cache.LL_initialized = false
         cache.lu_F = nothing
     end
 
@@ -191,55 +252,55 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     end
 
     # internal W points
-    let ii    = vec(MapW[2:end-1, 2:end-1]),
-        EtaC1 = vec(etaco[2:end-1, 1:end-1]),
-        EtaC2 = vec(etaco[2:end-1, 2:end]),
-        EtaP1 = vec(eta[1:end-1, :]),
-        EtaP2 = vec(eta[2:end,   :])
-        # coefficients multiplying z-velocities W
-        jj1 = vec(MapW[1:end-2, 2:end-1])    # top
-        jj2 = vec(MapW[3:end,   2:end-1])    # bottom
-        jj3 = vec(MapW[2:end-1, 1:end-2])    # left
-        jj4 = vec(MapW[2:end-1, 3:end])      # right
+    @timeit_debug TO "assemble:stencils" let
+        EtaC1 = vec(etaco[2:end-1, 1:end-1]);  EtaC2 = vec(etaco[2:end-1, 2:end])
+        EtaP1 = vec(eta[1:end-1, :]);          EtaP2 = vec(eta[2:end, :])
+        ii    = vec(MapW[2:end-1, 2:end-1])    # row index — needed every sweep for the RHS
 
-        # inertial term  rhow .* a1 / dt
-        aa = a1 .* vec(rhow[2:end-1, :]) ./ T(dt)
-        append!(IIL, ii); append!(JJL, ii); append!(AAL, aa) # inertial term
+        # coefficient VALUES (recomputed every sweep, appended to AAL in a fixed
+        # band order); the matching INDEX bands are built once, below.
+        append!(AAL, a1 .* vec(rhow[2:end-1, :]) ./ T(dt))                              # 1 inertial  (ii,ii)
+        append!(AAL, T(2/3).*(EtaP1.+EtaP2).*invh2 .+ T(1/2).*(EtaC1.+EtaC2).*invh2)    # 2 center    (ii,ii)
+        append!(AAL, -T(2/3) .* EtaP1 .* invh2)                                         # 3 above     (ii,jj1)
+        append!(AAL, -T(2/3) .* EtaP2 .* invh2)                                         # 4 below     (ii,jj2)
+        append!(AAL, -T(1/2) .* EtaC1 .* invh2)                                         # 5 left      (ii,jj3)
+        append!(AAL, -T(1/2) .* EtaC2 .* invh2)                                         # 6 right     (ii,jj4)
+        if !bnchm                                                                        # 7 drunken   (ii,ii)
+            append!(AAL, vec((rho[2:end, :] .- rho[1:end-1, :]) .* invh) .* g0 .* T(dt))
+        end
+        append!(AAL, -(T(1/2).*EtaC1 .- T(1/3).*EtaP1) .* invh2)                        # 8  Utl (ii,jU1)
+        append!(AAL, +(T(1/2).*EtaC1 .- T(1/3).*EtaP2) .* invh2)                        # 9  Ubl (ii,jU2)
+        append!(AAL, +(T(1/2).*EtaC2 .- T(1/3).*EtaP1) .* invh2)                        # 10 Utr (ii,jU3)
+        append!(AAL, -(T(1/2).*EtaC2 .- T(1/3).*EtaP2) .* invh2)                        # 11 Ubr (ii,jU4)
 
-        # diagonal stress coefficient
-        aa = T(2/3) .* (EtaP1 .+ EtaP2) .* invh2 .+ T(1/2) .* (EtaC1 .+ EtaC2) .* invh2
-        append!(IIL, ii); append!(JJL, ii); append!(AAL,  aa)                           # W on stencil center
-        append!(IIL, ii); append!(JJL, jj1); append!(AAL, -T(2/3) .* EtaP1 .* invh2)    # W one above
-        append!(IIL, ii); append!(JJL, jj2); append!(AAL, -T(2/3) .* EtaP2 .* invh2)    # W one below
-        append!(IIL, ii); append!(JJL, jj3); append!(AAL, -T(1/2) .* EtaC1 .* invh2)    # W one to the left
-        append!(IIL, ii); append!(JJL, jj4); append!(AAL, -T(1/2) .* EtaC2 .* invh2)    # W one to the right
-
-        # what shall we do with the drunken sailor...
-        if !bnchm
-            ddz_rho = (rho[2:end, :] .- rho[1:end-1, :]) .* invh
-            aa = vec(ddz_rho) .* g0 .* T(dt)
-            append!(IIL, ii); append!(JJL, ii); append!(AAL, aa)
+        # INDEX bands (first call only — identical band order to the values; the
+        # sparsity pattern + nzmap are built from these once and reused).
+        if !cache.initialized
+            jj1 = vec(MapW[1:end-2, 2:end-1]); jj2 = vec(MapW[3:end, 2:end-1])
+            jj3 = vec(MapW[2:end-1, 1:end-2]); jj4 = vec(MapW[2:end-1, 3:end])
+            jU1 = vec(MapU[2:end-2, 1:end-1]); jU2 = vec(MapU[3:end-1, 1:end-1])
+            jU3 = vec(MapU[2:end-2, 2:end]);   jU4 = vec(MapU[3:end-1, 2:end])
+            append!(IIL, ii); append!(JJL, ii)                                # 1 inertial
+            append!(IIL, ii); append!(JJL, ii)                                # 2 center
+            append!(IIL, ii); append!(JJL, jj1)                               # 3 above
+            append!(IIL, ii); append!(JJL, jj2)                               # 4 below
+            append!(IIL, ii); append!(JJL, jj3)                               # 5 left
+            append!(IIL, ii); append!(JJL, jj4)                               # 6 right
+            !bnchm && (append!(IIL, ii); append!(JJL, ii))                    # 7 drunken
+            append!(IIL, ii); append!(JJL, jU1)                               # 8
+            append!(IIL, ii); append!(JJL, jU2)                               # 9
+            append!(IIL, ii); append!(JJL, jU3)                               # 10
+            append!(IIL, ii); append!(JJL, jU4)                               # 11
         end
 
-        # coefficients multiplying x-velocities U
-        jU1 = vec(MapU[2:end-2, 1:end-1])   # top left
-        jU2 = vec(MapU[3:end-1, 1:end-1])   # bottom left
-        jU3 = vec(MapU[2:end-2, 2:end])     # top right
-        jU4 = vec(MapU[3:end-1, 2:end])     # bottom right
-
-        append!(IIL, ii); append!(JJL, jU1); append!(AAL, -(T(1/2) .* EtaC1 .- T(1/3) .* EtaP1) .* invh2)   # U one to the top and left
-        append!(IIL, ii); append!(JJL, jU2); append!(AAL, +(T(1/2) .* EtaC1 .- T(1/3) .* EtaP2) .* invh2)   # U one to the bottom and left
-        append!(IIL, ii); append!(JJL, jU3); append!(AAL, +(T(1/2) .* EtaC2 .- T(1/3) .* EtaP1) .* invh2)   # U one to the top and right
-        append!(IIL, ii); append!(JJL, jU4); append!(AAL, -(T(1/2) .* EtaC2 .- T(1/3) .* EtaP2) .* invh2)   # U one to the bottom and right
-
-        # z - RHS vector
-        f_mz    = rhow[2:end-1, :] .* W[2:end-1, 2:end-1]
-        u_mz    = (U[2:end-2, :] .+ U[3:end-1, :]) ./ T(2)
-        w_mz    = (W[1:end-1, 2:end-1] .+ W[2:end, 2:end-1]) ./ T(2)
-        advn_mz = similar(f_mz)
+        # z-momentum RHS (every sweep; reuses the cached advection out-buffer)
+        f_mz = rhow[2:end-1, :] .* W[2:end-1, 2:end-1]
+        u_mz = (U[2:end-2, :] .+ U[3:end-1, :]) ./ T(2)
+        w_mz = (W[1:end-1, 2:end-1] .+ W[2:end, 2:end-1]) ./ T(2)
+        size(cache.advn_mz) == size(f_mz) || (cache.advn_mz = similar(f_mz))
+        advn_mz = cache.advn_mz
         advect_centered!(advn_mz, f_mz, u_mz, w_mz, h, par.ADVN; xBC, zBC)
-        rr =  + Drho[2:end-1, :] .* g0 .+ (a2 .* rhoWo[2:end-1, :] .+ a3 .* rhoWoo[2:end-1, :]) ./ T(dt) .- advn_mz
-
+        rr = Drho[2:end-1, :] .* g0 .+ (a2 .* rhoWo[2:end-1, :] .+ a3 .* rhoWoo[2:end-1, :]) ./ T(dt) .- advn_mz
         if bnchm
             rr .+= bnchm_data.src_W[2:end-1, 2:end-1]
         end
@@ -267,50 +328,51 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     end
 
     # internal points
-    let ii    = vec(MapU[2:end-1, :]),
-        EtaC1 = vec(etaco[1:end-1, :]),
-        EtaC2 = vec(etaco[2:end,   :]),
-        EtaP1 = vec(eta[:, icx[1:end-1]]),
-        EtaP2 = vec(eta[:, icx[2:end]])
+    @timeit_debug TO "assemble:stencils" let
+        EtaC1 = vec(etaco[1:end-1, :]);        EtaC2 = vec(etaco[2:end, :])
+        EtaP1 = vec(eta[:, icx[1:end-1]]);     EtaP2 = vec(eta[:, icx[2:end]])
+        ii    = vec(MapU[2:end-1, :])          # row index — needed every sweep for the RHS
 
-        jj1 = vec(MapU[2:end-1, ifx[1:end-2]])    # left
-        jj2 = vec(MapU[2:end-1, ifx[3:end]])      # right
-        jj3 = vec(MapU[1:end-2, ifx[2:end-1]])    # top
-        jj4 = vec(MapU[3:end,   ifx[2:end-1]])    # bottom
+        # coefficient VALUES (every sweep, fixed band order)
+        append!(AAL, vec((a1 + gamma) .* rhou ./ T(dt)))                                # 1 inertial  (ii,ii)
+        append!(AAL, T(2/3).*(EtaP1.+EtaP2).*invh2 .+ T(1/2).*(EtaC1.+EtaC2).*invh2)    # 2 center    (ii,ii)
+        append!(AAL, -T(2/3) .* EtaP1 .* invh2)                                         # 3 left      (ii,jj1)
+        append!(AAL, -T(2/3) .* EtaP2 .* invh2)                                         # 4 right     (ii,jj2)
+        append!(AAL, -T(1/2) .* EtaC1 .* invh2)                                         # 5 top       (ii,jj3)
+        append!(AAL, -T(1/2) .* EtaC2 .* invh2)                                         # 6 bottom    (ii,jj4)
+        if !bnchm                                                                        # 7 drunken   (ii,ii)
+            append!(AAL, vec((rho[:, icx[2:end]] .- rho[:, icx[1:end-1]]) .* invh) .* g0 .* T(dt))
+        end
+        append!(AAL, -(T(1/2).*EtaC1 .- T(1/3).*EtaP1) .* invh2)                        # 8  Wtl (ii,jW1)
+        append!(AAL, +(T(1/2).*EtaC1 .- T(1/3).*EtaP2) .* invh2)                        # 9  Wtr (ii,jW2)
+        append!(AAL, +(T(1/2).*EtaC2 .- T(1/3).*EtaP1) .* invh2)                        # 10 Wbl (ii,jW3)
+        append!(AAL, -(T(1/2).*EtaC2 .- T(1/3).*EtaP2) .* invh2)                        # 11 Wbr (ii,jW4)
 
-        # inertial term — note (a1 + gamma) here matches MATLAB exactly
-        aa = (a1 + gamma) .* rhou ./ T(dt)
-        append!(IIL, ii); append!(JJL, ii); append!(AAL, vec(aa))
-
-        aa = T(2/3) .* (EtaP1 .+ EtaP2) .* invh2 .+ T(1/2) .* (EtaC1 .+ EtaC2) .* invh2
-        append!(IIL, ii); append!(JJL, ii);  append!(AAL,  aa)
-        append!(IIL, ii); append!(JJL, jj1); append!(AAL, -T(2/3) .* EtaP1 .* invh2)
-        append!(IIL, ii); append!(JJL, jj2); append!(AAL, -T(2/3) .* EtaP2 .* invh2)
-        append!(IIL, ii); append!(JJL, jj3); append!(AAL, -T(1/2) .* EtaC1 .* invh2)
-        append!(IIL, ii); append!(JJL, jj4); append!(AAL, -T(1/2) .* EtaC2 .* invh2)
-
-        # what shall we do with the drunken sailor...
-        if !bnchm
-            ddx_rho = (rho[:, icx[2:end]] .- rho[:, icx[1:end-1]]) .* invh
-            aa = vec(ddx_rho) .* g0 .* T(dt)
-            append!(IIL, ii); append!(JJL, ii); append!(AAL, aa)
+        # INDEX bands (first call only — identical band order to the values)
+        if !cache.initialized
+            jj1 = vec(MapU[2:end-1, ifx[1:end-2]]); jj2 = vec(MapU[2:end-1, ifx[3:end]])
+            jj3 = vec(MapU[1:end-2, ifx[2:end-1]]); jj4 = vec(MapU[3:end, ifx[2:end-1]])
+            jW1 = vec(MapW[1:end-1, 1:end-1]); jW2 = vec(MapW[1:end-1, 2:end])
+            jW3 = vec(MapW[2:end, 1:end-1]);   jW4 = vec(MapW[2:end, 2:end])
+            append!(IIL, ii); append!(JJL, ii)                                # 1 inertial
+            append!(IIL, ii); append!(JJL, ii)                                # 2 center
+            append!(IIL, ii); append!(JJL, jj1)                               # 3 left
+            append!(IIL, ii); append!(JJL, jj2)                               # 4 right
+            append!(IIL, ii); append!(JJL, jj3)                               # 5 top
+            append!(IIL, ii); append!(JJL, jj4)                               # 6 bottom
+            !bnchm && (append!(IIL, ii); append!(JJL, ii))                    # 7 drunken
+            append!(IIL, ii); append!(JJL, jW1)                               # 8
+            append!(IIL, ii); append!(JJL, jW2)                               # 9
+            append!(IIL, ii); append!(JJL, jW3)                               # 10
+            append!(IIL, ii); append!(JJL, jW4)                               # 11
         end
 
-        # coefficients multiplying z-velocities W
-        jW1 = vec(MapW[1:end-1, 1:end-1])    # top left
-        jW2 = vec(MapW[1:end-1, 2:end])      # top right
-        jW3 = vec(MapW[2:end,   1:end-1])    # bottom left
-        jW4 = vec(MapW[2:end,   2:end])      # bottom right
-        append!(IIL, ii); append!(JJL, jW1); append!(AAL, -(T(1/2) .* EtaC1 .- T(1/3) .* EtaP1) .* invh2)   # W one to the top and left
-        append!(IIL, ii); append!(JJL, jW2); append!(AAL, +(T(1/2) .* EtaC1 .- T(1/3) .* EtaP2) .* invh2)   # W one to the top and right
-        append!(IIL, ii); append!(JJL, jW3); append!(AAL, +(T(1/2) .* EtaC2 .- T(1/3) .* EtaP1) .* invh2)   # W one to the bottom and left
-        append!(IIL, ii); append!(JJL, jW4); append!(AAL, -(T(1/2) .* EtaC2 .- T(1/3) .* EtaP2) .* invh2)   # W one to the bottom and right
-
-        # x-RHS vector
-        u_mx    = (U[2:end-1, ifx[1:end-1]] .+ U[2:end-1, ifx[2:end]]) ./ T(2)
-        w_mx    = (W[:, 1:end-1] .+ W[:, 2:end]) ./ T(2)
-        f_mx    = rhou .* U[2:end-1, :]
-        advn_mx = similar(f_mx)
+        # x-momentum RHS (every sweep; reuses the cached advection out-buffer)
+        u_mx = (U[2:end-1, ifx[1:end-1]] .+ U[2:end-1, ifx[2:end]]) ./ T(2)
+        w_mx = (W[:, 1:end-1] .+ W[:, 2:end]) ./ T(2)
+        f_mx = rhou .* U[2:end-1, :]
+        size(cache.advn_mx) == size(f_mx) || (cache.advn_mx = similar(f_mx))
+        advn_mx = cache.advn_mx
         advect_centered!(advn_mx, f_mx, u_mx, w_mx, h, par.ADVN; xBC, zBC)
         # average the periodic-equivalent boundary columns (fluidmech.m:164)
         col_avg = (advn_mx[:, 1] .+ advn_mx[:, end]) ./ T(2)
@@ -326,7 +388,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     # assemble coefficient matrix & right-hand side vector — first call builds
     # the sparsity, subsequent calls only scatter the new AAL values into the
     # cached `cache.KV.nzval`.
-    if cache.initialized
+    @timeit_debug TO "assemble:build" if cache.initialized
         _scatter!(cache.KV, cache.nz_KV, AAL)
         KV = cache.KV
     else
@@ -355,7 +417,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIL_g, ii); append!(JJL_g, jj2); append!(AAL_g, fill(+invh, aa))    # one to the right
     end
     # assemble coefficient matrix
-    if cache.initialized
+    @timeit_debug TO "assemble:build" if cache.initialized
         _scatter!(cache.GG, cache.nz_GG, AAL_g)
         GG = cache.GG
     else
@@ -370,22 +432,25 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     JJL_d = Int[];  # variable indeces into A
     AAL_d = T[]     # coefficients for A
     # internal points
-    let ii  = vec(MapP[2:end-1, 2:end-1]),
-        jUL = vec(MapU[2:end-1, 1:end-1]),      # left U
-        jUR = vec(MapU[2:end-1, 2:end]),        # right U
-        jWT = vec(MapW[1:end-1, 2:end-1]),      # top W
-        jWB = vec(MapW[2:end,   2:end-1]),      # bottom W
-        r1  = vec(rhou[:, 1:end-1]),
-        r2  = vec(rhou[:, 2:end]),
-        r3  = vec(rhow[1:end-1, :]),
-        r4  = vec(rhow[2:end,   :])
-        append!(IIL_d, ii); append!(JJL_d, jUL); append!(AAL_d, -r1 .* invh)    # U one to the left
-        append!(IIL_d, ii); append!(JJL_d, jUR); append!(AAL_d, +r2 .* invh)    # U one to the right
-        append!(IIL_d, ii); append!(JJL_d, jWT); append!(AAL_d, -r3 .* invh)    # W one above
-        append!(IIL_d, ii); append!(JJL_d, jWB); append!(AAL_d, +r4 .* invh)    # W one below
+    @timeit_debug TO "assemble:stencils" let
+        # coefficient VALUES (every sweep, fixed band order)
+        append!(AAL_d, -vec(rhou[:, 1:end-1]) .* invh)   # 1 left U  (ii,jUL)
+        append!(AAL_d, +vec(rhou[:, 2:end])   .* invh)   # 2 right U (ii,jUR)
+        append!(AAL_d, -vec(rhow[1:end-1, :]) .* invh)   # 3 top W   (ii,jWT)
+        append!(AAL_d, +vec(rhow[2:end,   :]) .* invh)   # 4 bot W   (ii,jWB)
+        # INDEX bands (first call only — DM has no RHS, so ii is unused later)
+        if !cache.initialized
+            ii  = vec(MapP[2:end-1, 2:end-1])
+            jUL = vec(MapU[2:end-1, 1:end-1]); jUR = vec(MapU[2:end-1, 2:end])
+            jWT = vec(MapW[1:end-1, 2:end-1]); jWB = vec(MapW[2:end, 2:end-1])
+            append!(IIL_d, ii); append!(JJL_d, jUL)
+            append!(IIL_d, ii); append!(JJL_d, jUR)
+            append!(IIL_d, ii); append!(JJL_d, jWT)
+            append!(IIL_d, ii); append!(JJL_d, jWB)
+        end
     end
     # Assemble coefficient matrix
-    if cache.initialized
+    @timeit_debug TO "assemble:build" if cache.initialized
         _scatter!(cache.DM, cache.nz_DM, AAL_d)
         DM = cache.DM
     else
@@ -431,7 +496,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         np0 = MapP[round(Int, Nz / 2), round(Int, Nx / 2)]
         push!(IIL_p, np0); push!(JJL_p, np0); push!(AAL_p, zero(T))
     end
-    if cache.initialized
+    @timeit_debug TO "assemble:build" if cache.initialized
         _scatter!(cache.KP, cache.nz_KP, AAL_p)
         KP = cache.KP
     else
@@ -487,8 +552,32 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         end
     end
 
-    # assemble and scale global coefficient matrix and right-hand side vector
-    LL = [KV GG; DM KP]
+    # ---- merge blocks into the global system, reusing cached structure -------
+    # The four blocks occupy disjoint quadrants of `LL = [KV GG; DM KP]` and
+    # their sparsity is fixed across sweeps, so after the first call we scatter
+    # the freshly-assembled block values straight into `cache.LL.nzval` instead
+    # of re-running the sparse vcat/hcat concat.
+    if cache.LL_initialized
+        @timeit_debug TO "merge" begin
+            _fill_block!(cache.LL, cache.map_KV, KV)
+            _fill_block!(cache.LL, cache.map_GG, GG)
+            _fill_block!(cache.LL, cache.map_DM, DM)
+            _fill_block!(cache.LL, cache.map_KP, KP)
+        end
+        LL = cache.LL
+    else
+        LL = @timeit_debug TO "merge" [KV GG; DM KP]
+        cache.LL     = LL
+        cache.map_KV = _block_map(LL, KV, 0,       0)
+        cache.map_GG = _block_map(LL, GG, 0,       NW + NU)
+        cache.map_DM = _block_map(LL, DM, NW + NU, 0)
+        cache.map_KP = _block_map(LL, KP, NW + NU, NW + NU)
+        cache.Lcol   = _col_of_nzval(LL)
+        cache.LLs    = SparseMatrixCSC(size(LL, 1), size(LL, 2),
+                                       copy(LL.colptr), copy(LL.rowval),
+                                       similar(LL.nzval))
+        cache.LL_initialized = true
+    end
     RR = sparsevec(1:(NW + NU + NP),
                    vcat(Vector(RV), Vector(RP)), NW + NU + NP)
 
@@ -497,19 +586,21 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     scl_p  = ones(T, Nz + 2, Nx + 2)
     @views scl_p[2:end-1, 2:end-1] .= rho ./ eta
     extra  = vcat(zeros(T, NU + NW), sqrt.(T(1) ./ vec(scl_p)))
-    scl    = T(1) ./ (sqrt.(diagLL) .+ extra)
-    SCL    = Diagonal(scl)
+    scl    = collect(T(1) ./ (sqrt.(diagLL) .+ extra))
 
     SOL = vcat(vec(W), vec(U), vec(P))
-    # collect to dense Vector — UMFPACK \ doesn't accept SparseVector RHS,
-    # and the scaling step can leak the sparse type through `Diagonal *` ops.
-    FF::Vector{T}  = collect(SCL * (LL * SOL .- Vector(RR)))
-    LLs::SparseMatrixCSC{T,Int} = SCL * LL * SCL
+    # symmetric Jacobi scaling applied in place: LLs = D·LL·D shares LL's
+    # structure (so UMFPACK keeps refactoring the same pattern), rewriting nzval
+    # rather than forming the two sparse products `SCL*LL*SCL`.
+    LLs::SparseMatrixCSC{T,Int} = @timeit_debug TO "scale" _scale_into!(cache.LLs, LL, cache.Lcol, scl)
+    # RHS: FF = D·(LL·SOL − RR); LL·SOL and RR are length-ndof (cheap). UMFPACK
+    # \ needs a dense RHS, so collect.
+    FF::Vector{T} = @timeit_debug TO "scale" collect(scl .* (LL * SOL .- Vector(RR)))
 
     # UMFPACK numeric-refactor reuse: keep one UmfpackLU instance, refactor
     # in-place via `lu!(F, LLs)` on subsequent calls (symbolic stays valid
     # because LLs has the same sparsity each call).
-    if cache.lu_F === nothing
+    @timeit_debug TO "factor" if cache.lu_F === nothing
         cache.lu_F = lu(LLs)
     else
         try
@@ -519,7 +610,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
             cache.lu_F = lu(LLs)
         end
     end
-    UPD_perm = cache.lu_F \ FF
+    UPD_perm = @timeit_debug TO "solve" cache.lu_F \ FF
     UPD      = scl .* UPD_perm
 
     # decode update (matching MATLAB sign convention)

@@ -21,16 +21,23 @@ With closed segregation boundaries (`open_sgr = false`), the taper is ≈ 0 at
 both z = 0 and z = D and ≈ 1 in the interior. Multiplied into `wx` it zeroes
 the segregation speed at impermeable boundaries.
 """
+@kernel function _bndtaperw_kernel!(bndtaperw, h, D, l0h, osgr)
+    j, i = @index(Global, NTuple)
+    @inbounds begin
+        z = (j - one(h)) * h
+        bndtaperw[j, i] = one(h) -
+            (exp(-z / l0h) + exp(-(D - z) / l0h)) * (one(h) - osgr)
+    end
+end
+
 function compute_bndtaperw!(phase::PhaseState{T}, grid::Grid{T},
                             par::Parameters{T}, scales::Scales{T}) where {T<:AbstractFloat}
-    Nz1, Nx2 = size(phase.bndtaperw)
-    h = grid.h;  D = grid.D;  l0h = scales.l0h
+    backend = KernelAbstractions.get_backend(phase.bndtaperw)
+    h = T(grid.h);  D = T(grid.D);  l0h = T(scales.l0h)
     osgr = par.open_sgr ? one(T) : zero(T)
-    @inbounds for j in 1:Nz1, i in 1:Nx2
-        z = T(j - 1) * h
-        phase.bndtaperw[j, i] = one(T) -
-            (exp(-z / l0h) + exp(-(D - z) / l0h)) * (one(T) - osgr)
-    end
+    _bndtaperw_kernel!(backend)(phase.bndtaperw, h, D, l0h, osgr;
+                                          ndrange = size(phase.bndtaperw))
+    KernelAbstractions.synchronize(backend)
     return nothing
 end
 
@@ -44,13 +51,38 @@ Fill `phase.bndshape` (sized `(Nz, Nx)`) per `init.m` line 141:
 Top-localised exponential profile that selects where boundary
 crystallisation `Gx = G0·(1-x)·bndshape` is active.
 """
+@kernel function _bndshape_kernel!(bndshape, h, bnd_w)
+    j, i = @index(Global, NTuple)
+    @inbounds begin
+        zc = (j - oftype(h, 0.5)) * h
+        bndshape[j, i] = exp((-zc + h / oftype(h, 2)) / bnd_w)
+    end
+end
+
+# Initial-condition fill for the crystallinity field `x` (init.m:157-159).
+# `rp` (normalised host random field) is already on-device; `gp` is the analytic
+# Gaussian bump in cell position. Runs on the backend of `x`.
+@kernel function _init_x_kernel!(x, @Const(rp), @Const(bndshape),
+                                 h, L, D, x0, Da, dxr, dxg)
+    iz, ix = @index(Global, NTuple)
+    @inbounds begin
+        half = oftype(h, 0.5)
+        xc = (ix - half) * h / L
+        zc = (iz - half) * h / D
+        c  = oftype(h, 0.125)
+        gp = exp(-((xc - half) / c)^2) * exp(-((zc - half) / c)^2)
+        xin = x0 + (Da - x0) * bndshape[iz, ix]
+        x[iz, ix] = xin * (one(h) + dxr * rp[iz, ix] + dxg * gp)
+    end
+end
+
 function compute_bndshape!(phase::PhaseState{T}, grid::Grid{T},
                            scales::Scales{T}) where {T<:AbstractFloat}
-    h = grid.h;  bnd_w = scales.bnd_w
-    @inbounds for j in 1:size(phase.bndshape, 1), i in 1:size(phase.bndshape, 2)
-        zc = (T(j) - T(0.5)) * h
-        phase.bndshape[j, i] = exp((-zc + h / T(2)) / bnd_w)
-    end
+    backend = KernelAbstractions.get_backend(phase.bndshape)
+    h = T(grid.h);  bnd_w = T(scales.bnd_w)
+    _bndshape_kernel!(backend)(phase.bndshape, h, bnd_w;
+                                         ndrange = size(phase.bndshape))
+    KernelAbstractions.synchronize(backend)
     return nothing
 end
 
@@ -95,17 +127,19 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
     # Gaussian + random perturbation (init.m:157-159):
     #   xin = x0 + (Da - x0) * bndshape
     #   x   = xin * (1 + dxr * rp + dxg * gp)
-    rng_seed = par.seed
-    rp = randn(MersenneTwister(rng_seed), T, Nz, Nx)
-    rp .= (rp .- sum(rp) / length(rp)) ./ std(rp)
-    @inbounds for j in 1:Nz, i in 1:Nx
-        xc = (T(i) - T(0.5)) * grid.h / grid.L
-        zc = (T(j) - T(0.5)) * grid.h / grid.D
-        gp = exp(-((xc - T(0.5)) / T(0.125))^2) *
-             exp(-((zc - T(0.5)) / T(0.125))^2)
-        xin = par.x0 + (par.Da - par.x0) * phase.bndshape[j, i]
-        phase.x[j, i] = xin * (one(T) + par.dxr * rp[j, i] + par.dxg * gp)
-    end
+    # The random field `rp` is drawn + normalised on the host (seeded
+    # MersenneTwister ⇒ reproducible across backends), transferred to the device
+    # once, then the per-cell assignment runs as a kernel on whatever backend
+    # `phase.x` lives on. `gp` is analytic in the cell position.
+    backend = KernelAbstractions.get_backend(phase.x)
+    rp_h = randn(MersenneTwister(par.seed), T, Nz, Nx)
+    rp_h .= (rp_h .- sum(rp_h) / length(rp_h)) ./ std(rp_h)
+    rp = adapt_backend(backend, rp_h)
+    _init_x_kernel!(backend)(phase.x, rp, phase.bndshape,
+                                       T(grid.h), T(grid.L), T(grid.D),
+                                       T(par.x0), T(par.Da), T(par.dxr), T(par.dxg);
+                                       ndrange = (Nz, Nx))
+    KernelAbstractions.synchronize(backend)
     phase.m .= one(T) .- phase.x
 
     # seed eta to the melt viscosity so the Picard blend in update_viscosity!
@@ -191,7 +225,12 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
     time = T(time)
     dt   = T(dt)
     step = Int(step)
-    res  = StepResidual(grid)
+    res  = StepResidual(grid, fluid)
+
+    # Stokes/Navier-Stokes solver strategy (:direct | :dyrel | :gmg | :mg).
+    # Persistent state (caches, MG hierarchy) allocated once, reused across all
+    # Picard sweeps and time steps. Dispatch via `solve_fluidmech!` below.
+    solver = make_solver(par, fluid, phase, grid)
 
     tend_dim = T(par.tend)
     tend_t0  = T(par.t0end) * T(scales.t0)
@@ -227,11 +266,9 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                 t_phs += @elapsed phsevo!(phase, fluid, grid, par, scales;
                         ADVN, xBC, zBC,
                         a1, a2, a3, b1, b2, b3, dt)
-                t_fm  += @elapsed fluidmech!(fluid, grid, par;
-                           phase = phase,
-                           sds, top_cnv, bot_cnv, open_cnv,
-                           xBC, zBC,
-                           dt, a1, a2, a3, b1, b2, b3)
+                t_fm  += @elapsed solve_fluidmech!(solver, fluid, phase, grid, par, scales;
+                           dt, a1, a2, a3, b1, b2, b3,
+                           sds, top_cnv, bot_cnv, open_cnv, xBC, zBC)
                 # noise + phase velocities before update! — mirrors MATLAB main.m:
                 # fluidmech sets wx/wm/Wx/Ux/Wm/Um, THEN update uses them
                 # (update.m lines 26-29, 73-104 require current Wx/Wm)

@@ -49,7 +49,7 @@ function diffus!(dff::AbstractMatrix, f_halo::AbstractMatrix, k_halo::AbstractMa
     @assert size(dff, 2) == size(f_halo, 2) - 2halo     "diffus!: output col count must match f interior"
     backend = KernelAbstractions.get_backend(dff)
     T = eltype(dff)
-    _diffus_kernel!(backend, (16, 16))(dff, f_halo, k_halo,
+    _diffus_kernel!(backend)(dff, f_halo, k_halo,
                                        T(inv(h)^2), halo, T(0.5);
                                        ndrange = size(dff))
     KernelAbstractions.synchronize(backend)
@@ -121,9 +121,9 @@ function diffus_with_flux!(dff::AbstractMatrix, qx::AbstractMatrix, qz::Abstract
     qx_int = view(qx, 2:Nz+1, 1:Nx+1)
     qz_int = view(qz, 1:Nz+1, 2:Nx+1)
 
-    _diffus_flux_x_kernel!(backend, (16, 16))(qx_int, f_halo, k_halo, invh, halo, half;
+    _diffus_flux_x_kernel!(backend)(qx_int, f_halo, k_halo, invh, halo, half;
                                                ndrange = size(qx_int))
-    _diffus_flux_z_kernel!(backend, (16, 16))(qz_int, f_halo, k_halo, invh, halo, half;
+    _diffus_flux_z_kernel!(backend)(qz_int, f_halo, k_halo, invh, halo, half;
                                                ndrange = size(qz_int))
     KernelAbstractions.synchronize(backend)
 

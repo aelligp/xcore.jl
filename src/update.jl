@@ -47,7 +47,7 @@ sweep, producing spot-wise undershoots at sharp fronts.
 function update_volume_fractions!(phase::PhaseState{T}, fluid::FluidState{T},
                                   par::Parameters{T}) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.x)
-    compute_volfrac_kernel!(backend, (16, 16))(fluid.rho, phase.chi, phase.mu,
+    compute_volfrac_kernel!(backend)(fluid.rho, phase.chi, phase.mu,
                                         phase.hasx, phase.hasm,
                                         phase.x, phase.m,
                                         par.rhom0, par.rhox0,
@@ -119,17 +119,23 @@ Pl + P_dyn)` using the interior of the dynamic pressure array `fluid.P`.
 function update_pressure!(phase::PhaseState{T}, fluid::FluidState{T},
                           grid::Grid{T}, par::Parameters{T}) where {T<:AbstractFloat}
     Nz = grid.Nz;  h = grid.h
-    rhoref = vec(mean(fluid.rhow, dims = 2))                  # length Nz+1
-    # column build of Pl: top cell uses rhoref[1] * g * h/2, then cumulative
-    # rhoref[2:Nz] * g * h. Last entry rhoref[Nz+1] is unused.
-    Pl_col = similar(rhoref, Nz)
-    Pl_col[1] = rhoref[1] * par.g0 * h / T(2) + par.Ptop
-    if Nz > 1
-        @inbounds for j in 2:Nz
-            Pl_col[j] = Pl_col[j - 1] + rhoref[j] * par.g0 * h
-        end
+    # column build of Pl: top cell uses rhoref[1]·g·h/2, then the cumulative
+    # rhoref[2:Nz]·g·h. The reduction `mean(rhow, dims=2)` runs on-device; the
+    # length-(Nz+1) column is then pulled to the host for the inherently
+    # sequential prefix sum (a single tiny vector — negligible vs the Stokes
+    # solve) and copied back. This avoids relying on a device 1-D scan
+    # (`cumsum`/`accumulate`), which not every KernelAbstractions backend
+    # implements, keeping the path portable across CPU/CUDA/AMD/Metal.
+    rhoref = Array(vec(mean(fluid.rhow, dims = 2)))           # host, length Nz+1
+    gh = par.g0 * h
+    Pl_h = Vector{T}(undef, Nz)
+    Pl_h[1] = rhoref[1] * gh / T(2) + par.Ptop
+    @inbounds for j in 2:Nz
+        Pl_h[j] = Pl_h[j - 1] + rhoref[j] * gh
     end
-    @views phase.Pl .= reshape(Pl_col, Nz, 1)
+    Pl_d = similar(fluid.rhow, Nz)                            # device vector
+    copyto!(Pl_d, Pl_h)
+    @views phase.Pl .= reshape(Pl_d, Nz, 1)
     floor_p = par.Ptop / T(100)
     @views phase.Pt .= max.(floor_p, phase.Pl .+ fluid.P[2:end-1, 2:end-1])
     return nothing
@@ -185,7 +191,7 @@ Compute `etamix` from `chi`, `mu` using the permission-weight rheology
 function update_rheology!(phase::PhaseState{T}, par::Parameters{T}) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.etamix)
     AA = par.AA;  BB = par.BB;  CC = par.CC
-    compute_rheology_kernel!(backend, (16, 16))(phase.etamix, phase.chi, phase.mu,
+    compute_rheology_kernel!(backend)(phase.etamix, phase.chi, phase.mu,
                                          AA[1,1], AA[1,2], AA[2,1], AA[2,2],
                                          BB[1,1], BB[1,2], BB[2,1], BB[2,2],
                                          CC[1,1], CC[1,2], CC[2,1], CC[2,2],
@@ -263,16 +269,16 @@ function update_kinematics!(phase::PhaseState{T}, fluid::FluidState{T},
                             grid::Grid{T}) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.eII)
     invh = T(inv(grid.h))
-    compute_strain_kernel!(backend, (16, 16))(phase.exx, phase.ezz, phase.Div_V,
+    compute_strain_kernel!(backend)(phase.exx, phase.ezz, phase.Div_V,
                                        fluid.W, fluid.U, invh;
                                        ndrange = size(phase.exx))
-    compute_shear_kernel!(backend, (16, 16))(phase.exz, fluid.W, fluid.U, invh;
+    compute_shear_kernel!(backend)(phase.exz, fluid.W, fluid.U, invh;
                                       ndrange = size(phase.exz))
-    compute_eII_V_kernel!(backend, (16, 16))(phase.eII, phase.V,
+    compute_eII_V_kernel!(backend)(phase.eII, phase.V,
                                       phase.exx, phase.ezz, phase.exz,
                                       fluid.W, fluid.U, eps(T);
                                       ndrange = size(phase.eII))
-    compute_segspeed_kernel!(backend, (16, 16))(phase.vx, phase.vm,
+    compute_segspeed_kernel!(backend)(phase.vx, phase.vm,
                                                 phase.wx, phase.wm, eps(T);
                                                 ndrange = size(phase.vx))
     KernelAbstractions.synchronize(backend)
@@ -320,7 +326,7 @@ function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
     backend = KernelAbstractions.get_backend(phase.etamix)
     # copy current eta as the "previous" iterate, write uncapped etai into fluid.eta
     eta_prev = copy(fluid.eta)
-    compute_viscblend_kernel!(backend, (16, 16))(fluid.eta, phase.etae, phase.ke, phase.kx,
+    compute_viscblend_kernel!(backend)(fluid.eta, phase.etae, phase.ke, phase.kx,
                                           phase.ReL, phase.fReL,
                                           phase.etamix, phase.eII, fluid.rho, phase.V,
                                           scales.L0;
@@ -383,7 +389,7 @@ function update_segregation_viscosity!(phase::PhaseState{T}, fluid::FluidState{T
     backend = KernelAbstractions.get_backend(phase.etas)
     etas_prev = copy(phase.etas)
     # kernel writes uncapped etasi into phase.etas
-    compute_segvisc_kernel!(backend, (16, 16))(phase.Rel, phase.fRel, phase.ks,
+    compute_segvisc_kernel!(backend)(phase.Rel, phase.fRel, phase.ks,
                                                phase.etat, phase.etas,
                                                phase.kx, phase.Rc,
                                                phase.vx, phase.V, phase.etamix,
@@ -463,9 +469,9 @@ the Rayleigh number `Ra = V D0 / kx`.
 function update_stresses!(phase::PhaseState{T}, fluid::FluidState{T},
                           grid::Grid{T}, scales::Scales{T}) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.txx)
-    compute_shear_stress_kernel!(backend, (16, 16))(phase.txz, fluid.etaco, phase.exz;
+    compute_shear_stress_kernel!(backend)(phase.txz, fluid.etaco, phase.exz;
                                              ndrange = size(phase.txz))
-    compute_stress_kernel!(backend, (16, 16))(phase.txx, phase.tzz, phase.tII, phase.Ra,
+    compute_stress_kernel!(backend)(phase.txx, phase.tzz, phase.tII, phase.Ra,
                                        fluid.eta, phase.exx, phase.ezz,
                                        phase.exz, phase.txz,
                                        phase.V, phase.kx,

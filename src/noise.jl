@@ -2,6 +2,14 @@ using FFTW
 using Random
 using Statistics
 
+# White-noise draw, dispatched by array backend. KernelAbstractions does not
+# abstract RNG, so this is the one place that needs an explicit backend split:
+#   - host `Array`  → seeded MersenneTwister (reproducible across runs)
+#   - device array  → the array package's own device RNG (GPUArrays /
+#     CUDA.CURAND / AMDGPU.rocRAND), since a host RNG cannot fill device memory.
+_noise_randn!(rng::Random.AbstractRNG, A::Array) = Random.randn!(rng, A)
+_noise_randn!(_,                       A::AbstractArray) = Random.randn!(A)
+
 # Port of src/noise.m + the filter precomputation from src/init.m.
 #
 # Ornstein–Uhlenbeck noise on the stream function / potential field for three
@@ -35,21 +43,27 @@ Fields (all cell-centred (Nz,Nx) unless noted):
 * `xie/xix/xis`      — noise speed magnitudes (cell-centred; for diagnostics)
 * `rng`              — seeded Mersenne-Twister used for all white noise
 """
-struct NoiseState{T<:AbstractFloat}
-    psie::Matrix{T};   psix::Matrix{T};   psis::Matrix{T}
-    psieo::Matrix{T};  psixo::Matrix{T};  psiso::Matrix{T}
-    re::Matrix{T};     rs::Matrix{T}
-    Gkpe::Matrix{Complex{T}}
-    Gkps::Matrix{Complex{T}}
+# Array-type-generic so the noise fields live on whatever backend the rest of
+# the state uses (CPU `Array`, CUDA `CuArray`, AMD `ROCArray`, …). `A` is the
+# real field type, `AC` the complex FFT-filter type, `R` the RNG (host
+# `MersenneTwister` on CPU; on a device the per-element `randn!(A)` device RNG
+# is used and `rng` is ignored — see `_noise_randn!`).
+struct NoiseState{T<:AbstractFloat, A<:AbstractMatrix{T},
+                  AC<:AbstractMatrix{Complex{T}}, R}
+    psie::A;   psix::A;   psis::A
+    psieo::A;  psixo::A;  psiso::A
+    re::A;     rs::A
+    Gkpe::AC
+    Gkps::AC
     padL0::Int
     padl0::Int
     fL::T
     fl::T
-    xiew::Matrix{T};   xieu::Matrix{T}
-    xixw::Matrix{T};   xixu::Matrix{T}
-    xisw::Matrix{T};   xisu::Matrix{T}
-    xie::Matrix{T};    xix::Matrix{T};    xis::Matrix{T}
-    rng::MersenneTwister
+    xiew::A;   xieu::A
+    xixw::A;   xixu::A
+    xisw::A;   xisu::A
+    xie::A;    xix::A;    xis::A
+    rng::R
 end
 
 """
@@ -58,7 +72,7 @@ end
 Allocate and precompute all static fields. Mirrors the filter kernel
 construction in `src/init.m` (lines 83–101).
 """
-function NoiseState(::Type{T}, grid::Grid{T}, scales::Scales{T};
+function NoiseState(::Type{T}, backend, grid::Grid{T}, scales::Scales{T};
                     seed::Integer = 0) where {T<:AbstractFloat}
     Nz, Nx = grid.Nz, grid.Nx
     h   = Float64(grid.h)
@@ -69,17 +83,18 @@ function NoiseState(::Type{T}, grid::Grid{T}, scales::Scales{T};
     padL0 = 4 * ceil(Int, L0h / h)
     padl0 = 4 * ceil(Int, l0h / h)
 
-    # precompute Gaussian filter kernels for padded domains
-    Gkpe = _make_gaussian_filter(T, Nz + padL0, Nx, h, L0h)
-    Gkps = _make_gaussian_filter(T, Nz + padl0, Nx, h, l0h)
+    # Gaussian filters: built on the host (small, setup-only) then moved to the
+    # target backend so the per-step FFT filtering runs on-device.
+    Gkpe = adapt_backend(backend, _make_gaussian_filter(T, Nz + padL0, Nx, h, L0h))
+    Gkps = adapt_backend(backend, _make_gaussian_filter(T, Nz + padl0, Nx, h, l0h))
 
     # stream-function to flux-component variance normalisation (init.m line 28-29)
     fL = T(2 / sqrt(1 - exp(-h^2 / (2 * L0h^2))))
     fl = T(2 / sqrt(1 - exp(-h^2 / (2 * l0h^2))))
 
-    z = (args...) -> zeros(T, args...)
+    z = (args...) -> xcore_zeros(backend, T, args...)
 
-    return NoiseState{T}(
+    return NoiseState(
         z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),   # psie, psix, psis
         z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),   # psieo, psixo, psiso
         z(Nz, Nx), z(Nz, Nx),               # re, rs
@@ -91,6 +106,11 @@ function NoiseState(::Type{T}, grid::Grid{T}, scales::Scales{T};
         MersenneTwister(seed),
     )
 end
+
+# Back-compat: default to the CPU backend so existing `NoiseState(T, grid, scales)`
+# call sites keep working unchanged.
+NoiseState(::Type{T}, grid::Grid{T}, scales::Scales{T}; seed::Integer = 0) where {T} =
+    NoiseState(T, KernelAbstractions.CPU(), grid, scales; seed = seed)
 
 # Build a Gaussian filter kernel exp(-σ² |k|²) for an (Nz_pad × Nx) FFT domain.
 # σ here is the *full* scale (L0h or l0h); the padded filter omits the 1/2
@@ -150,10 +170,11 @@ function noise!(ns::NoiseState{T}, phase::PhaseState{T}, grid::Grid{T},
     txi0 = T(scales.txi0)
     eps_T = eps(T)
 
-    # draw white noise once per outer step
+    # draw white noise once per outer step (host MersenneTwister on CPU;
+    # the array package's device RNG on GPU — see `_noise_randn!`)
     if first_iter
-        randn!(ns.rng, ns.re)
-        randn!(ns.rng, ns.rs)
+        _noise_randn!(ns.rng, ns.re)
+        _noise_randn!(ns.rng, ns.rs)
     end
 
     # --- per-cell decorrelation times ---
@@ -220,44 +241,68 @@ function noise!(ns::NoiseState{T}, phase::PhaseState{T}, grid::Grid{T},
     ns.xisw .= (-(psis_ext[2:end, :] .- psis_ext[1:end-1, :])) .* xtaperw
 
     # --- noise speed magnitudes (cell-centred, for diagnostics) ---
-    @inbounds for i in 1:Nx, j in 1:Nz
-        # interior z-face index in the ghost-extended arrays: col i+1
-        wz_s = (ns.xisw[j, i+1] + ns.xisw[j+1, i+1]) / T(2)
-        wx_s = (ns.xisu[j+1, i] + ns.xisu[j+1, i+1]) / T(2)
-        ns.xis[j, i] = sqrt(wz_s^2 + wx_s^2)
-
-        wz_x = (ns.xixw[j, i+1] + ns.xixw[j+1, i+1]) / T(2)
-        wx_x = (ns.xixu[j+1, i] + ns.xixu[j+1, i+1]) / T(2)
-        ns.xix[j, i] = sqrt(wz_x^2 + wx_x^2)
-
-        wz_e = (ns.xiew[j, i+1] + ns.xiew[j+1, i+1]) / T(2)
-        wx_e = (ns.xieu[j+1, i] + ns.xieu[j+1, i+1]) / T(2)
-        ns.xie[j, i] = sqrt(wz_e^2 + wx_e^2)
-    end
+    backend = KernelAbstractions.get_backend(ns.xie)
+    _noise_magnitudes_kernel!(backend)(ns.xis, ns.xix, ns.xie,
+                                       ns.xisw, ns.xisu, ns.xixw, ns.xixu,
+                                       ns.xiew, ns.xieu; ndrange = (Nz, Nx))
+    KernelAbstractions.synchronize(backend)
 
     return nothing
+end
+
+# Cell-centred noise speed magnitudes from the staggered, ghost-extended flux
+# components (interior z-face column is i+1 in the ghost-extended arrays).
+@kernel function _noise_magnitudes_kernel!(xis, xix, xie,
+                                           @Const(xisw), @Const(xisu),
+                                           @Const(xixw), @Const(xixu),
+                                           @Const(xiew), @Const(xieu))
+    j, i = @index(Global, NTuple)
+    @inbounds begin
+        T = eltype(xis)
+        wz_s = (xisw[j, i+1] + xisw[j+1, i+1]) / T(2)
+        wx_s = (xisu[j+1, i] + xisu[j+1, i+1]) / T(2)
+        xis[j, i] = sqrt(wz_s^2 + wx_s^2)
+
+        wz_x = (xixw[j, i+1] + xixw[j+1, i+1]) / T(2)
+        wx_x = (xixu[j+1, i] + xixu[j+1, i+1]) / T(2)
+        xix[j, i] = sqrt(wz_x^2 + wx_x^2)
+
+        wz_e = (xiew[j, i+1] + xiew[j+1, i+1]) / T(2)
+        wx_e = (xieu[j+1, i] + xieu[j+1, i+1]) / T(2)
+        xie[j, i] = sqrt(wz_e^2 + wx_e^2)
+    end
 end
 
 # Pad `psi` (Nz×Nx) with `pad` zero rows (half on each side), apply the
 # Gaussian FFT filter `Gk`, unpad, then rescale the result to match the
 # original field's mean and standard deviation.
-function compute_fft_filter(psi::Matrix{T}, Gk::Matrix{Complex{T}}, pad::Int) where {T<:AbstractFloat}
+# Array-type-generic: scratch is allocated via `similar(psi, …)` so it lands on
+# the same backend as `psi`, and `fft`/`ifft` are the AbstractFFTs generics that
+# dispatch automatically to FFTW (CPU), cuFFT (CUDA), or rocFFT (AMD) when the
+# corresponding package is loaded — no explicit per-backend code needed. `Gk`
+# must already be on the same backend (NoiseState moves it there at construction).
+function compute_fft_filter(psi::AbstractMatrix{T}, Gk::AbstractMatrix{Complex{T}},
+                            pad::Int) where {T<:AbstractFloat}
     Nz, Nx  = size(psi)
     halfpad = pad ÷ 2
     Nz_pad  = Nz + pad
 
-    # embed in zero-padded array
-    psi_pad = zeros(Complex{T}, Nz_pad, Nx)
-    psi_pad[halfpad + 1 : halfpad + Nz, :] .= psi
+    # embed in zero-padded array (on psi's backend)
+    psi_pad = similar(psi, Complex{T}, Nz_pad, Nx)
+    fill!(psi_pad, zero(Complex{T}))
+    @views psi_pad[halfpad + 1 : halfpad + Nz, :] .= psi
 
-    # FFT → multiply filter → IFFT
-    psi_pad .= fft(psi_pad, (1, 2))
+    # FFT → multiply filter → IFFT, all IN-PLACE (`fft!`/`ifft!`) so the
+    # transforms reuse `psi_pad` instead of allocating fresh output arrays each
+    # call. AbstractFFTs in-place generics dispatch to FFTW / cuFFT / rocFFT.
+    fft!(psi_pad, (1, 2))
     psi_pad .*= Gk
-    psi_pad .= ifft(psi_pad, (1, 2))
+    ifft!(psi_pad, (1, 2))
 
-    psi_flt = real.(psi_pad[halfpad + 1 : halfpad + Nz, :])
+    psi_flt = real.(@view psi_pad[halfpad + 1 : halfpad + Nz, :])
 
-    # rescale to original mean and std (noise.m lines 54-56)
+    # rescale to original mean and std (noise.m lines 54-56). std/mean reduce to
+    # host scalars; the final broadcast stays on-device.
     raw_std  = std(psi)
     raw_mean = mean(psi)
     flt_std  = std(psi_flt)

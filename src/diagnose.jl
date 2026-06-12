@@ -17,16 +17,30 @@ per run via `StepResidual(grid)`, then call `update_residual!` at the start of
 each iteration to snapshot the primary unknowns, and `compute_resnorm` after
 each iteration to measure the change.
 """
-mutable struct StepResidual{T}
-    Wo::Matrix{T};  Uo::Matrix{T};  Po::Matrix{T}
-    Xo::Matrix{T};  MFSo::Matrix{T}
+mutable struct StepResidual{T, M<:AbstractMatrix{T}}
+    Wo::M;  Uo::M;  Po::M
+    Xo::M;  MFSo::M
     resnorm0::Float64
 end
 
+# Backend-aware: buffers live on the same backend as `fluid` so `snapshot!`'s
+# `.=` stays a device-side copy (a host Matrix destination would scalar-index).
+function StepResidual(grid::Grid{T}, fluid::FluidState{T}) where {T<:AbstractFloat}
+    backend = KernelAbstractions.get_backend(fluid.W)
+    Nz, Nx = grid.Nz, grid.Nx
+    z(s...) = xcore_zeros(backend, T, s...)
+    StepResidual(
+        z(Nz+1, Nx+2), z(Nz+2, Nx+1), z(Nz+2, Nx+2),
+        z(Nz,   Nx),   z(Nz,   Nx),
+        1.0,
+    )
+end
+
+# Back-compat: CPU buffers when no fluid state is given.
 function StepResidual(grid::Grid{T}) where {T<:AbstractFloat}
     Nz, Nx = grid.Nz, grid.Nx
     z(s...) = zeros(T, s...)
-    StepResidual{T}(
+    StepResidual(
         z(Nz+1, Nx+2), z(Nz+2, Nx+1), z(Nz+2, Nx+2),
         z(Nz,   Nx),   z(Nz,   Nx),
         1.0,

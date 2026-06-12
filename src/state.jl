@@ -32,6 +32,21 @@ mutable struct FluidmechCache{T<:AbstractFloat}
     nz_DM::Vector{Int}
     nz_KP::Vector{Int}
 
+    # global system `LL = [KV GG; DM KP]` assembled once; later sweeps scatter
+    # block values into `LL.nzval` (via map_*) and write the symmetric-Jacobi
+    # scaling into `LLs` (shares LL's structure) in place. `Lcol[k]` = column of
+    # LL.nzval[k]. Built lazily; reset with `initialized` on a signature change.
+    LL_initialized::Bool
+    LL::SparseMatrixCSC{T,Int}
+    LLs::SparseMatrixCSC{T,Int}
+    map_KV::Vector{Int};  map_GG::Vector{Int};  map_DM::Vector{Int};  map_KP::Vector{Int}
+    Lcol::Vector{Int}
+
+    # advection out-buffers for the momentum RHS, sized lazily and reused across
+    # sweeps (the value bands are recomputed every sweep; only the index triplets
+    # are first-call-only).
+    advn_mz::Matrix{T};  advn_mx::Matrix{T}
+
     # UMFPACK numeric-refactor cache (built lazily on first solve).
     # Untyped on the matrix-element side because `SparseArrays.UMFPACK.UmfpackLU`
     # only admits {Float64, ComplexF64}; using the bare UnionAll keeps the field
@@ -45,6 +60,9 @@ function FluidmechCache(::Type{T}) where {T<:AbstractFloat}
         false, 0, 0, false,
         spzeros(T, 0, 0), spzeros(T, 0, 0), spzeros(T, 0, 0), spzeros(T, 0, 0),
         Int[], Int[], Int[], Int[],
+        false, spzeros(T, 0, 0), spzeros(T, 0, 0),
+        Int[], Int[], Int[], Int[], Int[],
+        Matrix{T}(undef, 0, 0), Matrix{T}(undef, 0, 0),
         nothing,
     )
 end

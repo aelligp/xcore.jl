@@ -390,31 +390,31 @@ function advect!(adv::AbstractMatrix, f_halo::AbstractMatrix,
     half = T(0.5)
 
     if scheme === :centr
-        _advect_centr_kernel!(backend, (16, 16))(adv, f_halo, u, w,
+        _advect_centr_kernel!(backend)(adv, f_halo, u, w,
                                                  invh, halo, half;
                                                  ndrange = size(adv))
     elseif scheme === :upwd1
-        _advect_upwd1_kernel!(backend, (16, 16))(adv, f_halo, u, w,
+        _advect_upwd1_kernel!(backend)(adv, f_halo, u, w,
                                                  invh, halo, half;
                                                  ndrange = size(adv))
     elseif scheme === :quick
-        _advect_quick_kernel!(backend, (16, 16))(adv, f_halo, u, w,
+        _advect_quick_kernel!(backend)(adv, f_halo, u, w,
                                                  invh, halo, half, T(1//6);
                                                  ndrange = size(adv))
     elseif scheme === :fromm
-        _advect_fromm_kernel!(backend, (16, 16))(adv, f_halo, u, w,
+        _advect_fromm_kernel!(backend)(adv, f_halo, u, w,
                                                  invh, halo, half, T(0.25);
                                                  ndrange = size(adv))
     elseif scheme === :weno3
-        _advect_weno3_kernel!(backend, (16, 16))(adv, f_halo, u, w,
+        _advect_weno3_kernel!(backend)(adv, f_halo, u, w,
                                                  invh, halo, half, T(1e-6);
                                                  ndrange = size(adv))
     elseif scheme === :weno5
-        _advect_weno5_kernel!(backend, (16, 16))(adv, f_halo, u, w,
+        _advect_weno5_kernel!(backend)(adv, f_halo, u, w,
                                                  invh, halo, half, eps(T);
                                                  ndrange = size(adv))
     elseif scheme === :tvdim
-        _advect_tvdim_kernel!(backend, (16, 16))(adv, f_halo, u, w,
+        _advect_tvdim_kernel!(backend)(adv, f_halo, u, w,
                                                  invh, halo, half;
                                                  ndrange = size(adv))
     else
@@ -737,39 +737,39 @@ function advect_with_flux!(adv::AbstractMatrix, qx::AbstractMatrix, qz::Abstract
     qz_int = view(qz, 1:Nz+1, 2:Nx+1)
 
     if scheme === :centr
-        _flux_centr_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half;
+        _flux_centr_x_kernel!(backend)(qx_int, f_halo, u, halo, half;
                                                   ndrange = size(qx_int))
-        _flux_centr_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half;
+        _flux_centr_z_kernel!(backend)(qz_int, f_halo, w, halo, half;
                                                   ndrange = size(qz_int))
     elseif scheme === :upwd1
-        _flux_upwd1_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half;
+        _flux_upwd1_x_kernel!(backend)(qx_int, f_halo, u, halo, half;
                                                   ndrange = size(qx_int))
-        _flux_upwd1_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half;
+        _flux_upwd1_z_kernel!(backend)(qz_int, f_halo, w, halo, half;
                                                   ndrange = size(qz_int))
     elseif scheme === :quick
-        _flux_quick_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half, T(1//6);
+        _flux_quick_x_kernel!(backend)(qx_int, f_halo, u, halo, half, T(1//6);
                                                   ndrange = size(qx_int))
-        _flux_quick_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half, T(1//6);
+        _flux_quick_z_kernel!(backend)(qz_int, f_halo, w, halo, half, T(1//6);
                                                   ndrange = size(qz_int))
     elseif scheme === :fromm
-        _flux_fromm_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half, T(0.25);
+        _flux_fromm_x_kernel!(backend)(qx_int, f_halo, u, halo, half, T(0.25);
                                                   ndrange = size(qx_int))
-        _flux_fromm_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half, T(0.25);
+        _flux_fromm_z_kernel!(backend)(qz_int, f_halo, w, halo, half, T(0.25);
                                                   ndrange = size(qz_int))
     elseif scheme === :weno3
-        _flux_weno3_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half, T(1e-6);
+        _flux_weno3_x_kernel!(backend)(qx_int, f_halo, u, halo, half, T(1e-6);
                                                   ndrange = size(qx_int))
-        _flux_weno3_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half, T(1e-6);
+        _flux_weno3_z_kernel!(backend)(qz_int, f_halo, w, halo, half, T(1e-6);
                                                   ndrange = size(qz_int))
     elseif scheme === :weno5
-        _flux_weno5_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half, eps(T);
+        _flux_weno5_x_kernel!(backend)(qx_int, f_halo, u, halo, half, eps(T);
                                                   ndrange = size(qx_int))
-        _flux_weno5_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half, eps(T);
+        _flux_weno5_z_kernel!(backend)(qz_int, f_halo, w, halo, half, eps(T);
                                                   ndrange = size(qz_int))
     elseif scheme === :tvdim
-        _flux_tvdim_x_kernel!(backend, (16, 16))(qx_int, f_halo, u, halo, half;
+        _flux_tvdim_x_kernel!(backend)(qx_int, f_halo, u, halo, half;
                                                   ndrange = size(qx_int))
-        _flux_tvdim_z_kernel!(backend, (16, 16))(qz_int, f_halo, w, halo, half;
+        _flux_tvdim_z_kernel!(backend)(qz_int, f_halo, w, halo, half;
                                                   ndrange = size(qz_int))
     else
         throw(ArgumentError("advect_with_flux!: unsupported scheme = :$scheme"))

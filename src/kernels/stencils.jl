@@ -28,7 +28,7 @@ function ddx!(out::AbstractMatrix, f::AbstractMatrix, h::Real)
     @assert size(out, 2) == size(f, 2) - 1        "ddx!: output must be one col narrower than input"
     backend = KernelAbstractions.get_backend(out)
     T = eltype(out)
-    _ddx_kernel!(backend, (16, 16))(out, f, T(inv(h)); ndrange = size(out))
+    _ddx_kernel!(backend)(out, f, T(inv(h)); ndrange = size(out))
     KernelAbstractions.synchronize(backend)
     return out
 end
@@ -44,7 +44,7 @@ function ddz!(out::AbstractMatrix, f::AbstractMatrix, h::Real)
     @assert size(out, 2) == size(f, 2)            "ddz!: column count mismatch"
     backend = KernelAbstractions.get_backend(out)
     T = eltype(out)
-    _ddz_kernel!(backend, (16, 16))(out, f, T(inv(h)); ndrange = size(out))
+    _ddz_kernel!(backend)(out, f, T(inv(h)); ndrange = size(out))
     KernelAbstractions.synchronize(backend)
     return out
 end
