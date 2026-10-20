@@ -18,9 +18,9 @@ using TimerOutputs
 const TO = TimerOutput()
 
 """Enable `@timeit_debug` regions in xcore and its GMG submodule (all solver phases)."""
-enable_solver_timings()  = (foreach(TimerOutputs.enable_debug_timings, (@__MODULE__, GMG)); nothing)
+enable_solver_timings()  = (foreach(TimerOutputs.enable_debug_timings, (@__MODULE__, GMG, Stokes)); nothing)
 """Disable `@timeit_debug` regions, restoring zero-overhead production behaviour."""
-disable_solver_timings() = (foreach(TimerOutputs.disable_debug_timings, (@__MODULE__, GMG)); nothing)
+disable_solver_timings() = (foreach(TimerOutputs.disable_debug_timings, (@__MODULE__, GMG, Stokes)); nothing)
 
 include("parameters.jl")
 include("grid.jl")
@@ -69,6 +69,8 @@ include("dyrel_GMG/GMG.jl")
 # 3-D geometric-multigrid solver (Phase 1: operator-core submodule). Included
 # after the 3-D structs above so `module GMG3D` can import them from `..xcore`.
 include("dyrel3D/GMG3D.jl")
+# Dimension-generic matrix-free solvers (D = 2 and D = 3 from one implementation).
+include("stokes/Stokes.jl")
 # Solver-strategy dispatch (needs both the single-grid solvers above and the GMG
 # submodule); `run!` uses `make_solver`/`solve_fluidmech!` from here.
 include("solver.jl")
