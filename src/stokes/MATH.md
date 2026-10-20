@@ -1,7 +1,7 @@
 # Mathematical basis of the xcore DYREL Stokes solver
 
 This documents the equations the DYREL (Dynamic-Relaxation / pseudo-transient)
-solver in `src/dyrel/` actually solves, the augmented-Lagrangian / Powell–Hestenes
+solver in `src/stokes/` actually solves, the augmented-Lagrangian / Powell–Hestenes
 structure, the pseudo-transient velocity relaxation, and — in detail — the
 **Schur-complement-scaled pressure update** (`P += ω·R_P/s_P`). Symbols match the
 code (`R_W`,`R_U`,`R_P`, `D_W`,`D_U`, `γ_eff`, `s_P`, …).
@@ -85,7 +85,7 @@ P^{k+1} = P^k + Δ(R_P)                      (multiplier update, §5)
 ```
 
 - The penalty term is injected as `P_num = γ_eff·R_P`, added to the momentum
-  residual as `−∂(P_num)` (`solve.jl`, `dr=true`). It stiffens `K` against the
+  residual as `−∂(P_num)` (`dyrel.jl`, `dr=true`). It stiffens `K` against the
   constraint, accelerating the multiplier iteration. `γ_eff = γfact·⟨η⟩`.
 - At a fixed point `R_P → 0`, so the multiplier update vanishes and `(v,P)`
   solves the saddle point regardless of the update *coefficient* — the
@@ -183,7 +183,7 @@ The couplings on the staggered grid:
 - momentum response (Jacobi):      `(K⁻¹)_ff ≈ 1/D_f`.
 
 Multiplying and summing the four faces gives the **Schur diagonal** computed in
-`compute_schur_diag!`:
+`schur_diagonal!`:
 
 ```
 s_P[i] = (1/(h²ρ_i)) · Σ_f  ρ_f / D_f
@@ -196,7 +196,7 @@ scaling and the local grid spacing — no hand-tuned `γfact`.
 ### 5.3 The update and the ρ-cancellation
 
 The pressure (multiplier) update becomes the **diagonally-preconditioned
-Newton/Uzawa step** (`solve.jl`):
+Newton/Uzawa step** (`dyrel.jl`):
 
 ```
 P_i += ω · R_P_i / s_P[i],        ω = par.pres_relax_PT ~ O(1)   (Newton step at ω=1).
@@ -228,7 +228,7 @@ The rediscretised coarse operator is not consistent *enough* with the fine one f
 the correction to reduce the fine residual (classic Stokes/saddle-point MG issue).
 
 **Failed coupled-smoother attempts** (all in xcore's flipped `R=b−Av`, 1/ρ-scaled
-convention; see `dyrel_GMG/vanka.jl`, kept WIP):
+convention; the prototypes are not part of the repository):
 
 | attempt | pressure step | velocity correction | result |
 |---|---|---|---|
@@ -264,16 +264,16 @@ red-black), and extends to 3-D mechanically. This reuses the existing `transfer.
 cell operators and the hierarchy; it needs a Poisson operator-apply + Poisson
 smoother instead of the coupled saddle smoother.
 
-**IMPLEMENTED** in `dyrel_GMG/poisson.jl` (operator `GᵀD⁻¹G` + red-black
-Gauss-Seidel smoother) and `dyrel_GMG/poisson_mg.jl` (`PoissonMG` hierarchy +
+**Prototyped** (not part of the repository) as an operator `GᵀD⁻¹G` + red-black
+Gauss-Seidel smoother and a `PoissonMG` hierarchy +
 V-cycle + `poisson_solve!`), with coefficient rediscretisation down the levels
-(`restrict_u!`/`restrict_w!` on `κU=ρ_u/D_U`, `κW=ρ_w/D_W`) and null-space
+(face-coefficient restriction on `κU=ρ_u/D_U`, `κW=ρ_w/D_W`) and null-space
 handling (RHS mean-removed for Neumann compatibility, φ gauge-fixed). Validated
-on a manufactured discrete problem (`test/test_poisson_mg.jl`): solves to solver
+on a manufactured discrete problem: solves to solver
 tolerance (`sol_err≈1e-9`) and is **grid-independent — 7–8 V-cycles to `rel 1e-10`
 for N = 32, 64, 128, 256** (constant + variable coefficient). This is the textbook
 MG signature the full-saddle V-cycle never achieved, confirming the reframing.
-The full-saddle V-cycle (`vcycle.jl`) is superseded by this for the pressure;
+The full-saddle V-cycle (`gmg.jl`) is superseded by this for the pressure;
 remaining work is wiring `PoissonMG` into an outer SIMPLE/Uzawa loop (cheap DR
 velocity + Poisson-MG pressure projection — the WaterLily.jl-style architecture).
 
@@ -308,14 +308,14 @@ pattern) — an inexact inner solve per sweep is admissible.
 
 ---
 
-## 7. Multigrid (planned, `src/dyrel_GMG/`)
+## 7. Multigrid (planned, `src/stokes/`)
 
 PT/DR convergence degrades as `O(N)` (`dτ ~ h` ⇒ iters ~ `1/h`). Geometric
 multigrid with the DR solver as a per-level **smoother** restores
 grid-independent iteration counts. The same Schur-diagonal pressure update is
 essential there: a constant penalty tuned for the fine grid penalty-locks on
 coarse levels, whereas `s_P` (built from the per-level `D_f`) auto-rescales.
-See `dyrel_GMG/DESIGN_multigrid.md` and `MATH.md` §5.
+See `stokes/DESIGN_multigrid.md` and `MATH.md` §5.
 
 ---
 

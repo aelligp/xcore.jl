@@ -35,7 +35,7 @@ end
 
 @testset "free-slip walls: DYREL matches the direct solve" begin
     # The free-slip side boundaries are assembled in fluidmech.jl and applied
-    # kernel-side in dyrel/bcs.jl; agreement to well below the discretization
+    # kernel-side in src/stokes/bcs.jl; agreement to well below the discretization
     # error is what ties the two implementations together.
     for case in (:solkz, :solcx)
         ref = sol_benchmark(Float64, 64, case, :direct)

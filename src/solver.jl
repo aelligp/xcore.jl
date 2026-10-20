@@ -7,9 +7,8 @@
 # Picard sweeps and time steps.
 #
 #   :direct → sparse-LU            (DirectSolver,  no state)
-#   :dyrel  → pseudo-transient AL  (DyrelSolver,   DyrelCache)
+#   :dyrel  → pseudo-transient AL  (DyrelSolver,   StokesCache)
 #   :gmg    → geometric multigrid  (GMGSolver,     MGHierarchy; dyrel sweep = smoother)
-#   :gmg_direct → :direct's assembled system, AMG-preconditioned FGMRES (DirectMGSolver)
 #   :vmg    → DYREL Powell–Hestenes + velocity V-cycles + Cahouet–Chabard (VMGSolver, MGHierarchy)
 
 abstract type FluidSolver end
@@ -18,11 +17,6 @@ struct DirectSolver <: FluidSolver end
 struct DyrelSolver{C} <: FluidSolver;          cache::C;        end
 struct GMGSolver{H} <: FluidSolver;            hier::H;         end
 struct VMGSolver{H} <: FluidSolver;            hier::H;         end
-mutable struct DirectMGSolver{T} <: FluidSolver
-    const rtol::T
-    const itmax::Int
-    stats::DirectMGStats
-end
 
 """
     make_solver(par, fluid, phase, grid) -> FluidSolver
@@ -38,20 +32,17 @@ function make_solver(par::Parameters{T}, fluid::FluidState{T}, phase::PhaseState
         return DirectSolver()
     elseif par.solver === :dyrel
         _check_iterative_tolerance("solver = :dyrel", par)
-        return DyrelSolver(DyrelCache(T, be, grid))
+        return DyrelSolver(StokesCache(T, be, grid))
     elseif par.solver === :gmg
         _check_iterative_tolerance("solver = :gmg", par)
-        return GMGSolver(GMG.build_hierarchy(fluid, phase, grid, par; xBC))
+        return GMGSolver(build_hierarchy(fluid, grid, par; xBC))
     elseif par.solver === :vmg
         _check_iterative_tolerance("solver = :vmg", par)
-        # Velocity V-cycle design point of `fluidmech_dyrel_vmg!`: 16 DR
+        # Velocity V-cycle design point of `fluidmech_vmg!`: 16 DR
         # iterations per smoothing step, one pre- and one post-smooth.
-        return VMGSolver(GMG.build_hierarchy(fluid, phase, grid, par; xBC,
-                                             inner = 16, npre = 1, npost = 1))
-    elseif par.solver === :gmg_direct
-        return DirectMGSolver(par.mg_direct_rtol, par.mg_direct_itmax, DirectMGStats(false, 0))
+        return VMGSolver(build_hierarchy(fluid, grid, par; xBC, inner = 16, npre = 1, npost = 1))
     else
-        error("unknown par.solver = $(par.solver) (use :direct, :dyrel, :gmg, :vmg, or :gmg_direct)")
+        error("unknown par.solver = $(par.solver) (use :direct, :dyrel, :gmg, or :vmg)")
     end
 end
 
@@ -74,15 +65,6 @@ function solve_fluidmech!(::DirectSolver, fluid, phase, grid, par, scales;
     fluidmech!(fluid, grid, par; phase, sds, top_cnv, bot_cnv, open_cnv, xBC, zBC,
                dt, a1, a2, a3, b1, b2, b3, verbose = verbose)
     return true      # sparse LU: solved exactly or it threw
-end
-
-function solve_fluidmech!(s::DirectMGSolver, fluid, phase, grid, par, scales;
-                          dt, a1, a2, a3, b1, b2, b3,
-                          sds, top_cnv, bot_cnv, open_cnv, xBC, zBC, verbose = false)
-    fluidmech!(fluid, grid, par; phase, sds, top_cnv, bot_cnv, open_cnv, xBC, zBC,
-               dt, a1, a2, a3, b1, b2, b3, mg = s, verbose = verbose)
-    s.stats.converged || println("      !  gmg_direct FGMRES hit itmax ($(s.stats.niter))")
-    return s.stats.converged
 end
 
 # The Picard residual is a norm of the change between sweeps, so a linear solve
@@ -132,10 +114,10 @@ function solve_fluidmech!(s::GMGSolver, fluid, phase, grid, par, scales;
     # An open bottom would need its own homogeneous coarse-level form.
     open_cnv && throw(ArgumentError(
         "solver = :gmg does not implement open_cnv = true; use solver = :dyrel or :direct"))
-    st = GMG.fluidmech_gmg!(fluid, phase, s.hier, grid, par, scales;
-                            dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
-                            rtol_PH = par.forcing_PH,
-                            xBC, zBC, sds, top_cnv, bot_cnv, verbose = verbose)
+    st = fluidmech_gmg!(fluid, phase, s.hier, grid, par, scales;
+                        dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
+                        rtol_PH = par.forcing_PH,
+                        xBC, zBC, sds, top_cnv, bot_cnv, verbose = verbose)
     st.converged || st.relaxed || println("      !  gmg solve hit V-cycle cap (ncyc=$(st.ncyc))")
     return st.converged
 end
@@ -147,9 +129,9 @@ function solve_fluidmech!(s::VMGSolver, fluid, phase, grid, par, scales;
     # The velocity V-cycle's coarse levels assume a closed bottom, as in :gmg.
     open_cnv && throw(ArgumentError(
         "solver = :vmg does not implement open_cnv = true; use solver = :dyrel or :direct"))
-    st = GMG.fluidmech_dyrel_vmg!(fluid, phase, s.hier, grid, par, scales;
-                                  dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
-                                  γfact = 5, cc = true, rtol_PH = par.forcing_PH,
-                                  xBC, zBC, sds, top_cnv, bot_cnv, verbose = verbose)
+    st = fluidmech_vmg!(fluid, phase, s.hier, grid, par, scales;
+                        dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
+                        γfact = 5, cc = true, rtol_PH = par.forcing_PH,
+                        xBC, zBC, sds, top_cnv, bot_cnv, verbose = verbose)
     return st.converged
 end

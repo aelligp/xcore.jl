@@ -34,7 +34,7 @@ function velocity_vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::Sto
     fscale   = fine ? one(T) : zero(T)
     mfs_mean = fine ? T(mfs_mean0) : zero(T)
     Ddom     = T(lvl.grid.D)
-    P0       = fine ? lvl.fluid.P : lvl.P0
+    P0       = fine ? lvl.fluid.P : lvl.cache.P0
     # the pseudo-transient term is off: P0 = P on the fine level, 0 = 0 on coarse ones
     sm(n, inner, adaptive) = smooth!(lvl, par, op; nsweeps = n, ninner = inner, fscale, P0,
                                      mfs_mean, Ddom, adaptive, update_P = false)
@@ -54,8 +54,9 @@ function velocity_vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::Sto
     @timeit_debug TO "L$l residual" res!()
     cl = hier.levels[l + 1]
     @timeit_debug TO "L$l restrict" begin
-    for d in 1:D
-        restrict_face!(cl.cache.bext[d], lvl.cache.Rv[d], d)
+    _each_axis(Val(D)) do comp
+        d = _val(comp)
+        restrict_face!(cl.cache.bext[d], lvl.cache.Rv[d], comp)
     end
     fill!(cl.cache.bext_P, 0)
     _zero_solution!(cl)
@@ -63,9 +64,9 @@ function velocity_vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::Sto
     velocity_vcycle!(hier, l + 1, par, op; mfs_mean0)
     @timeit_debug TO "L$l prolong + correct" begin
     v = velocity(lvl.fluid);  vc = velocity(cl.fluid)
-    for d in 1:D
-        e = lvl.cache.Rv[d]
-        prolong_face!(e, _compact(vc[d], d), d, op)
+    _each_axis(Val(D)) do comp
+        d = _val(comp);  e = lvl.cache.Rv[d]
+        prolong_face!(e, _compact(vc[d], d), comp, op)
         vd = _compact(v[d], d)
         @. vd += e
     end
@@ -116,11 +117,6 @@ end
         p[I] += ω * r[I] / (diag * invh2)
     end
 end
-
-# per-level scratch (p, f, r) for the Poisson V-cycle
-_cc_workspace(hier::MGHierarchy{T}, backend) where {T} =
-    [(p = xcore_zeros(backend, T, cells(lv.grid)...), f = xcore_zeros(backend, T, cells(lv.grid)...),
-      r = xcore_zeros(backend, T, cells(lv.grid)...), h = T(lv.grid.h)) for lv in hier.levels]
 
 function _cc_sweeps!(w, n, wk, periodic)
     backend = KernelAbstractions.get_backend(w.p)
@@ -181,9 +177,11 @@ velocity V-cycles at fixed pressure, then the multiplier update
 iteration grid-independent when inertia dominates without changing the fixed
 point. The velocity block carries `γ_eff = γfact/s_P` on every level; point-DR
 smoothing of it degrades as `γfact` grows, so the default is small. Stops as
-`converged` at `par.atol_PH` (penalty-free full residual) or as `relaxed` once
-it drops by `rtol_PH` below its value after the first update; throws otherwise
-after `par.maxit_PH` steps. `errs[k]` is the residual after step `k`.
+`converged` once the penalty-free full residual and the applied pressure change
+(`pressure_change_norm`) are both below `par.atol_PH`, or as `relaxed` once the
+residual alone drops by `rtol_PH` below its value after the first update;
+throws otherwise after `par.maxit_PH` steps. `errs[k]` is the larger of the
+residual and the pressure change after step `k`.
 """
 function fluidmech_vmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameters,
                         scales::Scales;
@@ -201,14 +199,13 @@ function fluidmech_vmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
     op = StokesOp(T, _dims(grid), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
     lvl1 = hier.levels[1];  c = lvl1.cache
     @timeit_debug TO "setup" begin
-    P0arr = P0 === nothing ? copy(fluid.P) : P0
+    P0arr = P0 === nothing ? copyto!(hier.levels[1].cache.P0, fluid.P) : P0
     bnchm || _update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
     momentum_advection!(c, fluid, grid, par, op)
     mfs_mean = bnchm ? zero(T) : T(sum(fluid.MFS) / length(fluid.MFS))
     refresh_coefficients!(hier, par, op; γfact)
     apply_velocity_bcs!(fluid, grid, op; mfs_mean, Ddom = T(grid.D))
     apply_pressure_bcs!(fluid, op)
-    ccws = cc && a1 > 0 ? _cc_workspace(hier, KernelAbstractions.get_backend(fluid.P)) : nothing
     end
     err0 = one(T);  converged = false;  relaxed = false;  PH_iters = 0
     errs = T[]
@@ -220,10 +217,11 @@ function fluidmech_vmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
         @timeit_debug TO "PH multiplier update" begin
         residual_continuity!(c, fluid, grid, P0arr, Inf)
         Pint = _interior(fluid.P)
+        c.dP .= Pint
         @. Pint += par.pres_relax_PT * c.γ_eff * c.R_P
         end
-        ccws === nothing ||
-            @timeit_debug TO "Cahouet–Chabard Poisson V-cycle" _cc_update!(ccws, fluid, c, par.pres_relax_PT, op)
+        cc && a1 > 0 &&
+            @timeit_debug TO "Cahouet–Chabard Poisson V-cycle" _cc_update!(hier.cc, fluid, c, par.pres_relax_PT, op)
         # full (penalty-free) residual: the penalty vanishes with R_P at the solution
         @timeit_debug TO "gauge + convergence residual" begin
         bnchm || pressure_gauge!(fluid, P0arr)
@@ -231,17 +229,22 @@ function fluidmech_vmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
         residual_continuity!(c, fluid, grid, P0arr, Inf)
         residual_momentum!(c, fluid, grid, op; dr = false)
         nvn, nP = residual_norms(c, fluid.rho)
+        c.dP .= Pint .- c.dP
+        ndP = pressure_change_norm(c.dP, fluid, grid.h)
         end
-        err = max(nvn..., nP)
+        # The residuals bound the pressure error only up to the conditioning of
+        # the Schur complement; the applied pressure change bounds it directly.
+        res = max(nvn..., nP)
+        err = max(res, ndP)
         isfinite(err) || error("fluidmech_vmg! produced a non-finite residual at PH step $it")
         push!(errs, err)
-        it == 1 && (err0 = err + eps(T))
-        verbose && @printf("  [vMG PH %02d] err=%.3e  (v=%s P=%.2e)\n", it, err,
-                           join((@sprintf("%.2e", x) for x in nvn), "/"), nP)
+        it == 1 && (err0 = res + eps(T))
+        verbose && @printf("  [vMG PH %02d] err=%.3e  (v=%s P=%.2e dP=%.2e)\n", it, err,
+                           join((@sprintf("%.2e", x) for x in nvn), "/"), nP, ndP)
         if err < par.atol_PH
             converged = true;  break
         end
-        if it > 1 && err < rtol_PH * err0
+        if it > 1 && res < rtol_PH * err0
             relaxed = true;  break
         end
     end

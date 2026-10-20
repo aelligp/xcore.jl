@@ -106,7 +106,7 @@ inertia, both of which are scalar additions to the residual.
 
 ```
 solve_dyrel!(state, grid, par, …):
-    cache = state.dyrel                          # DyrelCache, lazy-initialized
+    cache = state.dyrel                          # StokesCache, lazy-initialized
 
     # one-time setup per fluidmech! call: re-tune for current viscosity field
     compute_bulk_viscosity_and_penalty!(cache, η, par.γfact)
@@ -266,7 +266,7 @@ For xcore (incompressible): `K_b → ∞`, so `γ_eff = γ_num = par.γfact · �
 ## 6. Cache data structure
 
 ```julia
-mutable struct DyrelCache{T<:AbstractFloat, A<:AbstractMatrix{T}}
+mutable struct StokesCache{T<:AbstractFloat, A<:AbstractMatrix{T}}
     # --- penalty + compressibility ---
     γ_eff::A          # (Nz,   Nx  )
     η_b::A            # (Nz,   Nx  )
@@ -294,7 +294,7 @@ end
 ```
 
 Constructor allocates everything via `xcore_zeros(backend, T, …)` exactly
-like `FluidState`. Lives at `state.dyrel::DyrelCache{T}`, parametric on the
+like `FluidState`. Lives at `state.dyrel::StokesCache{T}`, parametric on the
 backend.
 
 ---
@@ -333,32 +333,33 @@ atol_PH::T            = T(1e-6)          # outer PH absolute tol
 | BC kernels (flow_bcs!) | adapt from existing xcore BC patterns in fluidmech.jl | **NEW** |
 
 Plus reductions: `_dyrel_rayleigh_quotient` (2 dot products + 2 norms),
-`_dyrel_residual_norms` (3 norms).
+`_residual_norms` (3 norms).
 
 ---
 
-## 9. File layout under `src/dyrel/`
+## 9. File layout under `src/stokes/`
+
+One implementation serves D = 2 (`FluidState`, `Grid`) and D = 3 (`FluidState3D`,
+`Grid3D`); kernels run over `CartesianIndex{D}`.
 
 ```
-src/dyrel/
-├── DESIGN.md         ← this file
-├── cache.jl          ← DyrelCache struct + constructor
-├── gershgorin.jl     ← _dyrel_gershgorin_kernel! + update_dτ_α_β
-├── residuals.jl      ← _dyrel_residual_{W,U,P}_{PH,DR}_kernel!
-├── velocity.jl       ← damping + velocity update kernels
-├── pressure.jl       ← penalty pressure update + MFS handling
-├── bcs.jl            ← W/U/P boundary condition kernels
-├── init.jl           ← compute_bulk_viscosity_and_penalty!
-├── solve.jl          ← solve_dyrel! outer/inner loop orchestrator
-└── reductions.jl     ← Rayleigh quotient + residual norms
+src/stokes/
+├── Stokes.jl         ← module Stokes, includes below
+├── layout.jl         ← index helpers, state accessors, StokesOp (frozen coefficients + BCs)
+├── cache.jl          ← StokesCache, AndersonPH
+├── residuals.jl      ← momentum / continuity residuals, DR velocity update
+├── gershgorin.jl     ← Gershgorin diagonals + λmax, Schur diagonal, penalty!, dτ/α/β
+├── bcs.jl            ← velocity / pressure BCs, pressure gauges
+├── reductions.jl     ← Rayleigh quotient, residual norms, pressure-update gate
+├── advection.jl      ← D-dimensional flux-form advection, frozen momentum advection
+├── transfer.jl       ← multigrid restriction / prolongation
+├── dyrel.jl          ← fluidmech_dyrel! (Powell–Hestenes + dynamic relaxation)
+├── hierarchy.jl      ← MGLevel / MGHierarchy, coefficient coarsening
+├── gmg.jl            ← smoother, coarse solve, V-cycle, fluidmech_gmg!
+└── vmg.jl            ← velocity V-cycle, Cahouet–Chabard Poisson V-cycle, fluidmech_vmg!
 ```
 
-Plus changes elsewhere:
-- `src/state.jl`: add `dyrel::DyrelCache{T,A}` field to `FluidState`
-- `src/parameters.jl`: add solver-control fields from §7
-- `src/run.jl`: dispatch on `par.solver` to choose `fluidmech!` vs `fluidmech_dyrel!`
-- `src/xcore.jl`: `include("dyrel/...")` for the new files
-- New test: `test/test_dyrel.jl` validating against MMS + comparing to direct solve
+`src/solver.jl` dispatches `par.solver ∈ (:dyrel, :gmg, :vmg)` to these drivers.
 
 ---
 

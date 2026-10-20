@@ -1,6 +1,6 @@
 # Multigrid hierarchy: per level a grid, a fluid state holding the level's
-# (v, P) and coarsened coefficients, a `StokesCache`, and a pseudo-transient
-# reference pressure `P0`. Level 1 wraps the caller's fluid state.
+# (v, P) and coarsened coefficients, and a `StokesCache` (whose `P0` is the
+# pseudo-transient reference pressure). Level 1 wraps the caller's fluid state.
 
 """
     coarsen(grid; xBC = :periodic) -> grid
@@ -30,24 +30,24 @@ Number of levels from `N` cells down to the coarsest grid whose dimensions stay
 ≥ `minlvl` (a horizontal extent of 1 is kept).
 """
 function n_levels(N::NTuple{D, Int}; minlvl::Int = 4) where {D}
-    lvls = 1
-    ok(n, k) = k == 1 ? (iseven(n) && n ÷ 2 ≥ minlvl) :
-                        ((iseven(n) || n == 1) && (n == 1 || n ÷ 2 ≥ minlvl))
-    while all(ntuple(k -> ok(N[k], k), Val(D)))
-        N = ntuple(k -> N[k] == 1 ? 1 : N[k] ÷ 2, Val(D));  lvls += 1
+    halvable(n, k) = k == 1 ? (iseven(n) && n ÷ 2 ≥ minlvl) :
+                              ((iseven(n) || n == 1) && (n == 1 || n ÷ 2 ≥ minlvl))
+    lvls = 1;  n = N
+    while all(map(halvable, n, ntuple(identity, Val(D))))
+        n = map(m -> m == 1 ? 1 : m ÷ 2, n);  lvls += 1
     end
     return lvls
 end
 
-struct MGLevel{G, F, C, A}
+struct MGLevel{G, F, C}
     grid::G
     fluid::F
     cache::C
-    P0::A          # pseudo-transient reference pressure (see `vcycle!`)
 end
 
-struct MGHierarchy{T, L}
+struct MGHierarchy{T, L, W}
     levels::Vector{L}     # levels[1] = finest
+    cc::Vector{W}         # per-level (p, f, r, h) of the Cahouet–Chabard Poisson V-cycle
     minlvl::Int
     npre::Int
     npost::Int
@@ -78,20 +78,20 @@ function build_hierarchy(fluid, grid, par::Parameters{T};
         "(with L = 1.5·D choose N a multiple of 64 so that Nx = 1.5N is a multiple of 32)"))
     backend = KernelAbstractions.get_backend(fluid.P)
     nlev = n_levels(N; minlvl)
-    # Level 1's P0 is supplied per solve. Coarse levels keep a permanently zero
-    # P0: their P is the pressure correction (started at 0 each cycle), so
+    # Level 1's cache.P0 is set per solve. Coarse levels keep cache.P0 = 0:
+    # their P is the pressure correction (started at 0 each cycle), so
     # (P − 0)/(η_b·dt) is the linearized pseudo-transient term the fine operator
     # applies to its own per-cycle increment.
-    z(g) = xcore_zeros(backend, T, (cells(g) .+ 2)...)
-    levels = [MGLevel(grid, fluid, StokesCache(T, backend, grid), z(grid))]
+    levels = [MGLevel(grid, fluid, StokesCache(T, backend, grid))]
     g = grid
     for _ in 2:nlev
         g = coarsen(g; xBC)
-        push!(levels, MGLevel(g, _similar_fluid(fluid, backend, cells(g)),
-                              StokesCache(T, backend, g), z(g)))
+        push!(levels, MGLevel(g, _similar_fluid(fluid, backend, cells(g)), StokesCache(T, backend, g)))
     end
-    return MGHierarchy{T, eltype(levels)}(levels, minlvl, npre, npost, ncoarse,
-                                          T(coarse_rtol), inner, T(γ_mg))
+    cell(l) = xcore_zeros(backend, T, cells(l.grid)...)
+    cc = [(p = cell(l), f = cell(l), r = cell(l), h = T(l.grid.h)) for l in levels]
+    return MGHierarchy{T, eltype(levels), eltype(cc)}(levels, cc, minlvl, npre, npost, ncoarse,
+                                                      T(coarse_rtol), inner, T(γ_mg))
 end
 
 # face densities: mean of the two adjacent cells (edge cell repeated at a bound)
@@ -131,12 +131,18 @@ Rebuild the face densities and edge viscosities of `fluid` from its cell
 function derived_coefficients!(fluid, op::StokesOp{D}) where {D}
     backend = KernelAbstractions.get_backend(fluid.rho)
     ρf = face_density(fluid);  ηe = edge_viscosity(fluid)
-    for k in 1:D
-        _face_density_kernel!(backend)(ρf[k], fluid.rho, Val(k), op.periodic[k]; ndrange = size(ρf[k]))
+    _each_axis(Val(D)) do ka
+        k = _val(ka)
+        _face_density_kernel!(backend)(ρf[k], fluid.rho, ka, op.periodic[k]; ndrange = size(ρf[k]))
     end
-    for a in 1:D-1, b in a+1:D
-        η = ηe[_pair(a, b, D)]
-        _edge_viscosity_kernel!(backend)(η, fluid.eta, Val(a), Val(b), op.periodic; ndrange = size(η))
+    _each_axis(Val(D)) do pa
+        _each_axis(Val(D)) do pb
+            a = _val(pa);  b = _val(pb)
+            if a < b
+                η = ηe[_pair(a, b, D)]
+                _edge_viscosity_kernel!(backend)(η, fluid.eta, pa, pb, op.periodic; ndrange = size(η))
+            end
+        end
     end
     return nothing
 end

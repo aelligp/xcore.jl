@@ -27,7 +27,7 @@ const T = Float64
 
 NS      = parse.(Int, split(get(ENV, "XCORE_NS", "64,128,256"), ","))
 NREP    = parse(Int, get(ENV, "XCORE_NREP", "10"))
-SOLVERS = Symbol.(split(get(ENV, "XCORE_SOLVERS", "direct,gmg_direct,dyrel,gmg,vmg"), ","))
+SOLVERS = Symbol.(split(get(ENV, "XCORE_SOLVERS", "direct,dyrel,gmg,vmg"), ","))
 # Production inexact-solve forcing (see `Parameters.forcing_PH`); 0 solves every
 # sweep to `atol_PH`, the like-for-like comparison against :direct.
 FORCING = parse(T, get(ENV, "XCORE_FORCING", "0.1"))

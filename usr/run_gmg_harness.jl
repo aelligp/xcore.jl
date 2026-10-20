@@ -1,5 +1,5 @@
 # In-process GMG tuning harness: measures the per-V-cycle contraction factor ρ
-# of `GMG.fluidmech_gmg!` on a FROZEN production state (step-1 IC after
+# of `fluidmech_gmg!` on a FROZEN production state (step-1 IC after
 # `initialize!`), across (mg_gfact, mg_inner, mg_minlvl) — the numeric
 # cycle-factor measurement standard in MG practice. One Julia session, one
 # `initialize!` per N, one `deepcopy` per config probe: no per-config JIT, no
@@ -57,8 +57,8 @@ end
 function probe(base, par)
     fc = deepcopy(base.fluid)
     pc = deepcopy(base.phase)
-    hier = xcore.GMG.build_hierarchy(fc, pc, base.grid, par)
-    wall = @elapsed st = xcore.GMG.fluidmech_gmg!(
+    hier = xcore.build_hierarchy(fc, base.grid, par)
+    wall = @elapsed st = xcore.fluidmech_gmg!(
         fc, pc, hier, base.grid, par, base.scales;
         dt = base.dt0, a1 = 1, a2 = 1, a3 = 0)
     errs = st.errs

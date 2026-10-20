@@ -4,16 +4,20 @@
 # the fluid state directly). Cell-centered fields have shape `N`.
 
 # Anderson-acceleration history of the Powell-Hestenes multiplier iteration
-# (see `_anderson_pressure_update!`). Cell-centered arrays, allocated on first use.
+# (see `_anderson_pressure_update!`). Cell-centered arrays and the host-side
+# m×m least-squares scratch, allocated on first use.
 mutable struct AndersonPH{T<:AbstractFloat, A<:AbstractArray{T}}
     prev::Vector{A}     # [pressure, update] of the previous sweep
     dX::Vector{A}       # pressure differences, ring buffer of depth m
     dF::Vector{A}       # update differences, same slots as dX
+    G::Matrix{T}        # Gram matrix ΔFᵀΔF
+    b::Vector{T}        # ΔFᵀf
     n::Int              # valid history columns
     slot::Int           # last column written
     have_prev::Bool     # `prev` holds the previous sweep
 end
-AndersonPH{T, A}() where {T, A} = AndersonPH{T, A}(A[], A[], A[], 0, 0, false)
+AndersonPH{T, A}() where {T, A} =
+    AndersonPH{T, A}(A[], A[], A[], zeros(T, 0, 0), T[], 0, 0, false)
 
 """
     StokesCache{D,T,A}
@@ -29,6 +33,9 @@ solve on one grid:
   faces), and the injected multigrid right-hand side `bext`.
 * continuity residual `R_P`, Schur penalty `P_num = γ_eff·R_P`, Schur diagonal
   `s_P`, injected `bext_P`, previous-iterate viscosity `eta_prev`.
+* `P0` (ghosted pressure shape): the reference pressure of a solve (gauge level,
+  pseudo-transient term); zero on multigrid coarse levels.
+* `dP`: the interior pressure change of the last multiplier update or V-cycle.
 * `c` (global damping from the Rayleigh quotient) and `γfact` (penalty factor
   learned by the last solve; 0 = start from `par.γfact_PT`).
 """
@@ -51,6 +58,8 @@ mutable struct StokesCache{D, T<:AbstractFloat, A<:AbstractArray{T, D}}
     const s_P::A
     const bext_P::A
     const eta_prev::A
+    const P0::A
+    const dP::A
     const anderson::AndersonPH{T, A}
     c::T
     γfact::T
@@ -69,10 +78,18 @@ function StokesCache(::Type{T}, backend, N::NTuple{D, Int}) where {T<:AbstractFl
     A = typeof(z(N))
     return StokesCache{D, T, A}(z(N), z(N),
                                 fv(), fv(), fv(), fv(), fv(), fv(), fv(), fv(), fv(), fv(), fv(),
-                                z(N), z(N), z(N), z(N), z(N),
+                                z(N), z(N), z(N), z(N), z(N), z(N .+ 2), z(N),
                                 AndersonPH{T, A}(), zero(T), zero(T))
 end
 StokesCache(::Type{T}, backend, grid::Union{Grid, Grid3D}) where {T<:AbstractFloat} =
     StokesCache(T, backend, cells(grid))
 
 cells(c::StokesCache) = size(c.R_P)
+
+"""
+    DyrelCache
+
+Alias of [`StokesCache`](@ref): `DyrelCache(T, backend, grid)` builds the
+cache `fluidmech_dyrel!` takes.
+"""
+const DyrelCache = StokesCache

@@ -101,8 +101,9 @@ function apply_velocity_bcs!(fluid, grid, op::StokesOp{D, T};
     mode = open_cnv ? 2 : (iszero(mfs_mean) ? 0 : 1)
     _velocity_bc_z_kernel!(backend)(v, face_density(fluid), fluid.MFS, op.top_cnv, op.bot_cnv,
                                     T(mfs_mean), T(Ddom), mode, T(grid.h); ndrange = _plane(N, 1))
-    for a in 2:D
-        _velocity_bc_h_kernel!(backend)(v, Val(a), op.periodic[a], op.sds; ndrange = _plane(N, a))
+    _each_axis(Val(D)) do ax
+        a = _val(ax)
+        a == 1 || _velocity_bc_h_kernel!(backend)(v, ax, op.periodic[a], op.sds; ndrange = _plane(N, a))
     end
     return nothing
 end
@@ -131,8 +132,9 @@ function apply_pressure_bcs!(fluid, op::StokesOp{D}) where {D}
     P = fluid.P
     backend = KernelAbstractions.get_backend(P)
     plane(a) = ntuple(k -> k == a ? 1 : size(P, k), Val(D))
-    for a in 2:D
-        _pressure_bc_kernel!(backend)(P, Val(a), op.periodic[a]; ndrange = plane(a))
+    _each_axis(Val(D)) do ax
+        a = _val(ax)
+        a == 1 || _pressure_bc_kernel!(backend)(P, ax, op.periodic[a]; ndrange = plane(a))
     end
     _pressure_bc_kernel!(backend)(P, Val(1), false; ndrange = plane(1))
     return nothing

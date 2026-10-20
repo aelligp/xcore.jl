@@ -55,13 +55,15 @@ end
 """
     restrict_face!(coarse, fine, d) -> coarse
 
-Mean of the 2^(D−1) fine faces of component `d` covering each coarse face.
+Mean of the 2^(D−1) fine faces of component `d` (an `Int` or `Val(d)`)
+covering each coarse face.
 """
-function restrict_face!(coarse, fine, d::Int)
-    _restrict_face_kernel!(KernelAbstractions.get_backend(coarse))(coarse, fine, Val(d);
+function restrict_face!(coarse, fine, comp::Val)
+    _restrict_face_kernel!(KernelAbstractions.get_backend(coarse))(coarse, fine, comp;
                                                                   ndrange = size(coarse))
     return coarse
 end
+restrict_face!(coarse, fine, d::Int) = restrict_face!(coarse, fine, Val(d))
 
 # coarse neighbor index along axis k of a cell-centered field
 @inline _nb_cell(i, n, periodic) = i < 1 ? (periodic ? n : 1) : (i > n ? (periodic ? 1 : n) : i)
@@ -145,11 +147,13 @@ end
 """
     prolong_face!(fine, coarse, d, op) -> fine
 
-Interpolate component `d` (compact face shape) from the coarse to the fine grid
-with the BC-consistent ghost rule of each transverse axis (file header).
+Interpolate component `d` (an `Int` or `Val(d)`; compact face shape) from the
+coarse to the fine grid with the BC-consistent ghost rule of each transverse
+axis (file header).
 """
-function prolong_face!(fine, coarse, d::Int, op::StokesOp)
+function prolong_face!(fine, coarse, comp::Val, op::StokesOp)
     _prolong_face_kernel!(KernelAbstractions.get_backend(fine))(
-        fine, coarse, Val(d), op.periodic, op.sds, op.top_cnv, op.bot_cnv; ndrange = size(fine))
+        fine, coarse, comp, op.periodic, op.sds, op.top_cnv, op.bot_cnv; ndrange = size(fine))
     return fine
 end
+prolong_face!(fine, coarse, d::Int, op::StokesOp) = prolong_face!(fine, coarse, Val(d), op)

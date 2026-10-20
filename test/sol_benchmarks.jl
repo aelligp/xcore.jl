@@ -1,7 +1,6 @@
 using xcore
-using xcore: Parameters, Grid, FluidState, PhaseState, DyrelCache,
-             compute_scales, fluidmech!, fluidmech_dyrel!, compute_corner_eta!
-using xcore.GMG: build_hierarchy, fluidmech_gmg!
+using xcore: Parameters, Grid, FluidState, PhaseState, DyrelCache, build_hierarchy,
+             compute_scales, fluidmech!, fluidmech_dyrel!, fluidmech_gmg!, compute_corner_eta!
 using KernelAbstractions: CPU
 using LinearAlgebra
 using Statistics
@@ -22,7 +21,7 @@ include("solkz_solution.jl")
 #
 # Viscosity convention: xcore's deviatoric stress is tau = eta(e - div(v)/3),
 # without the conventional factor 2 (see the stress expressions in
-# dyrel/residuals.jl and the 2/3 and 1/2 stencil weights in fluidmech.jl). The
+# src/stokes/residuals.jl and the 2/3 and 1/2 stencil weights in fluidmech.jl). The
 # reference solutions are posed for tau = 2*eta_ref(e - div(v)/3), so the
 # benchmark viscosity must be loaded as eta = 2*eta_ref or the computed
 # velocities come out twice too large.
@@ -125,7 +124,7 @@ function sol_solve!(fluid::FluidState{T}, phase, grid, par, scales,
         cache = DyrelCache(T, CPU(), grid)
         return fluidmech_dyrel!(fluid, phase, cache, grid, par, scales; kw...)
     elseif solver === :gmg
-        hier = build_hierarchy(fluid, phase, grid, par; xBC = :closed)
+        hier = build_hierarchy(fluid, grid, par; xBC = :closed)
         return fluidmech_gmg!(fluid, phase, hier, grid, par, scales; kw...)
     end
     throw(ArgumentError("sol_solve!: unknown solver $solver"))

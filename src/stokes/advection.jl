@@ -4,33 +4,39 @@
 # wide-stencil advection.
 #
 # Each component's momentum ρ_d·v_d is advected as a cell field on the control
-# volumes centered on its faces, by `advect!`'s flux-form schemes (generic in D).
-# Along its own axis d:
-#   * bounded (always z): the control volumes are the interior faces 2..N_d,
-#     advected by v_d interpolated to cell centres; boundary faces get zero.
+# volumes (CVs) centered on its faces, with `advect!`'s flux-form schemes. Along
+# its own axis d:
+#   * bounded (always z): the CVs are the interior faces 2..N_d, advected by v_d
+#     interpolated to cell centers; boundary faces get zero.
 #   * periodic: all N_d + 1 faces (the two boundary faces are the same physical
-#     face), advected by v_d at the midpoints between faces with periodic wrap;
-#     the two boundary values are averaged afterwards so they agree.
-# Along every other axis k the control volumes follow the cell grid, advected
-# by v_k averaged along d onto the control-volume faces.
+#     face, so the CV row has period N_d + 1), advected by v_d at the midpoints
+#     between faces with periodic wrap; the two boundary values are averaged
+#     afterwards so they agree.
+# Along every other axis k the CVs follow the cell grid, advected by v_k
+# averaged along d onto the CV faces.
+#
+# One kernel per component evaluates the momentum and the CV-face velocities
+# directly from the state, applying the ghost rule of each axis on the fly
+# (periodic wrap, otherwise repeat of the edge value); the TVD scheme reads one
+# face further out, with the same rule.
 
-# One-dimensional face fluxes (q_hi, q_lo) along an axis: `f` is the halo field,
-# `c` the cell, `e` the unit offset; `vl`, `vh` the velocities of the low/high
-# faces, `vll`, `vhh` those one face further out (TVD only).
 @inline _pos(u, half) = (u + abs(u)) * half
 @inline _neg(u, half) = (u - abs(u)) * half
 
-Base.@propagate_inbounds function _fluxes(::Val{:centr}, f, c, e, vl, vh, vll, vhh, half)
-    fc = f[c]
-    return vh * (fc + f[c + e]) * half, vl * (fc + f[c - e]) * half
+# One-dimensional face fluxes (q_hi, q_lo) along an axis: `F(m)` is the advected
+# field m cells from the current one; `vl`, `vh` the velocities of the low/high
+# faces, `vll`, `vhh` those one face further out (TVD only).
+@inline function _fluxes(::Val{:centr}, F, vl, vh, vll, vhh, half)
+    fc = F(0)
+    return vh * (fc + F(1)) * half, vl * (fc + F(-1)) * half
 end
-Base.@propagate_inbounds function _fluxes(::Val{:upwd1}, f, c, e, vl, vh, vll, vhh, half)
-    fc = f[c];  fm = f[c - e];  fp = f[c + e]
+@inline function _fluxes(::Val{:upwd1}, F, vl, vh, vll, vhh, half)
+    fc = F(0);  fm = F(-1);  fp = F(1)
     return _pos(vh, half) * fc + _neg(vh, half) * fp, _pos(vl, half) * fm + _neg(vl, half) * fc
 end
-Base.@propagate_inbounds function _fluxes(::Val{:quick}, f, c, e, vl, vh, vll, vhh, half)
+@inline function _fluxes(::Val{:quick}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  sixth = T(1//6)
-    fmm = f[c - 2e];  fm = f[c - e];  fc = f[c];  fp = f[c + e];  fpp = f[c + 2e]
+    fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
     fppos = sixth * (2 * fp + 5 * fc - fm)
     fpneg = sixth * (2 * fc + 5 * fp - fpp)
     fmpos = sixth * (2 * fc + 5 * fm - fmm)
@@ -38,9 +44,9 @@ Base.@propagate_inbounds function _fluxes(::Val{:quick}, f, c, e, vl, vh, vll, v
     return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
            _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
 end
-Base.@propagate_inbounds function _fluxes(::Val{:fromm}, f, c, e, vl, vh, vll, vhh, half)
+@inline function _fluxes(::Val{:fromm}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  quarter = T(0.25)
-    fmm = f[c - 2e];  fm = f[c - e];  fc = f[c];  fp = f[c + e];  fpp = f[c + 2e]
+    fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
     fppos = fc + quarter * (fp - fm)
     fpneg = fp + quarter * (fc - fpp)
     fmpos = fm + quarter * (fc - fmm)
@@ -48,9 +54,9 @@ Base.@propagate_inbounds function _fluxes(::Val{:fromm}, f, c, e, vl, vh, vll, v
     return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
            _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
 end
-Base.@propagate_inbounds function _fluxes(::Val{:weno3}, f, c, e, vl, vh, vll, vhh, half)
+@inline function _fluxes(::Val{:weno3}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  ε = T(1e-6)
-    fmm = f[c - 2e];  fm = f[c - e];  fc = f[c];  fp = f[c + e];  fpp = f[c + 2e]
+    fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
     fppos = _weno3_poly(fm, fc, fp, ε)
     fpneg = _weno3_poly(fpp, fp, fc, ε)
     fmpos = _weno3_poly(fmm, fm, fc, ε)
@@ -58,10 +64,9 @@ Base.@propagate_inbounds function _fluxes(::Val{:weno3}, f, c, e, vl, vh, vll, v
     return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
            _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
 end
-Base.@propagate_inbounds function _fluxes(::Val{:weno5}, f, c, e, vl, vh, vll, vhh, half)
+@inline function _fluxes(::Val{:weno5}, F, vl, vh, vll, vhh, half)
     ε = eps(typeof(half))
-    fmmm = f[c - 3e];  fmm = f[c - 2e];  fm = f[c - e];  fc = f[c]
-    fp = f[c + e];  fpp = f[c + 2e];  fppp = f[c + 3e]
+    fmmm = F(-3);  fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2);  fppp = F(3)
     fppos = _weno5_poly(fmm, fm, fc, fp, fpp, ε)
     fpneg = _weno5_poly(fppp, fpp, fp, fc, fm, ε)
     fmpos = _weno5_poly(fmmm, fmm, fm, fc, fp, ε)
@@ -69,8 +74,8 @@ Base.@propagate_inbounds function _fluxes(::Val{:weno5}, f, c, e, vl, vh, vll, v
     return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
            _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
 end
-Base.@propagate_inbounds function _fluxes(::Val{:tvdim}, f, c, e, vl, vh, vll, vhh, half)
-    fmm = f[c - 2e];  fm = f[c - e];  fc = f[c];  fp = f[c + e];  fpp = f[c + 2e]
+@inline function _fluxes(::Val{:tvdim}, F, vl, vh, vll, vhh, half)
+    fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
     lpos = _pos(vl, half);  lneg = _neg(vl, half)
     hpos = _pos(vh, half);  hneg = _neg(vh, half)
     fppos = _tvd_flux(fm, fc, fp, lpos, hpos)
@@ -80,127 +85,101 @@ Base.@propagate_inbounds function _fluxes(::Val{:tvdim}, f, c, e, vl, vh, vll, v
     return hpos * fppos + hneg * fpneg, lpos * fmpos + lneg * fmneg
 end
 
-# `vel[k]` has n_k + 1 + 2pad faces along k; face j of the cell grid is at j + pad.
-@kernel function _advect_kernel!(adv, @Const(f), @Const(vel), scheme, g, pad, invh, half)
+# ghost rule of a CV row with n cells: periodic wrap, otherwise edge repeat
+@inline _ghost(i, n, periodic) = periodic ? mod1(i, n) : clamp(i, 1, n)
+# CV-face index outside 1..n+1 (one face further out, TVD only)
+@inline _ghost_face(i, n, periodic) = i < 1 ? (periodic ? n : 1) : (i > n + 1 ? (periodic ? 2 : n + 1) : i)
+
+# momentum ρ_d·v_d at CV index c (ghost rule applied); `own` = periodic own axis
+Base.@propagate_inbounds @inline function _cv_momentum(v, ρd, c::CartesianIndex{D}, d, own, n,
+                                                      periodic) where {D}
+    J = CartesianIndex(ntuple(k -> (i = _ghost(c[k], n[k], k == d ? own : periodic[k]);
+                                    k == d && !own ? i + 1 : i), Val(D)))
+    return @inbounds ρd[J] * v[d][J + _ones(J) - _unit(J, d)]
+end
+
+# velocity on CV face i along axis k at the transverse position I
+Base.@propagate_inbounds @inline function _cv_velocity(v, I::CartesianIndex{D}, d, k, i, own, N) where {D}
+    if k == d
+        Nd = N[d]
+        if own
+            # midpoints between faces a(j), a(j + 1) with a = [N_d; 1:N_d+1; 2]
+            a(j) = j == 1 ? Nd : (j == Nd + 3 ? 2 : j - 1)
+            lo = CartesianIndex(ntuple(m -> m == d ? a(i) : I[m] + 1, Val(D)))
+            hi = _setidx(lo, d, a(i + 1))
+        else
+            lo = CartesianIndex(ntuple(m -> m == d ? i : I[m] + 1, Val(D)))
+            hi = lo + _unit(lo, d)
+        end
+        return @inbounds (v[d][lo] + v[d][hi]) / 2
+    end
+    # v_k averaged along d over the two cells adjacent to the CV
+    lo = CartesianIndex(ntuple(m -> m == d ? (own ? I[m] : I[m] + 1) : (m == k ? i : I[m] + 1), Val(D)))
+    return @inbounds (v[k][lo] + v[k][lo + _unit(lo, d)]) / 2
+end
+
+@kernel function _momentum_advection_kernel!(advn, comp, @Const(v), @Const(ρd), scheme,
+                                             periodic, N, n, g_tvd, invh, half)
     I = @index(Global, Cartesian)
     @inbounds begin
-        D = length(I)
-        c = I + g * _ones(I)
+        d = _val(comp);  D = length(I)
+        own = periodic[d]
+        pcv(k) = k == d ? own : periodic[k]
+        # flux balance along axis k: horizontal axes first, then z
+        q(k) = (ek = _unit(I, k);  nk = n[k];  p = pcv(k);
+                vel(i) = _cv_velocity(v, I, d, k, _ghost_face(i, nk, p), own, N);
+                _fluxes(scheme, m -> _cv_momentum(v, ρd, I + m * ek, d, own, n, periodic),
+                        vel(I[k]), vel(I[k] + 1),
+                        g_tvd ? vel(I[k] - 1) : zero(half), g_tvd ? vel(I[k] + 2) : zero(half), half))
         ax = _hz_axes(Val(D))
-        q(k) = @inbounds (ek = _unit(I, k);  vk = vel[k];  P = pad * ek;
-                          _fluxes(scheme, f, c, ek, vk[I + P], vk[I + ek + P],
-                                  vk[I + P - pad * ek], vk[I + ek + P + pad * ek], half))
         q1 = q(ax[1])
         acc = _tfoldl((s, k) -> (qk = q(k); s + qk[1] - qk[2]), q1[1] - q1[2], Base.tail(ax))
-        adv[I] = acc * invh
+        advn[own ? I : I + _unit(I, d)] = acc * invh
     end
 end
 
-# Ghost layers of width g: periodic wrap or zero-gradient repeat per axis.
-function _fill_ghosts!(f::AbstractArray{<:Any, D}, g, periodic::NTuple{D, Bool}) where {D}
-    for k in (ntuple(k -> k + 1, Val(D - 1))..., 1)
-        n = size(f, k) - 2g
-        sel(r) = view(f, ntuple(m -> m == k ? r : Colon(), Val(D))...)
-        if periodic[k]
-            sel(1:g) .= sel(n + 1:n + g)
-            sel(n + g + 1:n + 2g) .= sel(g + 1:2g)
+# boundary faces of component d along its own axis: periodic ⇒ the two copies
+# of the boundary face take their mean; bounded ⇒ zero
+@kernel function _advection_boundary_kernel!(advn, comp, own::Bool)
+    I = @index(Global, Cartesian)          # plane, I[d] = 1
+    @inbounds begin
+        d = _val(comp);  n = size(advn, d)
+        i1 = _setidx(I, d, 1);  in_ = _setidx(I, d, n)
+        if own
+            avg = (advn[i1] + advn[in_]) / 2
+            advn[i1] = avg;  advn[in_] = avg
         else
-            for m in 1:g
-                sel(m:m) .= sel(g + 1:g + 1)
-                sel(n + g + m:n + g + m) .= sel(n + g:n + g)
-            end
+            advn[i1] = zero(eltype(advn));  advn[in_] = zero(eltype(advn))
         end
     end
-    return f
-end
-
-"""
-    advect_nd!(adv, f, vel, h, scheme, periodic) -> adv
-
-Flux-form `div(v f)` of the cell field `f` (shape of `adv`), with `vel[k]` the
-velocity on the faces normal to axis k (n_k + 1 along k, cell-shaped
-elsewhere) and `periodic[k]` the ghost rule of each axis (otherwise repeat).
-`scheme` as in `advect!`.
-"""
-function advect_nd!(adv::AbstractArray{T, D}, f, vel::NTuple{D}, h, scheme::Symbol,
-                    periodic::NTuple{D, Bool}) where {T, D}
-    g = scheme_halo(scheme)
-    fh = similar(f, size(f) .+ 2g)
-    fill!(fh, zero(T))
-    view(fh, ntuple(k -> g + 1:g + size(f, k), Val(D))...) .= f
-    _fill_ghosts!(fh, g, periodic)
-    pad = scheme === :tvdim ? 1 : 0
-    if pad == 1
-        vel = ntuple(Val(D)) do k
-            u = vel[k];  n = size(u, k) - 1
-            up = similar(u, size(u) .+ 2 .* ntuple(m -> Int(m == k), Val(D)))
-            sel(A, r) = view(A, ntuple(m -> m == k ? r : Colon(), Val(D))...)
-            sel(up, 2:n + 2) .= u
-            if periodic[k]
-                sel(up, 1:1) .= sel(u, n:n);  sel(up, n + 3:n + 3) .= sel(u, 2:2)
-            else
-                sel(up, 1:1) .= sel(u, 1:1);  sel(up, n + 3:n + 3) .= sel(u, n + 1:n + 1)
-            end
-            up
-        end
-    end
-    backend = KernelAbstractions.get_backend(adv)
-    _advect_kernel!(backend)(adv, fh, vel, Val(scheme), g, pad, T(inv(h)), T(0.5);
-                             ndrange = size(adv))
-    return adv
 end
 
 """
     momentum_advection!(cache, fluid, grid, par, op) -> nothing
 
 Fill `cache.advn[d]` with `div(v·ρ_d v_d)` for every component from the current
-velocity and face densities, scheme `par.ADVN` (see the file header).
+velocity and face densities, scheme `par.ADVN` ∈ (`:centr`, `:upwd1`, `:quick`,
+`:fromm`, `:weno3`, `:weno5`, `:tvdim`); see the file header.
 """
 function momentum_advection!(cache::StokesCache{D, T}, fluid, grid, par, op::StokesOp{D}) where {D, T}
+    scheme = par.ADVN
+    scheme in (:centr, :upwd1, :quick, :fromm, :weno3, :weno5, :tvdim) ||
+        throw(ArgumentError("momentum_advection!: unsupported scheme = :$scheme"))
+    return _momentum_advection!(cache, fluid, grid, op, Val(scheme))
+end
+
+function _momentum_advection!(cache::StokesCache{D, T}, fluid, grid, op::StokesOp{D},
+                              scheme::Val{S}) where {D, T, S}
+    backend = KernelAbstractions.get_backend(cache.R_P)
     v = velocity(fluid);  ρf = face_density(fluid)
-    N = cells(grid);  h = grid.h
-    for d in 1:D
-        own_periodic = op.periodic[d]
-        Nd = N[d]
-        # control volumes along d: face index range (compact) and count
-        cv = own_periodic ? (1:Nd + 1) : (2:Nd)
-        # cell-shaped selection on other axes: compact 1:N, ghosted 2:N+1
-        sel(A, rd, ghosted) = view(A, ntuple(k -> k == d ? rd : (ghosted ? (2:N[k] + 1) : (1:N[k])), Val(D))...)
-        f = sel(ρf[d], cv, false) .* sel(v[d], cv, true)
-        vel = ntuple(Val(D)) do k
-            if k == d
-                if own_periodic
-                    # midpoints between consecutive faces, wrapping across the boundary
-                    vd = v[d];  n = Nd + 1
-                    sl(r) = sel(vd, r, true)
-                    out = similar(f, ntuple(m -> m == d ? n + 1 : size(f, m), Val(D)))
-                    so(r) = view(out, ntuple(m -> m == d ? r : Colon(), Val(D))...)
-                    so(2:n) .= (sl(1:n - 1) .+ sl(2:n)) ./ T(2)
-                    so(1:1) .= (sl(Nd:Nd) .+ sl(1:1)) ./ T(2)
-                    so(n + 1:n + 1) .= (sl(n:n) .+ sl(2:2)) ./ T(2)
-                    out
-                else
-                    (sel(v[d], 1:Nd, true) .+ sel(v[d], 2:Nd + 1, true)) ./ T(2)
-                end
-            else
-                # v_k averaged along d onto the control-volume faces, all faces along k
-                rd0, rd1 = own_periodic ? (1:Nd + 1, 2:Nd + 2) : (2:Nd, 3:Nd + 1)
-                vk(rd) = view(v[k], ntuple(m -> m == d ? rd : (m == k ? (1:N[k] + 1) : (2:N[m] + 1)), Val(D))...)
-                (vk(rd0) .+ vk(rd1)) ./ T(2)
-            end
-        end
-        if own_periodic
-            out = cache.advn[d]
-            advect_nd!(out, f, vel, h, par.ADVN, op.periodic)
-            sd(r) = view(out, ntuple(m -> m == d ? r : Colon(), Val(D))...)
-            avg = (sd(1:1) .+ sd(Nd + 1:Nd + 1)) ./ T(2)
-            sd(1:1) .= avg
-            sd(Nd + 1:Nd + 1) .= avg
-        else
-            fill!(cache.advn[d], zero(T))
-            out = view(cache.advn[d], ntuple(m -> m == d ? (2:Nd) : Colon(), Val(D))...)
-            advect_nd!(out, f, vel, h, par.ADVN, op.periodic)
-        end
+    N = cells(grid);  invh = T(inv(grid.h))
+    _each_axis(Val(D)) do comp
+        d = _val(comp);  own = op.periodic[d]
+        n = ntuple(k -> k == d ? (own ? N[k] + 1 : N[k] - 1) : N[k], Val(D))
+        _momentum_advection_kernel!(backend)(cache.advn[d], comp, v, ρf[d], scheme, op.periodic,
+                                             N, n, S === :tvdim, invh, T(0.5); ndrange = n)
+        _advection_boundary_kernel!(backend)(cache.advn[d], comp, own;
+                                             ndrange = ntuple(k -> k == d ? 1 : size(cache.advn[d], k), Val(D)))
     end
     return nothing
 end

@@ -1,16 +1,13 @@
 # 3-D staggered grid — the dimension lift of `src/grid.jl::Grid`. Axes follow the
-# convention fixed in `src/dyrel3D/schur.jl`:
+# convention used by the Stokes solvers (see `src/stokes/layout.jl`):
 #
 #   (iz, ix, iy) = (z, x, y);  z = dim1 (gravity), x = dim2, y = dim3.
 #
-# x and y are periodic, z is closed (Dirichlet W faces). Cells are isotropic
-# (single `h`), as in 2-D. Coordinate vectors mirror the 2-D `Grid` construction
-# (cell centres at (i-½)h, faces at i·h).
-#
-# Phase-1 scaffold: carries only the geometry the GMG3D solver + VTK output need.
-# Ghost-index vectors (the 2-D `icx`/`ifz` wrap-around helpers) are deferred —
-# the 3-D BC kernels apply periodicity/Dirichlet directly (see schur.jl), so the
-# index vectors are not required yet.
+# z is closed (Dirichlet W faces); the horizontal boundary conditions are chosen
+# per solve. Cells are isotropic (single `h`), as in 2-D. Coordinate vectors
+# mirror the 2-D `Grid` construction (cell centers at (i-½)h, faces at i·h).
+# There are no ghost-index vectors: the solver kernels apply the boundary
+# conditions directly.
 
 """
     Grid3D{T}
@@ -49,8 +46,7 @@ function Grid3D(par::Parameters{T}) where {T<:AbstractFloat}
 end
 
 # Construct a Grid3D at explicit sizes/spacing (used by Grid3D(par) and by the
-# multigrid coarsening, which halves dims and doubles h without re-deriving from
-# Parameters — same pattern as `src/dyrel_GMG/hierarchy.jl::_grid_at`).
+# multigrid coarsening, which halves dims and doubles h).
 function _grid3d_at(::Type{T}, Nz::Int, Nx::Int, Ny::Int, h::T, D::T, L::T) where {T}
     Xc = collect(((1:Nx) .- T(0.5)) .* h)
     Yc = collect(((1:Ny) .- T(0.5)) .* h)
@@ -64,13 +60,13 @@ end
 """
     coarsen_grid3d(grid) -> Grid3D
 
-Halve `Nz`,`Nx`,`Ny` and double `h`. Errors on an odd coarsenable dimension —
-the hierarchy builder enforces 32-friendly fine sizes (see the 2-D analogue).
+Halve `Nz`,`Nx`,`Ny` and double `h`. Errors on an odd coarsenable dimension;
+the multigrid hierarchy builder requires multiples of 32.
 """
 function coarsen_grid3d(grid::Grid3D{T}) where {T}
     Nz, Nx, Ny = grid.Nz, grid.Nx, grid.Ny
     (iseven(Nz) && (iseven(Nx) || Nx == 1) && (iseven(Ny) || Ny == 1)) ||
-        error("GMG3D: cannot coarsen grid $(Nz)×$(Nx)×$(Ny) (need even dims)")
+        error("multigrid: cannot coarsen grid $(Nz)×$(Nx)×$(Ny) (need even dims)")
     half(n) = n == 1 ? 1 : n ÷ 2
     return _grid3d_at(T, half(Nz), half(Nx), half(Ny), grid.h * 2, grid.D, grid.L)
 end

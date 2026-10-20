@@ -1,85 +1,40 @@
-# Phase-1 smoke test for the 3-D GMG scaffold: the real `FluidState3D` /
-# `DyrelCache3D` structs must be field-compatible with the validated
-# `src/dyrel3D/schur.jl` kernel wrappers (which the standalone test
-# `test_schur3d.jl` checks for correctness on NamedTuples). Here we confirm the
-# struct field names/shapes line up and the wrappers run end-to-end producing
-# finite, correctly-shaped output.
+# 3-D state, grid and solver-cache layout: the shapes the dimension-generic
+# Stokes kernels index, the per-axis accessors, and grid coarsening.
 using Test
 using xcore
+import xcore as XC
 using KernelAbstractions: CPU
-using Random
-Random.seed!(7)
 
-const GMG3D = xcore.GMG3D
-be = CPU()
-T  = Float64
-Nz, Nx, Ny = 8, 6, 4
+let T = Float64, Nz = 8, Nx = 6, Ny = 4
+    f = FluidState3D(T, CPU(), Nz, Nx, Ny)
+    c = StokesCache(T, CPU(), (Nz, Nx, Ny))
+    S = XC.Stokes
 
-f = FluidState3D(T, be, Nz, Nx, Ny)
-c = DyrelCache3D(T, be, Nz, Nx, Ny)
+    @testset "FluidState3D / StokesCache shapes" begin
+        @test size(f.W) == (Nz + 1, Nx + 2, Ny + 2)
+        @test size(f.U) == (Nz + 2, Nx + 1, Ny + 2)
+        @test size(f.V) == (Nz + 2, Nx + 2, Ny + 1)
+        @test size(f.P) == (Nz + 2, Nx + 2, Ny + 2)
+        # compact face shapes N .+ e_d, edge viscosities N .+ e_a .+ e_b
+        @test size.(c.Rv) == ((Nz + 1, Nx, Ny), (Nz, Nx + 1, Ny), (Nz, Nx, Ny + 1))
+        @test size.(S.face_density(f)) == size.(c.Rv)
+        @test size.(S.edge_viscosity(f)) == ((Nz + 1, Nx + 1, Ny), (Nz + 1, Nx, Ny + 1),
+                                             (Nz, Nx + 1, Ny + 1))
+        @test S.velocity(f) === (f.W, f.U, f.V)
+        @test size(c.R_P) == size(c.s_P) == (Nz, Nx, Ny)
+    end
 
-# random, well-conditioned fill (viscosities/densities/diagonals strictly > 0)
-randfill!(A)  = (A .= randn(size(A)...); A)
-posfill!(A)   = (A .= rand(size(A)...) .+ 1.0; A)
-for fld in (f.W, f.U, f.V, f.P, f.Drho, f.MFS,
-            f.rhoWo, f.rhoWoo, f.rhoUo, f.rhoUoo, f.rhoVo, f.rhoVoo)
-    randfill!(fld)
-end
-for fld in (f.eta, f.etaxz, f.etayz, f.etaxy, f.rho, f.rhow, f.rhou, f.rhov)
-    posfill!(fld)
-end
-for fld in (c.D_W, c.D_U, c.D_V, c.γ_eff, c.η_b)
-    posfill!(fld)
-end
-for fld in (c.bext_W, c.bext_U, c.bext_V, c.bext_P, c.advn_mz, c.advn_mx, c.advn_my)
-    randfill!(fld)
-end
-P0 = randn(Nz + 2, Nx + 2, Ny + 2)
-
-@testset "FluidState3D / DyrelCache3D shapes" begin
-    # must match the field table in the header of src/dyrel3D/schur.jl
-    @test size(f.W)   == (Nz + 1, Nx + 2, Ny + 2)
-    @test size(f.U)   == (Nz + 2, Nx + 1, Ny + 2)
-    @test size(f.V)   == (Nz + 2, Nx + 2, Ny + 1)
-    @test size(c.R_W) == (Nz + 1, Nx, Ny)
-    @test size(c.R_U) == (Nz, Nx + 1, Ny)
-    @test size(c.R_V) == (Nz, Nx, Ny + 1)
-    @test size(c.s_P) == (Nz, Nx, Ny)
-end
-
-h, g0, dt = 0.37, 9.81, 0.7
-
-@testset "dyrel3d kernels on real structs (dr = $dr)" for dr in (false, true)
-    GMG3D.dyrel3d_residual_P!(c, f, h, P0, dt)
-    GMG3D.dyrel3d_residual_V!(c, f, h, g0; dr, a1 = 1.5, a2 = -0.6, a3 = 0.1,
-                              gamma = 1e-3, dt)
-    @test all(isfinite, c.R_W)
-    @test all(isfinite, c.R_U)
-    @test all(isfinite, c.R_V)
-    @test all(isfinite, c.R_P)
-    @test all(isfinite, c.P_num)
-end
-
-@testset "compute_schur_diag3d!" begin
-    GMG3D.compute_schur_diag3d!(c, f, h)
-    @test all(isfinite, c.s_P)
-    @test all(>(0), c.s_P)
-end
-
-@testset "dyrel3d_update_pressure! touches the interior only" begin
-    Pbefore = copy(f.P)
-    GMG3D.dyrel3d_update_pressure!(c, f; ω = 0.8)
-    expect = Pbefore[2:end-1, 2:end-1, 2:end-1] .+ 0.8 .* c.γ_eff .* c.R_P
-    @test f.P[2:end-1, 2:end-1, 2:end-1] ≈ expect atol = 1e-13
-    # ghost ring untouched
-    @test f.P[1, :, :] == Pbefore[1, :, :]
-    @test f.P[:, 1, :] == Pbefore[:, 1, :]
-    @test f.P[:, :, 1] == Pbefore[:, :, 1]
-end
-
-@testset "Grid3D + coarsen_grid3d" begin
-    g  = Grid3D(xcore.Parameters(T; N = 32, solver = :gmg))
-    gc = coarsen_grid3d(g)
-    @test (gc.Nz, gc.Nx, gc.Ny) == (g.Nz ÷ 2, g.Nx ÷ 2, g.Ny ÷ 2)
-    @test gc.h ≈ 2g.h
+    @testset "Grid3D, coarsening and the multigrid hierarchy" begin
+        par = Parameters(T; N = 64, L = 1.0, D = 1.0)
+        g  = Grid3D(par)
+        gc = coarsen_grid3d(g)
+        @test (gc.Nz, gc.Nx, gc.Ny) == (g.Nz ÷ 2, g.Nx ÷ 2, g.Ny ÷ 2)
+        @test gc.h ≈ 2g.h
+        fl = FluidState3D(T, CPU(), g)
+        hier = build_hierarchy(fl, g, par; minlvl = 16)
+        @test [S.cells(l.grid) for l in hier.levels] == [(64, 64, 64), (32, 32, 32), (16, 16, 16)]
+        @test hier.levels[1].fluid === fl
+        @test_throws ArgumentError build_hierarchy(FluidState3D(T, CPU(), 48, 48, 48),
+                                                   XC._grid3d_at(T, 48, 48, 48, 1 / 48, 1.0, 1.0), par)
+    end
 end

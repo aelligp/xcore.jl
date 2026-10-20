@@ -38,7 +38,7 @@ par = Parameters(Float64;
     Da    = 0.01,
     Xi    = 0.5,
 
-    solver= :vmg,           # :direct (sparse-LU) | :dyrel (pseudo-transient) | :gmg (geometric MG) | :vmg (velocity MG + Cahouet–Chabard) | :gmg_direct (assembled, AMG-FGMRES)
+    solver= :vmg,           # :direct (sparse-LU) | :dyrel (pseudo-transient) | :gmg (geometric MG) | :vmg (velocity MG + Cahouet–Chabard)
     atol = 1e-6,                # Picard convergence tolerance (nonlinear residual)
     # maxit_PH       = 100,                # outer Powell-Hestenes iterations
     # maxit_PT       = 50000,            # inner Dynamic-Relaxation iterations per PH step

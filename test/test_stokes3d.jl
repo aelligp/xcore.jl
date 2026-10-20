@@ -59,43 +59,74 @@ function _stokes3d_solve(kind, fluid, phase, grid, par, scales; kw...)
     return S3.fluidmech_vmg!(fluid, phase, hier, grid, par, scales; cc = true, kw...)
 end
 
-@testset "3-D residuals match the validated Schur kernels" begin
+@testset "3-D kernels reduce to 2-D and are symmetric under x ↔ y" begin
     Random.seed!(3)
-    T = Float64;  Nz, Nx, Ny = 8, 6, 4;  h = 0.37
-    par = Parameters(T; D = 1.0, N = 8, L = 1.0, g0 = 9.81)
-    grid = XC._grid3d_at(T, Nz, Nx, Ny, h, 1.0, 1.0)
+    T = Float64;  Nz, Nx, Ny = 8, 6, 4
+    par = Parameters(T; D = 1.0, N = Nz, L = Nx / Nz, g0 = 9.81)
+    g2 = Grid(par);  h = g2.h
+    g3 = XC._grid3d_at(T, Nz, Nx, Ny, h, 1.0, 1.0)
+    kw = (; a1 = 1.3, a2 = -0.4, a3 = 0.1, gamma = 0.7, dt = 0.05, top_cnv = -1, bot_cnv = 1)
+    rep(A, n) = repeat(A, 1, 1, n)
+    for xBC in (:periodic, :closed)
+        op2 = S3.StokesOp(T, Val(2), par; kw..., xBC, sds = 1)
+        op3 = S3.StokesOp(T, Val(3), par; kw..., xBC, yBC = :periodic, sds = 1)
+        # a y-uniform 3-D state with V = 0 is the 2-D state on every y-slice
+        f2 = FluidState(T, CPU(), Nz, Nx)
+        for A in (f2.W, f2.U, f2.P, f2.Drho, f2.MFS, f2.rhoWo, f2.rhoUo); A .= randn(T, size(A)); end
+        f2.eta .= exp.(randn(T, Nz, Nx));  f2.rho .= 1 .+ 0.3 .* rand(T, Nz, Nx)
+        S3.derived_coefficients!(f2, op2)
+        f3 = FluidState3D(T, CPU(), Nz, Nx, Ny)
+        f3.W .= rep(f2.W, Ny + 2);  f3.U .= rep(f2.U, Ny + 2);  f3.P .= rep(f2.P, Ny + 2)
+        for n in (:Drho, :MFS, :rhoWo, :eta, :rho); getfield(f3, n) .= rep(getfield(f2, n), Ny); end
+        f3.rhoUo .= rep(f2.rhoUo, Ny)
+        S3.derived_coefficients!(f3, op3)
+        c2 = S3.StokesCache(T, CPU(), g2);  c3 = S3.StokesCache(T, CPU(), g3)
+        c2.γ_eff .= 1 .+ rand(T, Nz, Nx);  c3.γ_eff .= rep(c2.γ_eff, Ny)
+        c2.η_b .= 1;  c3.η_b .= 1
+        S3.apply_velocity_bcs!(f2, g2, op2);  S3.apply_velocity_bcs!(f3, g3, op3)
+        S3.apply_pressure_bcs!(f2, op2);  S3.apply_pressure_bcs!(f3, op3)
+        @test all(f3.W[:, :, k] == f2.W && f3.U[:, :, k] == f2.U && f3.P[:, :, k] == f2.P for k in 1:Ny + 1)
+        S3.gershgorin!(c2, f2, g2, op2);  S3.gershgorin!(c3, f3, g3, op3)
+        S3.residual_continuity!(c2, f2, g2, f2.P, 0.3);  S3.residual_continuity!(c3, f3, g3, f3.P, 0.3)
+        # b − A·v: the Jacobi-preconditioned form divides by a diagonal that carries
+        # the y-shear terms in 3-D, so only the unpreconditioned residual is shared
+        S3.residual_momentum!(c2, f2, g2, op2; dr = false);  S3.residual_momentum!(c3, f3, g3, op3; dr = false)
+        for k in 1:Ny
+            @test c3.R_P[:, :, k] ≈ c2.R_P rtol = 1.0e-14
+            @test c3.Rv[1][:, :, k] ≈ c2.Rv[1] rtol = 1.0e-14
+            @test c3.Rv[2][:, :, k] ≈ c2.Rv[2] rtol = 1.0e-14
+        end
+        @test all(iszero, c3.Rv[3])
+        S3.momentum_advection!(c2, f2, g2, par, op2);  S3.momentum_advection!(c3, f3, g3, par, op3)
+        @test c3.advn[1][:, :, 2] ≈ c2.advn[1] rtol = 1.0e-14
+        @test c3.advn[2][:, :, 2] ≈ c2.advn[2] rtol = 1.0e-14
+    end
+    # x ↔ y: on a random periodic state the V-component is the U-component of
+    # the axis-swapped state
+    σ(A) = permutedims(A, (1, 3, 2))
     f = FluidState3D(T, CPU(), Nz, Nx, Ny)
-    for A in (f.W, f.U, f.V, f.P, f.Drho, f.MFS, f.rhoWo, f.rhoUo, f.rhoVo)
-        A .= randn(T, size(A))
+    for A in (f.W, f.U, f.V, f.P, f.Drho, f.MFS); A .= randn(T, size(A)); end
+    f.eta .= exp.(randn(T, size(f.eta)));  f.rho .= 1 .+ 0.3 .* rand(T, size(f.rho))
+    op = S3.StokesOp(T, Val(3), par; kw..., xBC = :periodic, yBC = :periodic)
+    S3.derived_coefficients!(f, op)
+    fs = FluidState3D(T, CPU(), Nz, Ny, Nx)
+    for (a, b) in ((:W, :W), (:U, :V), (:V, :U), (:P, :P), (:eta, :eta), (:rho, :rho), (:rhow, :rhow),
+                   (:rhou, :rhov), (:rhov, :rhou), (:etaxz, :etayz), (:etayz, :etaxz), (:etaxy, :etaxy),
+                   (:Drho, :Drho), (:MFS, :MFS))
+        getfield(fs, a) .= σ(getfield(f, b))
     end
-    for A in (f.eta, f.etaxz, f.etayz, f.etaxy); A .= exp.(randn(T, size(A))); end
-    for A in (f.rho, f.rhow, f.rhou, f.rhov); A .= 1 .+ 0.3 .* rand(T, size(A)); end
-    c = S3.StokesCache(T, CPU(), grid)
-    for d in 1:3
-        c.Dv[d] .= 1 .+ rand(T, size(c.Dv[d]));  c.bext[d] .= randn(T, size(c.bext[d]))
-        c.advn[d] .= randn(T, size(c.advn[d]))
+    g = XC._grid3d_at(T, Nz, Nx, Ny, h, 1.0, 1.0);  gs = XC._grid3d_at(T, Nz, Ny, Nx, h, 1.0, 1.0)
+    c = S3.StokesCache(T, CPU(), g);  cs = S3.StokesCache(T, CPU(), gs)
+    c.γ_eff .= 1 .+ rand(T, Nz, Nx, Ny);  cs.γ_eff .= σ(c.γ_eff)
+    c.η_b .= 1;  cs.η_b .= 1
+    for (cc, ff, gg) in ((c, f, g), (cs, fs, gs))
+        S3.gershgorin!(cc, ff, gg, op)
+        S3.residual_continuity!(cc, ff, gg, ff.P, Inf)
+        S3.residual_momentum!(cc, ff, gg, op; dr = true)
     end
-    c.advn[1][[1, Nz + 1], :, :] .= 0
-    c.γ_eff .= 1 .+ rand(T, Nz, Nx, Ny);  c.η_b .= 1 .+ rand(T, Nz, Nx, Ny)
-    kw = (; a1 = 1.3, a2 = -0.4, a3 = 0.1, gamma = 0.7, dt = 0.05)
-    op = S3.StokesOp(T, Val(3), par; kw..., top_cnv = 1, bot_cnv = -1)
-    ref = (; R_W = similar(c.Rv[1]), R_U = similar(c.Rv[2]), R_V = similar(c.Rv[3]),
-             R_P = similar(c.R_P), P_num = similar(c.R_P), D_W = c.Dv[1], D_U = c.Dv[2],
-             D_V = c.Dv[3], bext_W = c.bext[1], bext_U = c.bext[2], bext_V = c.bext[3],
-             bext_P = c.bext_P, advn_mz = c.advn[1][2:Nz, :, :], advn_mx = c.advn[2],
-             advn_my = c.advn[3], γ_eff = c.γ_eff, η_b = c.η_b)
-    P0 = randn(T, size(f.P))
-    rel(a, b) = maximum(abs, a .- b) / maximum(abs, b)
-    for dr in (false, true)
-        XC.GMG3D.dyrel3d_residual_P!(ref, f, h, P0, 0.3)
-        S3.residual_continuity!(c, f, grid, P0, 0.3)
-        @test rel(c.R_P, ref.R_P) < 1.0e-14
-        XC.GMG3D.dyrel3d_residual_V!(ref, f, h, par.g0; dr, kw...)
-        S3.residual_momentum!(c, f, grid, op; dr)
-        @test rel(c.Rv[1], ref.R_W) < 1.0e-14
-        @test rel(c.Rv[2], ref.R_U) < 1.0e-14
-        @test rel(c.Rv[3], ref.R_V) < 1.0e-14
-    end
+    @test σ(cs.Dv[2]) == c.Dv[3] && σ(cs.λmax[2]) == c.λmax[3]
+    @test σ(cs.Rv[2]) ≈ c.Rv[3] rtol = 1.0e-14
+    @test σ(cs.Rv[1]) ≈ c.Rv[1] rtol = 1.0e-14
 end
 
 @testset "3-D Gershgorin bounds the penalized operator under density contrast" begin
@@ -164,6 +195,19 @@ end
         @test r0.verr < 1.0e-5 && r1.verr < 1.0e-5
         @test isapprox(r0.perr, r1.perr; atol = 1.0e-9)
     end
+end
+
+@testset "3-D solver entry points infer concrete return types" begin
+    function inferred_solves(fluid, phase, grid, par, scales, kw)
+        cache = S3.StokesCache(Float64, CPU(), grid)
+        hier = @inferred S3.build_hierarchy(fluid, grid, par)
+        @inferred S3.fluidmech_dyrel!(fluid, phase, cache, grid, par, scales; kw...)
+        @inferred S3.fluidmech_gmg!(fluid, phase, hier, grid, par, scales; kw...)
+        @inferred S3.fluidmech_vmg!(fluid, phase, hier, grid, par, scales; cc = true, kw...)
+        return true
+    end
+    fluid, phase, grid, par, scales, _, kw = _stokes3d_mms(32, 0.0)
+    @test inferred_solves(fluid, phase, grid, par, scales, kw)
 end
 
 @testset "3-D inertia-dominated buoyant blob (vmg)" begin

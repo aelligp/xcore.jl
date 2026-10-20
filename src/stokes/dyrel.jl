@@ -35,6 +35,7 @@ function _anderson_pressure_update!(aa::AndersonPH{T}, P, f, m::Int) where {T}
     if length(aa.dX) != m
         aa.prev = [similar(f) for _ in 1:2]
         aa.dX = [similar(f) for _ in 1:m];  aa.dF = [similar(f) for _ in 1:m]
+        aa.G = zeros(T, m, m);  aa.b = zeros(T, m)
         _anderson_reset!(aa)
     end
     if aa.have_prev
@@ -46,14 +47,18 @@ function _anderson_pressure_update!(aa::AndersonPH{T}, P, f, m::Int) where {T}
     aa.prev[1] .= P;  aa.prev[2] .= f;  aa.have_prev = true
     P .+= f
     aa.n == 0 && return nothing
-    n = aa.n
-    G = [sum(_bc(*, aa.dF[i], aa.dF[j])) for i in 1:n, j in 1:n]
-    b = [sum(_bc(*, aa.dF[i], f)) for i in 1:n]
+    n = aa.n;  G = aa.G;  b = aa.b
+    for j in 1:n
+        for i in 1:j
+            G[i, j] = G[j, i] = sum(_bc(*, aa.dF[i], aa.dF[j]))
+        end
+        b[j] = sum(_bc(*, aa.dF[j], f))
+    end
     # The history columns turn nearly collinear as the iteration converges; the
     # pseudo-inverse drops the directions the residual differences cannot resolve.
-    θ = pinv(G; rtol = sqrt(eps(T))) * b
+    θ = pinv(@view(G[1:n, 1:n]); rtol = sqrt(eps(T))) * @view(b[1:n])
     for i in 1:n
-        P .-= T(θ[i]) .* (aa.dX[i] .+ aa.dF[i])
+        P .-= θ[i] .* (aa.dX[i] .+ aa.dF[i])
     end
     return nothing
 end
@@ -93,7 +98,7 @@ velocity (scheme `par.ADVN`), drunken-sailor stabilization, continuity
 The continuity residual carries no pressure term: the assembled constraint has
 an empty pressure block, so an artificial-compressibility term with a fixed
 reference would not vanish at the fixed point. `P0` (default: the entry
-pressure) only sets the level the pressure gauge keeps.
+pressure, copied into `cache.P0`) only sets the level the pressure gauge keeps.
 
 `converged`: the error reached `par.atol_PH`. With `rtol_PH > 0` the solve may
 stop once the error has dropped by `rtol_PH` relative to its entry value
@@ -122,7 +127,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
     op = StokesOp(T, Val(D), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
     h = grid.h
     _anderson_reset!(cache.anderson)
-    P0arr = P0 === nothing ? copy(fluid.P) : P0
+    P0arr = P0 === nothing ? copyto!(cache.P0, fluid.P) : P0
 
     @timeit_debug TO "setup" begin
     bnchm || _update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
@@ -173,8 +178,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
         # must be small too, not just R_P.
         normdP = pressure_update_norm(cache, fluid, h)
         end
-        err = max(maximum(ntuple(d -> min(normv[d] / err0[d], normv[d]), Val(D))),
-                  min(normP / errP0, normP), normdP)
+        err = max(maximum(min.(normv ./ err0, normv)), min(normP / errP0, normP), normdP)
         verbose && @printf("  [PH %02d] iter=%07d  err=%.3e  (v=%s P=%.2e dP=%.2e)\n",
                            itPH, total_iter, err, join((@sprintf("%.2e", x) for x in normv), "/"),
                            normP, normdP)

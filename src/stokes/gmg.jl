@@ -174,7 +174,7 @@ function vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::StokesOp{D};
     fscale   = fine ? one(T) : zero(T)
     mfs_mean = fine ? T(mfs_mean0) : zero(T)
     Ddom     = T(lvl.grid.D)
-    P0_lvl   = fine ? P0 : lvl.P0
+    P0_lvl   = fine ? P0 : lvl.cache.P0
     sm(n) = smooth!(lvl, par, op; nsweeps = n, ninner = hier.inner, fscale,
                     P0 = P0_lvl, mfs_mean, Ddom)
     if l == length(hier.levels)
@@ -186,8 +186,9 @@ function vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::StokesOp{D};
     @timeit_debug TO "L$l residual" level_residual!(lvl, op; P0 = P0_lvl, fscale)
     cl = hier.levels[l + 1]
     @timeit_debug TO "L$l restrict" begin
-    for d in 1:D
-        restrict_face!(cl.cache.bext[d], lvl.cache.Rv[d], d)
+    _each_axis(Val(D)) do comp
+        d = _val(comp)
+        restrict_face!(cl.cache.bext[d], lvl.cache.Rv[d], comp)
     end
     restrict_cell!(cl.cache.bext_P, lvl.cache.R_P)
     _zero_solution!(cl)
@@ -195,8 +196,9 @@ function vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::StokesOp{D};
     vcycle!(hier, l + 1, par, op; P0, mfs_mean0)
     @timeit_debug TO "L$l prolong + correct" begin
     v = velocity(lvl.fluid);  vc = velocity(cl.fluid)
-    for d in 1:D
-        prolong_face!(lvl.cache.Rv[d], _compact(vc[d], d), d, op)
+    _each_axis(Val(D)) do comp
+        d = _val(comp)
+        prolong_face!(lvl.cache.Rv[d], _compact(vc[d], d), comp, op)
     end
     eP = lvl.cache.R_P
     prolong_cell!(eP, _interior(cl.fluid.P), op.periodic)
@@ -226,9 +228,11 @@ end
 
 Coupled geometric-multigrid solve: MFS source and frozen momentum advection on
 the fine grid, coefficient coarsening and per-level autotune, then V-cycles
-until the fine residual (continuity without the pseudo-transient term) meets
-`par.atol_PH`, or — with `rtol_PH > 0` — drops by `rtol_PH` below its value
-after the first cycle (`relaxed`). `errs[k]` is the residual after cycle `k`.
+until the fine residual (continuity without the pseudo-transient term) and the
+cycle's pressure change (`pressure_change_norm`) meet `par.atol_PH`, or — with
+`rtol_PH > 0` — once the residual alone drops by `rtol_PH` below its value after
+the first cycle (`relaxed`). `errs[k]` is the larger of the residual and the
+pressure change after cycle `k`.
 Throws if neither is reached within `par.maxit_PH` cycles.
 """
 function fluidmech_gmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameters,
@@ -244,7 +248,7 @@ function fluidmech_gmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
     isfinite(dt) || throw(ArgumentError(
         "fluidmech_gmg!: dt must be finite (got $dt); the drunken-sailor term ∂ρ·g0·dt scales with dt"))
     op = StokesOp(T, _dims(grid), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
-    P0arr = P0 === nothing ? copy(fluid.P) : P0
+    P0arr = P0 === nothing ? copyto!(hier.levels[1].cache.P0, fluid.P) : P0
     lvl1 = hier.levels[1];  fcache = lvl1.cache
     @timeit_debug TO "setup" begin
     bnchm || _update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
@@ -259,6 +263,7 @@ function fluidmech_gmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
     errs = T[]
     for cyc in 1:par.maxit_PH
         ncyc = cyc
+        fcache.dP .= _interior(fluid.P)
         @timeit_debug TO "V-cycle" vcycle!(hier, 1, par, op; P0 = P0arr, mfs_mean0 = mfs_mean)
         @timeit_debug TO "gauge + convergence residual" begin
         bnchm || pressure_gauge!(fluid, P0arr, fcache.η_b)
@@ -267,17 +272,22 @@ function fluidmech_gmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
         # would otherwise absorb the mass imbalance the gate must bound
         level_residual!(lvl1, op; P0 = fluid.P, fscale = 1)
         nv, nP = residual_norms(fcache, fluid.rho)
+        fcache.dP .= _interior(fluid.P) .- fcache.dP
+        ndP = pressure_change_norm(fcache.dP, fluid, grid.h)
         end
-        err = max(nv..., nP)
+        # The residuals bound the pressure error only up to the conditioning of
+        # the Schur complement; the cycle's pressure change bounds it directly.
+        res = max(nv..., nP)
+        err = max(res, ndP)
         isfinite(err) || error("fluidmech_gmg! produced a non-finite residual at V-cycle $cyc")
         push!(errs, err)
-        cyc == 1 && (err0 = err + eps(T))
-        verbose && @printf("  [GMG V%02d] err=%.3e  (v=%s P=%.2e)\n", cyc, err,
-                           join((@sprintf("%.2e", x) for x in nv), "/"), nP)
+        cyc == 1 && (err0 = res + eps(T))
+        verbose && @printf("  [GMG V%02d] err=%.3e  (v=%s P=%.2e dP=%.2e)\n", cyc, err,
+                           join((@sprintf("%.2e", x) for x in nv), "/"), nP, ndP)
         if err < par.atol_PH
             converged = true;  break
         end
-        if cyc > 1 && err < rtol_PH * err0
+        if cyc > 1 && res < rtol_PH * err0
             relaxed = true;  break
         end
         # Pseudo-transient reference: P0 follows the latest iterate, so the term

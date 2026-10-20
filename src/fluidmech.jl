@@ -150,7 +150,6 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
                     dt::Real = T(1e32),
                     a1::Real = T(1), a2::Real = T(1), a3::Real = T(0),
                     b1::Real = T(1), b2::Real = T(0), b3::Real = T(0),
-                    mg = nothing,
                     verbose = false) where {T<:AbstractFloat}
     bnchm = bnchm_data !== nothing
     Nz = grid.Nz;  Nx = grid.Nx;  h = grid.h
@@ -660,36 +659,20 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     # \ needs a dense RHS, so collect.
     FF::Vector{T} = @timeit_debug TO "scale" collect(scl .* (LL * SOL .- Vector(RR)))
 
-    if mg !== nothing
-        # `mg` (a DirectMGSolver) replaces the LU solve by AMG-preconditioned
-        # FGMRES; it needs the inertial part of the momentum diagonal, scaled
-        # like LLs.
-        iiW    = vec(MapW[2:end-1, 2:end-1])
-        iiU    = periodic ? vec(MapU[2:end-1, :]) : vec(MapU[2:end-1, 2:end-1])
-        rhou_i = periodic ? rhou : rhou[:, 2:end-1]
-        minert = zeros(T, NW + NU)
-        minert[iiW] .= T(a1) .* vec(rhow[2:end-1, :]) ./ T(dt)
-        minert[iiU] .= (T(a1) + (periodic ? T(gamma) : zero(T))) .* vec(rhou_i) ./ T(dt)
-        minert .*= view(scl, 1:(NW + NU)) .^ 2
-        UPD_perm, mg.stats = @timeit_debug TO "solve" direct_mg_solve(
-            LLs, FF, NW + NU, minert, [iiW, iiU], vec(MapP[2:end-1, 2:end-1]);
-            rtol = mg.rtol, itmax = mg.itmax)
+    # UMFPACK numeric-refactor reuse: keep one UmfpackLU instance, refactor
+    # in-place via `lu!(F, LLs)` on subsequent calls (symbolic stays valid
+    # because LLs has the same sparsity each call).
+    @timeit_debug TO "factor" if cache.lu_F === nothing
+        cache.lu_F = lu(LLs)
     else
-        # UMFPACK numeric-refactor reuse: keep one UmfpackLU instance, refactor
-        # in-place via `lu!(F, LLs)` on subsequent calls (symbolic stays valid
-        # because LLs has the same sparsity each call).
-        @timeit_debug TO "factor" if cache.lu_F === nothing
+        try
+            lu!(cache.lu_F, LLs)
+        catch err
+            err isa SparseArrays.UMFPACK.UMFPACKException || rethrow()
             cache.lu_F = lu(LLs)
-        else
-            try
-                lu!(cache.lu_F, LLs)
-            catch err
-                err isa SparseArrays.UMFPACK.UMFPACKException || rethrow()
-                cache.lu_F = lu(LLs)
-            end
         end
-        UPD_perm = @timeit_debug TO "solve" cache.lu_F \ FF
     end
+    UPD_perm = @timeit_debug TO "solve" cache.lu_F \ FF
     UPD      = scl .* UPD_perm
 
     # decode update (matching MATLAB sign convention)

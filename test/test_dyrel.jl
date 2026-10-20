@@ -1,9 +1,15 @@
 using Statistics
 using LinearAlgebra: norm
 using xcore: Parameters, Grid, compute_scales, FluidState, PhaseState,
-             DyrelCache, fluidmech_dyrel!, fluidmech!
+             DyrelCache, fluidmech_dyrel!, fluidmech_gmg!, fluidmech_vmg!,
+             build_hierarchy, fluidmech!
 import xcore as XC
+using xcore.Stokes: StokesOp, residual_continuity!, residual_momentum!, residual_norms,
+                    apply_velocity_bcs!, penalty!, level_residual!, check_preconditioner
 using KernelAbstractions: CPU
+
+# momentum and continuity residual norms as one flat tuple
+_flat_norms(cache, rho) = ((nv, nP) = residual_norms(cache, rho); (nv..., nP))
 
 # Phase-1 DYREL validation: steady incompressible variable-viscosity Stokes.
 # We don't have MMS source terms wired into the DR residual yet, so these
@@ -115,7 +121,7 @@ end
     @test res.PH_iters ≤ par.maxit_PH
 
     # divergence-free check: recompute continuity residual (= -∇·v here)
-    XC.dyrel_residual_P!(dyrel, fluid, grid, par, fluid.P, Inf)
+    residual_continuity!(dyrel, fluid, grid, fluid.P, Inf)
     rms_div = sqrt(mean(abs2, dyrel.R_P))
     @test rms_div < 1.0e-4
 
@@ -132,7 +138,7 @@ end
                            dt = 1.0e30, top_cnv = -1, bot_cnv = -1, verbose = false)
 
     @test res.converged
-    XC.dyrel_residual_P!(dyrel, fluid, grid, par, fluid.P, Inf)
+    residual_continuity!(dyrel, fluid, grid, fluid.P, Inf)
     @test sqrt(mean(abs2, dyrel.R_P)) < 1.0e-3
     @test all(isfinite, fluid.W) && all(isfinite, fluid.U)
 end
@@ -156,19 +162,19 @@ end
         ψ = [1.0e-4 * sinpi((j - 1) * h) * sinpi(2 * (i - 1) * h) for j in 1:Nz+1, i in 1:Nx+1]
         fluid.W[:, 2:end-1] .= diff(ψ; dims = 2) ./ h
         fluid.U[2:end-1, :] .= .-diff(ψ; dims = 1) ./ h
-        XC.dyrel_apply_velocity_bcs!(fluid; top_cnv = -1, bot_cnv = -1, open_cnv = false,
-                                     xBC = :periodic, sds = -1, h, mfs_mean = 0.0, Ddom = 1.0)
         kw = (; a1 = 1, a2 = 1, a3 = 0, gamma = 0, dt)
-        XC.dyrel_residual_V!(dyrel, phase, fluid, grid, par; dr = false, kw...)
-        fluid.rhoWo .= .-dyrel.R_W .* dt
-        fluid.rhoUo .= .-dyrel.R_U .* dt
+        op = StokesOp(T, Val(2), par; kw..., top_cnv = -1, bot_cnv = -1)
+        apply_velocity_bcs!(fluid, grid, op)
+        residual_momentum!(dyrel, fluid, grid, op; dr = false)
+        fluid.rhoWo .= .-dyrel.Rv[1] .* dt
+        fluid.rhoUo .= .-dyrel.Rv[2] .* dt
         Wex, Uex = copy(fluid.W), copy(fluid.U)
         fill!(fluid.W, 0); fill!(fluid.U, 0)
         res = fluidmech_dyrel!(fluid, phase, dyrel, grid, par, scales; top_cnv = -1,
                                bot_cnv = -1, kw...)
-        XC.dyrel_residual_V!(dyrel, phase, fluid, grid, par; dr = false, kw...)
-        XC.dyrel_residual_P!(dyrel, fluid, grid, par, fluid.P, Inf)
-        return (; res, norms = XC.dyrel_residual_norms(dyrel, fluid.rho), par,
+        residual_momentum!(dyrel, fluid, grid, op; dr = false)
+        residual_continuity!(dyrel, fluid, grid, fluid.P, Inf)
+        return (; res, norms = _flat_norms(dyrel, fluid.rho), par,
                 verr = max(maximum(abs, fluid.W .- Wex), maximum(abs, fluid.U .- Uex)),
                 perr = maximum(abs, fluid.P[2:end-1, 2:end-1] .- c), Wamp = maximum(abs, Wex))
     end
@@ -186,6 +192,45 @@ end
     end
 end
 
+@testset "multigrid pressure meets atol_PH independent of resolution" begin
+    # Inertia-dominated solve: the residuals bound the pressure error only up to
+    # the conditioning of the inertial Schur complement, which grows with N, so
+    # the gate must also bound the applied pressure change.
+    rel(a, b) = (a = a[2:end-1, 2:end-1] .- mean(a[2:end-1, 2:end-1]);
+                 b = b[2:end-1, 2:end-1] .- mean(b[2:end-1, 2:end-1]); norm(a .- b) / norm(b))
+    for N in (64, 128)
+        P = map((:direct, :vmg, :gmg)) do solver
+            fluid, phase, dyrel, grid, par, scales = _dyrel_setup(Float64; Npts = N, maxit_PH = 300)
+            fluid.rhoo .= fluid.rho;  fluid.rhooo .= fluid.rho     # zero BD2 mass source
+            kw = (; dt = 1.0e-2, a1 = 1, a2 = 1, a3 = 0, top_cnv = -1, bot_cnv = -1)
+            if solver === :direct
+                fluidmech!(fluid, grid, par; phase, sds = -1, xBC = :periodic, zBC = :closed, kw...)
+            else
+                hier = build_hierarchy(fluid, grid, par)
+                r = solver === :gmg ? fluidmech_gmg!(fluid, phase, hier, grid, par, scales; kw...) :
+                    fluidmech_vmg!(fluid, phase, hier, grid, par, scales; γfact = 5, cc = true, kw...)
+                @test r.converged
+            end
+            (fluid.P, par.atol_PH)
+        end
+        (Pd, atol), (Pv, _), (Pg, _) = P
+        @test rel(Pv, Pd) < 2 * atol
+        @test rel(Pg, Pd) < 2 * atol
+    end
+end
+
+@testset "solver entry points infer concrete return types" begin
+    function inferred_solves(fluid, phase, dyrel, grid, par, scales)
+        kw = (; dt = 1.0, a1 = 1.0, a2 = 0, a3 = 0, top_cnv = -1, bot_cnv = -1)
+        hier = @inferred build_hierarchy(fluid, grid, par)
+        @inferred fluidmech_dyrel!(fluid, phase, dyrel, grid, par, scales; kw...)
+        @inferred fluidmech_gmg!(fluid, phase, hier, grid, par, scales; kw...)
+        @inferred fluidmech_vmg!(fluid, phase, hier, grid, par, scales; γfact = 5, cc = true, kw...)
+        return true
+    end
+    @test inferred_solves(_dyrel_setup(Float64; Npts = 32, maxit_PH = 200)...)
+end
+
 @testset "Gershgorin bound covers the penalized operator under density contrast" begin
     # λmax·D must be at least the absolute row sum of the penalized velocity
     # operator, assembled column by column from the dr = true residual. The
@@ -201,15 +246,14 @@ end
         fluid.rho .= [1 + 0.3 * sinpi(2 * (i + 0.3) / Nx) * sinpi(3 * (j + 0.2) / Nz) for j in 1:Nz, i in 1:Nx]
         XC.update_interpolations!(phase, fluid, grid, par; xBC)
         dyrel = DyrelCache(T, CPU(), grid)
-        kw = (; a1 = 1, a2 = 0, a3 = 0, gamma = par.gamma, dt = 1.0e3)
-        XC.compute_AL_penalty!(dyrel, fluid, h; γfact = 1.0e3, a1 = kw.a1, gamma = kw.gamma,
-                               dt = kw.dt, g0 = par.g0, xBC)
+        op = StokesOp(T, Val(2), par; a1 = 1, a2 = 0, a3 = 0, gamma = par.gamma, dt = 1.0e3,
+                      xBC, sds, top_cnv = -1, bot_cnv = -1)
+        penalty!(dyrel, fluid, grid, op; γfact = 1.0e3)
         function applied()
-            XC.dyrel_apply_velocity_bcs!(fluid; top_cnv = -1, bot_cnv = -1, xBC, sds, h,
-                                         mfs_mean = 0.0, Ddom = 1.0)
-            XC.dyrel_residual_P!(dyrel, fluid, grid, par, fluid.P, Inf)
-            XC.dyrel_residual_V!(dyrel, phase, fluid, grid, par; dr = true, xBC, kw...)
-            return vcat(vec(dyrel.R_W .* dyrel.D_W), vec(dyrel.R_U .* dyrel.D_U))
+            apply_velocity_bcs!(fluid, grid, op)
+            residual_continuity!(dyrel, fluid, grid, fluid.P, Inf)
+            residual_momentum!(dyrel, fluid, grid, op; dr = true)
+            return vcat(vec(dyrel.Rv[1] .* dyrel.Dv[1]), vec(dyrel.Rv[2] .* dyrel.Dv[2]))
         end
         ucols = xBC === :periodic ? (1:Nx) : (2:Nx)
         cols = vcat([CartesianIndex(iz, ix + 1) => fluid.W for iz in 2:Nz for ix in 1:Nx],
@@ -220,8 +264,8 @@ end
         for (I, A) in cols
             A[I] = 1;  rowsum .+= abs.(applied() .- r0);  A[I] = 0
         end
-        bound = vcat(vec(dyrel.λmax_W .* dyrel.D_W), vec(dyrel.λmax_U .* dyrel.D_U))
-        LW, LU = LinearIndices(dyrel.R_W), LinearIndices(dyrel.R_U)
+        bound = vcat(vec(dyrel.λmax[1] .* dyrel.Dv[1]), vec(dyrel.λmax[2] .* dyrel.Dv[2]))
+        LW, LU = LinearIndices(dyrel.Rv[1]), LinearIndices(dyrel.Rv[2])
         rows = vcat([LW[iz, ix] for iz in 2:Nz for ix in 1:Nx],
                     [length(LW) + LU[iz, ix] for iz in 1:Nz for ix in ucols])
         @test maximum(rowsum[rows] ./ bound[rows]) ≤ 1 + 1.0e-12
@@ -254,11 +298,10 @@ end
             r = fluidmech_dyrel!(fluid, phase, dyrel, grid, par, scales; kw(dt)...)
             return (; fluid, r.converged)
         end
-        hier = XC.GMG.build_hierarchy(fluid, phase, grid, par)
+        hier = build_hierarchy(fluid, grid, par)
         r = solver === :gmg ?
-            XC.GMG.fluidmech_gmg!(fluid, phase, hier, grid, par, scales; kw(dt)...) :
-            XC.GMG.fluidmech_dyrel_vmg!(fluid, phase, hier, grid, par, scales;
-                                        γfact = 5, cc = true, kw(dt)...)
+            fluidmech_gmg!(fluid, phase, hier, grid, par, scales; kw(dt)...) :
+            fluidmech_vmg!(fluid, phase, hier, grid, par, scales; γfact = 5, cc = true, kw(dt)...)
         return (; fluid, r.converged)
     end
     for (ratio, dt, solvers) in ((10.0, 1.0, (:dyrel, :gmg, :vmg)), (100.0, 1.0e-3, (:dyrel, :vmg)))
@@ -357,20 +400,35 @@ end
 
 @testset "VMG periodic transient Navier-Stokes trajectory" begin
     # Velocity V-cycles + Cahouet–Chabard inside the production Picard workflow.
-    # Its velocities agree with :direct to ~1e-5, and dt (CFL) and the advected
-    # phase inherit that at ~1e-8, so those checks sit at 1e-7.
     rel(a, b) = norm(a .- b) / (norm(b) + eps(eltype(b)))
+    relp(a, b) = _relative_pressure(a.fluid.P[2:end-1, 2:end-1], b.fluid.P[2:end-1, 2:end-1])
     direct = _periodic_ns_trajectory(:direct; N = 64)
-    vmg = _periodic_ns_trajectory(:vmg; N = 64, forcing_PH = 0.1)
-    @test isapprox(vmg.time, direct.time; rtol = 1.0e-7)
-    @test isapprox(vmg.dt, direct.dt; rtol = 1.0e-7)
-    @test rel(vmg.fluid.W, direct.fluid.W) < vmg.par.rtol
-    @test rel(vmg.fluid.U, direct.fluid.U) < vmg.par.rtol
-    @test _relative_pressure(vmg.fluid.P[2:end-1, 2:end-1],
-                            direct.fluid.P[2:end-1, 2:end-1]) < vmg.par.rtol
-    @test rel(vmg.fluid.rho, direct.fluid.rho) < 1.0e-8
-    @test rel(vmg.phase.x, direct.phase.x) < 1.0e-7
-    @test rel(vmg.fluid.eta, direct.fluid.eta) < 1.0e-8
+
+    # Every solve to atol_PH: VMG follows the direct Picard path, so velocity,
+    # pressure and everything advected with them agree to the solve tolerance.
+    exact = _periodic_ns_trajectory(:vmg; N = 64, forcing_PH = 0)
+    atol = exact.par.atol_PH
+    @test isapprox(exact.time, direct.time; rtol = 1.0e-8)
+    @test isapprox(exact.dt, direct.dt; rtol = 1.0e-8)
+    @test rel(exact.fluid.W, direct.fluid.W) < atol
+    @test rel(exact.fluid.U, direct.fluid.U) < atol
+    @test relp(exact, direct) < atol
+    @test rel(exact.fluid.rho, direct.fluid.rho) < 1.0e-8
+    @test rel(exact.phase.x, direct.phase.x) < 1.0e-8
+    @test rel(exact.fluid.eta, direct.fluid.eta) < 1.0e-8
+
+    # Inexact-solve forcing (the production default) takes a different Picard
+    # path and so agrees with the direct result to the Picard tolerance.
+    forced = _periodic_ns_trajectory(:vmg; N = 64, forcing_PH = 0.1)
+    rtol = forced.par.rtol
+    @test isapprox(forced.time, direct.time; rtol)
+    @test isapprox(forced.dt, direct.dt; rtol)
+    @test rel(forced.fluid.W, direct.fluid.W) < rtol
+    @test rel(forced.fluid.U, direct.fluid.U) < rtol
+    @test relp(forced, direct) < rtol
+    @test rel(forced.fluid.rho, direct.fluid.rho) < rtol
+    @test rel(forced.phase.x, direct.phase.x) < rtol
+    @test rel(forced.fluid.eta, direct.fluid.eta) < rtol
 end
 
 @testset "matrix-free solvers fail explicitly" begin
@@ -380,7 +438,7 @@ end
         dt = 1.0e6, top_cnv = -1, bot_cnv = -1,
         require_convergence = true)
 
-    @test_throws DomainError XC._check_dyrel_preconditioner(DyrelCache(Float64, CPU(), grid))
+    @test_throws DomainError check_preconditioner(DyrelCache(Float64, CPU(), grid))
 end
 
 @testset "direct cache rebuilds across side-boundary modes" begin
@@ -410,13 +468,14 @@ end
         fill!(fluid.MFS, 0)
         fluid.Drho .= [exp(-(((i - 0.5) * grid.h - 0.5)^2 + ((j - 1) * grid.h - 0.5)^2) / 0.01)
                        for j in 1:grid.Nz+1, i in 1:grid.Nx]
-        hier = XC.GMG.build_hierarchy(fluid, phase, grid, par)
+        hier = build_hierarchy(fluid, grid, par)
         kw = (; a1 = 1, a2 = 0, a3 = 0, gamma = 0, dt)
-        res = XC.GMG.fluidmech_gmg!(fluid, phase, hier, grid, par, scales;
-                                    top_cnv = -1, bot_cnv = -1, kw...)
-        XC.GMG.level_residual!(hier.levels[1], par; P0 = fluid.P, fscale = 1, kw...)
+        res = fluidmech_gmg!(fluid, phase, hier, grid, par, scales;
+                             top_cnv = -1, bot_cnv = -1, kw...)
+        level_residual!(hier.levels[1], StokesOp(T, Val(2), par; kw..., top_cnv = -1, bot_cnv = -1);
+                        P0 = fluid.P, fscale = 1)
         return (; res, nlev = length(hier.levels), par,
-                norms = XC.dyrel_residual_norms(hier.levels[1].cache, fluid.rho))
+                norms = _flat_norms(hier.levels[1].cache, fluid.rho))
     end
     single = blob_gmg(1.0; mg_minlvl = 32, mg_ncoarse = 100)
     @test single.nlev == 1
@@ -437,7 +496,7 @@ end
     # remove; a defective transfer still limps to the tolerance on a smooth
     # problem but shows up here as a contraction factor near 1. Npts = 64 meets
     # the GMG 32-multiple requirement, and no-slip (cnv = +1) exercises the
-    # signed z-ghost reflection in `prolong_u!`.
+    # signed z-ghost reflection in the face prolongation.
     ηc = 1.0e3
     fluid, phase, _, grid, par, scales =
         _dyrel_setup(Float64; Npts = 64, γfact = 50.0)
@@ -449,9 +508,9 @@ end
     end
     XC.compute_corner_eta!(fluid.etaco, fluid.eta; xBC = :periodic, zBC = :closed)
 
-    hier = XC.GMG.build_hierarchy(fluid, phase, grid, par)
-    res = XC.GMG.fluidmech_gmg!(fluid, phase, hier, grid, par, scales;
-                                dt = 1.0e6, top_cnv = 1, bot_cnv = 1)
+    hier = build_hierarchy(fluid, grid, par)
+    res = fluidmech_gmg!(fluid, phase, hier, grid, par, scales;
+                         dt = 1.0e6, top_cnv = 1, bot_cnv = 1)
 
     @test res.converged
     @test all(isfinite, fluid.W) && all(isfinite, fluid.U) && all(isfinite, fluid.P)
@@ -462,7 +521,7 @@ end
     @info "GMG contraction under η contrast" ρ res.ncyc
     @test ρ < 0.65
 
-    XC.dyrel_residual_P!(hier.levels[1].cache, fluid, grid, par, fluid.P, Inf)
+    residual_continuity!(hier.levels[1].cache, fluid, grid, fluid.P, Inf)
     @test sqrt(mean(abs2, hier.levels[1].cache.R_P)) < 1.0e-3
 end
 
@@ -512,10 +571,10 @@ end
     # --- GMG V-cycle (same iterate-to-convergence target) ---
     fluid_g = FluidState(T, CPU(), Nz, Nx);  phase_g = PhaseState(T, CPU(), Nz, Nx)
     _setup!(fluid_g)
-    hier = XC.GMG.build_hierarchy(fluid_g, phase_g, grid, par)
+    hier = build_hierarchy(fluid_g, grid, par)
     @test length(hier.levels) > 1                     # actually a hierarchy
-    res_g = XC.GMG.fluidmech_gmg!(fluid_g, phase_g, hier, grid, par, scales; dt = dt,
-                                  a1 = 1, a2 = 1, a3 = 0, top_cnv = -1, bot_cnv = -1)
+    res_g = fluidmech_gmg!(fluid_g, phase_g, hier, grid, par, scales; dt = dt,
+                           a1 = 1, a2 = 1, a3 = 0, top_cnv = -1, bot_cnv = -1)
     @test res_g.converged
 
     Wd = @view fluid_d.W[:, 2:end-1];  Ud = @view fluid_d.U[2:end-1, :]

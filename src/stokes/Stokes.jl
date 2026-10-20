@@ -12,9 +12,9 @@
 module Stokes
 
 using KernelAbstractions
-using LinearAlgebra: pinv
 using Printf
 using TimerOutputs: @timeit_debug
+using LinearAlgebra: pinv
 
 using ..xcore: TO, Grid, Grid3D, Parameters, Scales, FluidState, FluidState3D,
                xcore_zeros, coarsen_grid3d,

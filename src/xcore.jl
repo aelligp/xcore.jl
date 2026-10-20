@@ -17,10 +17,10 @@ using TimerOutputs
 #
 const TO = TimerOutput()
 
-"""Enable `@timeit_debug` regions in xcore and its GMG submodule (all solver phases)."""
-enable_solver_timings()  = (foreach(TimerOutputs.enable_debug_timings, (@__MODULE__, GMG, Stokes)); nothing)
+"""Enable `@timeit_debug` regions in xcore and its Stokes submodule (all solver phases)."""
+enable_solver_timings()  = (foreach(TimerOutputs.enable_debug_timings, (@__MODULE__, Stokes)); nothing)
 """Disable `@timeit_debug` regions, restoring zero-overhead production behaviour."""
-disable_solver_timings() = (foreach(TimerOutputs.disable_debug_timings, (@__MODULE__, GMG, Stokes)); nothing)
+disable_solver_timings() = (foreach(TimerOutputs.disable_debug_timings, (@__MODULE__, Stokes)); nothing)
 
 include("parameters.jl")
 include("grid.jl")
@@ -32,26 +32,10 @@ include("kernels/ghosts.jl")
 include("kernels/diffus.jl")
 include("kernels/advect.jl")
 include("state.jl")
-# --- 3-D state scaffolding (Phase 1 of the 3-D GMG port; see memory plan
-# `project_3d_implementation`). Parent-scope structs the GMG3D submodule imports.
+# 3-D grid and state, solved by the dimension-generic Stokes module below
 include("dyrel3D/grid3d.jl")
 include("dyrel3D/state3d.jl")
-include("dyrel3D/cache3d.jl")
 include("fluidmech.jl")
-include("direct_mg.jl")
-# DYREL pseudo-transient Stokes solver (standalone — its cache is NOT a field
-# of FluidState; construct a `DyrelCache` and pass it to `fluidmech_dyrel!`,
-# mirroring JustRelax's `DYREL` + `solve_DYREL!` separation).
-include("dyrel/cache.jl")
-include("dyrel/init.jl")
-include("dyrel/gershgorin.jl")
-include("dyrel/stress.jl")
-include("dyrel/advection.jl")
-include("dyrel/residuals.jl")
-include("dyrel/velocity.jl")
-include("dyrel/bcs.jl")
-include("dyrel/reductions.jl")
-include("dyrel/solve.jl")
 include("update.jl")
 include("timing.jl")
 include("noise.jl")
@@ -62,17 +46,13 @@ include("diagnose.jl")
 include("output.jl")
 include("restart.jl")
 include("run.jl")
-# Geometric-multigrid Stokes solver: a V-cycle layered on the single-grid dyrel/
-# kernels above, which it imports rather than duplicates. Included after them so
-# every name `module GMG` pulls from `..xcore` is already defined.
-include("dyrel_GMG/GMG.jl")
-# 3-D geometric-multigrid solver (Phase 1: operator-core submodule). Included
-# after the 3-D structs above so `module GMG3D` can import them from `..xcore`.
-include("dyrel3D/GMG3D.jl")
-# Dimension-generic matrix-free solvers (D = 2 and D = 3 from one implementation).
+# Matrix-free Stokes/Navier–Stokes solvers (:dyrel, :gmg, :vmg), one
+# implementation for D = 2 and D = 3. Included after update.jl/phsevo.jl, whose
+# kernels it imports.
 include("stokes/Stokes.jl")
-# Solver-strategy dispatch (needs both the single-grid solvers above and the GMG
-# submodule); `run!` uses `make_solver`/`solve_fluidmech!` from here.
+using .Stokes: StokesCache, DyrelCache, fluidmech_dyrel!, fluidmech_gmg!, fluidmech_vmg!,
+               build_hierarchy
+# Solver-strategy dispatch; `run!` uses `make_solver`/`solve_fluidmech!` from here.
 include("solver.jl")
 include("plotting.jl")
 
@@ -96,8 +76,8 @@ export plot_fluid, plot_phase, plot_diffuse, plot_dimensionless, plot_profiles,
        plot_history, save_output
 export plot_state, plot_mms_comparison
 export save_checkpoint, load_checkpoint!, restart_path, resolve_restart
-export DyrelCache, fluidmech_dyrel!
-export Grid3D, FluidState3D, PhaseState3D, DyrelCache3D, coarsen_grid3d
+export StokesCache, DyrelCache, fluidmech_dyrel!, fluidmech_gmg!, fluidmech_vmg!, build_hierarchy
+export Grid3D, FluidState3D, PhaseState3D, coarsen_grid3d
 export TO, enable_solver_timings, disable_solver_timings
 
 function _print_banner(io::IO)

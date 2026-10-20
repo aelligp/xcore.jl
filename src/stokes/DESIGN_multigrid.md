@@ -146,7 +146,7 @@ correctness risk (get the face-density restriction + `h_c` scaling right).
 
 ## 7. Smoother (`relax`) in correction form
 
-Reuse the inner-DR body from `solve.jl` (snapshot residuals → stress → continuity
+Reuse the inner-DR body from `dyrel.jl` (snapshot residuals → stress → continuity
 residual → Schur penalty `P_num=γ_eff·R_P` → preconditioned DR momentum residual
 with `bext` injected → damped velocity update → BCs → periodic Gershgorin/Rayleigh
 retune), but:
@@ -195,7 +195,7 @@ recompute α,β from per-level Gershgorin, which is cleaner).
 struct MGLevel{T,A}
     grid::Grid{T}                 # coarse grid (Nz_c,Nx_c,h_c)
     η::A; etaco::A; ρ::A; rhow::A; rhou::A      # restricted coefficients
-    cache::DyrelCache{T,A}        # per-level D_W/D_U/γ_eff/dτ/α/β/residual scratch
+    cache::StokesCache{T,A}        # per-level D_W/D_U/γ_eff/dτ/α/β/residual scratch
     W::A; U::A; P::A              # level solution (W (Nz_c+1,Nx_c+2) etc.)
     bext_W::A; bext_U::A; bext_P::A             # injected RHS (restricted residual)
 end
@@ -219,8 +219,8 @@ New `Parameters`: `mg::Bool=false` (opt-in), `mg_minlvl::Int`, `mg_npre::Int=2`,
 - **Periodic-x velocity** also carries a constant mode ⇒ mean-remove `e_W`,`e_U`
   when x is periodic (MATLAB guards this with `any(strcmp(BC,'periodic'))`).
 - Coarse-level BCs are **homogeneous** (error equation): `W=0` top/bot (no drain),
-  periodic-x ghosts, U reflection — reuse `dyrel_apply_velocity_bcs!` with
-  `mfs_mean=0`, and `dyrel_apply_pressure_bcs!`.
+  periodic-x ghosts, U reflection — reuse `apply_velocity_bcs!` with
+  `mfs_mean=0`, and `apply_pressure_bcs!`.
 
 ---
 
@@ -259,18 +259,18 @@ New `Parameters`: `mg::Bool=false` (opt-in), `mg_minlvl::Int`, `mg_npre::Int=2`,
 
 ---
 
-## 13. File layout (`src/dyrel/multigrid/`)
+## 13. File layout (`src/stokes/multigrid/`)
 
 ```
 multigrid/
 ├── DESIGN_multigrid.md   ← this file
 ├── transfer.jl           ← restrict_{p,w,u}! + prolong_{p,w,u}! KA kernels
 ├── hierarchy.jl          ← MGLevel/MGHierarchy structs + build/refresh + coefficient coarsening
-├── smoother.jl           ← smooth!(v,b,lvl;…) (refactored inner-DR, external-RHS, homogeneous flag)
-├── vcycle.jl             ← vcycle!(...) recursion + outer driver to atol_PH
-└── (residuals.jl gains optional bext_{W,U,P} args; solve.jl dispatches par.mg)
+├── gmg.jl           ← smooth!(v,b,lvl;…) (refactored inner-DR, external-RHS, homogeneous flag)
+├── gmg.jl             ← vcycle!(...) recursion + outer driver to atol_PH
+└── (residuals.jl gains optional bext_{W,U,P} args; dyrel.jl dispatches par.mg)
 ```
 
-Touches: `residuals.jl` (external-RHS injection), `solve.jl` (dispatch on
+Touches: `residuals.jl` (external-RHS injection), `dyrel.jl` (dispatch on
 `par.mg`), `parameters.jl` (mg knobs), `xcore.jl` (includes). Keeps the existing
 single-grid DR path intact (`par.mg=false`).

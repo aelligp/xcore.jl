@@ -1,7 +1,6 @@
-# 3-D fluid + phase state — the dimension lift of `src/state.jl`. Field NAMES are
-# kept identical to the 2-D structs (and to the `f.`/`c.` accesses in
-# `src/dyrel3D/schur.jl`) so the residual/Schur kernel wrappers operate on these
-# real structs unchanged. Array shapes follow the schur.jl header table:
+# 3-D fluid + phase state, the counterpart of `src/state.jl`. Field names match
+# the 2-D structs; the Stokes solvers reach the per-axis fields through the
+# accessors in `src/stokes/layout.jl`. Array shapes:
 #
 #   field   | shape                  | location
 #   --------|------------------------|--------------------
@@ -18,13 +17,13 @@
 #   rhov    | (Nz, Nx, Ny+1)         | y-faces
 #   Drho    | (Nz+1, Nx, Ny)         | z-faces (buoyancy anomaly)
 #
-# No sparse-LU solver cache (there is no `:direct` 3-D path — GMG only). The
-# DYREL scratch lives on a separate `DyrelCache3D` (see cache3d.jl), as in 2-D.
+# No sparse-LU solver cache: 3-D is solved only by the matrix-free solvers,
+# whose scratch lives in a separate `StokesCache`.
 
 """
     FluidState3D{T,A}
 
-Fields touched by the 3-D Navier-Stokes / GMG solver. `A<:AbstractArray{T,3}`
+Fields touched by the 3-D Navier-Stokes solvers. `A<:AbstractArray{T,3}`
 so GPU backends drop in unchanged. Shapes per the header table above.
 """
 struct FluidState3D{T<:AbstractFloat, A<:AbstractArray{T,3}}
@@ -80,11 +79,8 @@ FluidState3D(::Type{T}, backend, grid::Grid3D) where {T<:AbstractFloat} =
 """
     PhaseState3D{T,A}
 
-Constitutive workspace consumed/produced by the 3-D `update!` path. Phase-1
-scaffold: carries only the fields the GMG driver currently reads (`advn_rho`,
-the density-advection rate that feeds the MFS source). It will grow field-for-
-field as the 3-D `update!`/`phsevo!` path is ported (Phase 4) — mirror
-`PhaseState` in `src/state.jl` for the full set.
+Constitutive workspace of the 3-D solve: only `advn_rho`, the density-advection
+rate that feeds the MFS source. There is no 3-D `update!`/`phsevo!`.
 """
 struct PhaseState3D{T<:AbstractFloat, A<:AbstractArray{T,3}}
     advn_rho::A
