@@ -64,6 +64,21 @@ struct NoiseState{T<:AbstractFloat, A<:AbstractMatrix{T},
     xisw::A;   xisu::A
     xie::A;    xix::A;    xis::A
     rng::R
+    # per-step scratch (Nz,Nx): OU decorrelation times, noise-flux amplitudes
+    taue::A;   taus::A;   St::A
+    sge::A;    sgx::A;    sgs::A
+    Fte::A;    Fts::A
+    # spatially-filtered potentials (psie_flt/psix_flt share the eddy filter
+    # Gkpe/padL0, psis_flt uses the settling filter Gkps/padl0)
+    psie_flt::A; psix_flt::A; psis_flt::A
+    eddy_pad::AC; settle_pad::AC
+    # ghost-extended potential (Nz+2,Nx+2), reused sequentially across the
+    # psie_flt/psix_flt/psis_flt ghost-extensions since each is fully consumed
+    # before the next is written
+    psi_ext::A
+    psiec::A
+    xieu_int::A; xiew_int::A
+    xtaperw::A;  xtaperu::A
 end
 
 """
@@ -92,7 +107,8 @@ function NoiseState(::Type{T}, backend, grid::Grid{T}, scales::Scales{T};
     fL = T(2 / sqrt(1 - exp(-h^2 / (2 * L0h^2))))
     fl = T(2 / sqrt(1 - exp(-h^2 / (2 * l0h^2))))
 
-    z = (args...) -> xcore_zeros(backend, T, args...)
+    z  = (args...) -> xcore_zeros(backend, T, args...)
+    zc = (args...) -> xcore_zeros(backend, Complex{T}, args...)
 
     return NoiseState(
         z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),   # psie, psix, psis
@@ -104,6 +120,15 @@ function NoiseState(::Type{T}, backend, grid::Grid{T}, scales::Scales{T};
         z(Nz + 1, Nx + 2), z(Nz + 2, Nx + 1),   # xisw, xisu
         z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),         # xie, xix, xis
         MersenneTwister(seed),
+        z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),         # taue, taus, St
+        z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),         # sge, sgx, sgs
+        z(Nz, Nx), z(Nz, Nx),                     # Fte, Fts
+        z(Nz, Nx), z(Nz, Nx), z(Nz, Nx),         # psie_flt, psix_flt, psis_flt
+        zc(Nz + padL0, Nx), zc(Nz + padl0, Nx),  # eddy_pad, settle_pad
+        z(Nz + 2, Nx + 2),                        # psi_ext
+        z(Nz + 1, Nx + 1),                        # psiec
+        z(Nz, Nx + 1), z(Nz + 1, Nx),             # xieu_int, xiew_int
+        z(Nz + 1, Nx + 2), z(Nz + 2, Nx + 1),     # xtaperw, xtaperu
     )
 end
 
@@ -166,7 +191,6 @@ function noise!(ns::NoiseState{T}, phase::PhaseState{T}, grid::Grid{T},
     Xi   = T(par.Xi)
     L0h  = T(scales.L0h)
     l0h  = T(scales.l0h)
-    h    = T(grid.h)
     txi0 = T(scales.txi0)
     eps_T = eps(T)
 
@@ -178,67 +202,68 @@ function noise!(ns::NoiseState{T}, phase::PhaseState{T}, grid::Grid{T},
     end
 
     # --- per-cell decorrelation times ---
-    taue = @. L0h / (T(2) * (phase.V  + eps_T))   # eddy (Nz,Nx)
-    taus = @. l0h / (T(2) * (phase.vx + eps_T))   # settling
+    @. ns.taue = L0h / (T(2) * (phase.V  + eps_T))   # eddy (Nz,Nx)
+    @. ns.taus = l0h / (T(2) * (phase.vx + eps_T))   # settling
 
-    St   = @. txi0 / (taue + eps_T)
+    @. ns.St = txi0 / (ns.taue + eps_T)
 
     # --- noise flux amplitudes ---
-    sge = @. Xi * sqrt(max(zero(T),             phase.fReL * phase.ke / taue))                          # eddy mixture noise speed
-    sgx = @. Xi * sqrt(max(zero(T), phase.chi * phase.fReL * phase.ke / taue * St / (one(T) + St^2)))   # eddy crystal noise speed
-    sgs = @. Xi * sqrt(max(zero(T), phase.chi *              phase.ks / taus))                          # settling noise speed
+    @. ns.sge = Xi * sqrt(max(zero(T),             phase.fReL * phase.ke / ns.taue))                             # eddy mixture noise speed
+    @. ns.sgx = Xi * sqrt(max(zero(T), phase.chi * phase.fReL * phase.ke / ns.taue * ns.St / (one(T) + ns.St^2)))  # eddy crystal noise speed
+    @. ns.sgs = Xi * sqrt(max(zero(T), phase.chi *              phase.ks / ns.taus))                             # settling noise speed
 
     # Ornstein–Uhlenbeck time update for evolving noise
-    @. taue = inv(inv(taue) + inv(T(1e2) * T(dt))) + T(dt)
-    @. taus = inv(inv(taus) + inv(T(1e2) * T(dt))) + T(dt)
+    @. ns.taue = inv(inv(ns.taue) + inv(T(1e2) * T(dt))) + T(dt)
+    @. ns.taus = inv(inv(ns.taus) + inv(T(1e2) * T(dt))) + T(dt)
 
-    Fte = @. exp(-T(dt) / taue)     # eddy noise time evolution factor
-    Fts = @. exp(-T(dt) / taus)     # settling noise time evolution factor
+    @. ns.Fte = exp(-T(dt) / ns.taue)     # eddy noise time evolution factor
+    @. ns.Fts = exp(-T(dt) / ns.taus)     # settling noise time evolution factor
 
-    fL   = T(2)/sqrt(T(1) - exp(-h^2/(2*L0h^2))); # scaling factor for potential field to noise component variance
-    fl   = T(2)/sqrt(T(1) - exp(-h^2/(2*l0h^2))); # scaling factor for potential field to noise component variance
+    fL = ns.fL   # precomputed scaling factor for potential field to noise component variance
+    fl = ns.fl
 
     # --- OU time update ---
-    @. ns.psie = Fte * ns.psieo + sqrt(max(zero(T), one(T) - Fte^2)) * sge * fL * ns.re
-    @. ns.psix = Fte * ns.psixo + sqrt(max(zero(T), one(T) - Fte^2)) * sgx * fL * ns.re
-    @. ns.psis = Fts * ns.psiso + sqrt(max(zero(T), one(T) - Fts^2)) * sgs * fl * ns.rs
+    @. ns.psie = ns.Fte * ns.psieo + sqrt(max(zero(T), one(T) - ns.Fte^2)) * ns.sge * fL * ns.re
+    @. ns.psix = ns.Fte * ns.psixo + sqrt(max(zero(T), one(T) - ns.Fte^2)) * ns.sgx * fL * ns.re
+    @. ns.psis = ns.Fts * ns.psiso + sqrt(max(zero(T), one(T) - ns.Fts^2)) * ns.sgs * fl * ns.rs
 
     # --- spatial Gaussian filtering ---
-    psie_flt = compute_fft_filter(ns.psie, ns.Gkpe, ns.padL0)
-    psix_flt = compute_fft_filter(ns.psix, ns.Gkpe, ns.padL0)
-    psis_flt = compute_fft_filter(ns.psis, ns.Gkps, ns.padl0)
+    compute_fft_filter!(ns.psie_flt, ns.eddy_pad,   ns.psie, ns.Gkpe, ns.padL0)
+    compute_fft_filter!(ns.psix_flt, ns.eddy_pad,   ns.psix, ns.Gkpe, ns.padL0)
+    compute_fft_filter!(ns.psis_flt, ns.settle_pad, ns.psis, ns.Gkps, ns.padl0)
 
     # --- eddy noise fluxes from stream function (noise.m lines 61-64) ---
     # corner average of psie_flt to (Nz+1, Nx+1) corner points.
-    # psie_ext is already ghost-extended via icz/icx, so use sequential
+    # ns.psi_ext is ghost-extended via icz/icx, so use sequential
     # 1:end-1 / 2:end slices — equivalent to MATLAB's
-    # psie_flt(icz(1:end-1), icx(1:end-1)) etc.
-    psie_ext = psie_flt[icz, icx]             # (Nz+2, Nx+2)
-    psiec = (psie_ext[1:end-1, 1:end-1] .+ psie_ext[1:end-1, 2:end] .+
-             psie_ext[2:end,   1:end-1] .+ psie_ext[2:end,   2:end]) ./ T(4)  # (Nz+1, Nx+1)
+    # psie_flt(icz(1:end-1), icx(1:end-1)) etc. Reused below for
+    # psix_flt/psis_flt once this ghost-extension is fully consumed.
+    ns.psi_ext .= @view ns.psie_flt[icz, icx]             # (Nz+2, Nx+2)
+    @views @. ns.psiec = (ns.psi_ext[1:end-1, 1:end-1] + ns.psi_ext[1:end-1, 2:end] +
+                          ns.psi_ext[2:end,   1:end-1] + ns.psi_ext[2:end,   2:end]) / T(4)  # (Nz+1, Nx+1)
 
     # raw differences (h=1 convention — matches MATLAB `ddz(f,1)`)
-    xieu_int =   psiec[2:end, :] .- psiec[1:end-1, :]   # ddz  → (Nz, Nx+1)
-    xiew_int = -(psiec[:, 2:end] .- psiec[:, 1:end-1])  # -ddx → (Nz+1, Nx)
+    @views @. ns.xieu_int =   ns.psiec[2:end, :] - ns.psiec[1:end-1, :]   # ddz  → (Nz, Nx+1)
+    @views @. ns.xiew_int = -(ns.psiec[:, 2:end] - ns.psiec[:, 1:end-1])  # -ddx → (Nz+1, Nx)
 
     # ghost-extend to staggered grid sizes (index into interior, then copy whole field)
-    ns.xieu .= xieu_int[icz, :]   # (Nz+2, Nx+1) — extend z-ghosts via icz
-    ns.xiew .= xiew_int[:, icx]   # (Nz+1, Nx+2) — extend x-ghosts via icx
+    ns.xieu .= @view ns.xieu_int[icz, :]   # (Nz+2, Nx+1) — extend z-ghosts via icz
+    ns.xiew .= @view ns.xiew_int[:, icx]   # (Nz+1, Nx+2) — extend x-ghosts via icx
 
     # --- noise taper: suppress near chi=0 and where mu<0.4 ---
-    xtaperw = @. (one(T) - exp(-phase.chiw / T(1e-4))) *
-                 (one(T) - exp(-max(zero(T), phase.muw - T(0.4)) / T(0.05)))
-    xtaperu = @. (one(T) - exp(-phase.chiu / T(1e-4))) *
-                 (one(T) - exp(-max(zero(T), phase.muu - T(0.4)) / T(0.05)))
+    @. ns.xtaperw = (one(T) - exp(-phase.chiw / T(1e-4))) *
+                    (one(T) - exp(-max(zero(T), phase.muw - T(0.4)) / T(0.05)))
+    @. ns.xtaperu = (one(T) - exp(-phase.chiu / T(1e-4))) *
+                    (one(T) - exp(-max(zero(T), phase.muu - T(0.4)) / T(0.05)))
 
     # --- particle-eddy and settling noise (noise.m lines 71-76) ---
-    psix_ext = psix_flt[icz, icx]   # (Nz+2, Nx+2)
-    psis_ext = psis_flt[icz, icx]
+    ns.psi_ext .= @view ns.psix_flt[icz, icx]   # (Nz+2, Nx+2)
+    @views @. ns.xixu = -(ns.psi_ext[:, 2:end] - ns.psi_ext[:, 1:end-1]) * ns.xtaperu   # (Nz+2, Nx+1)
+    @views @. ns.xixw = -(ns.psi_ext[2:end, :] - ns.psi_ext[1:end-1, :]) * ns.xtaperw   # (Nz+1, Nx+2)
 
-    ns.xixu .= (-(psix_ext[:, 2:end] .- psix_ext[:, 1:end-1])) .* xtaperu   # (Nz+2, Nx+1)
-    ns.xixw .= (-(psix_ext[2:end, :] .- psix_ext[1:end-1, :])) .* xtaperw   # (Nz+1, Nx+2)
-    ns.xisu .= (-(psis_ext[:, 2:end] .- psis_ext[:, 1:end-1])) .* xtaperu
-    ns.xisw .= (-(psis_ext[2:end, :] .- psis_ext[1:end-1, :])) .* xtaperw
+    ns.psi_ext .= @view ns.psis_flt[icz, icx]
+    @views @. ns.xisu = -(ns.psi_ext[:, 2:end] - ns.psi_ext[:, 1:end-1]) * ns.xtaperu
+    @views @. ns.xisw = -(ns.psi_ext[2:end, :] - ns.psi_ext[1:end-1, :]) * ns.xtaperw
 
     # --- noise speed magnitudes (cell-centred, for diagnostics) ---
     backend = KernelAbstractions.get_backend(ns.xie)
@@ -273,22 +298,21 @@ end
     end
 end
 
-# Pad `psi` (Nz×Nx) with `pad` zero rows (half on each side), apply the
-# Gaussian FFT filter `Gk`, unpad, then rescale the result to match the
-# original field's mean and standard deviation.
-# Array-type-generic: scratch is allocated via `similar(psi, …)` so it lands on
-# the same backend as `psi`, and `fft`/`ifft` are the AbstractFFTs generics that
-# dispatch automatically to FFTW (CPU), cuFFT (CUDA), or rocFFT (AMD) when the
+# Pad `psi` (Nz×Nx) with `pad` zero rows (half on each side) into caller-owned
+# scratch `psi_pad`, apply the Gaussian FFT filter `Gk`, unpad, then rescale to
+# match the original field's mean and standard deviation, writing into
+# caller-owned `psi_flt`. `psi_pad`/`psi_flt` are reused across calls by the
+# caller (`noise!`) instead of being allocated here.
+# Array-type-generic: `fft!`/`ifft!` are the AbstractFFTs generics that dispatch
+# automatically to FFTW (CPU), cuFFT (CUDA), or rocFFT (AMD) when the
 # corresponding package is loaded — no explicit per-backend code needed. `Gk`
 # must already be on the same backend (NoiseState moves it there at construction).
-function compute_fft_filter(psi::AbstractMatrix{T}, Gk::AbstractMatrix{Complex{T}},
-                            pad::Int) where {T<:AbstractFloat}
-    Nz, Nx  = size(psi)
+function compute_fft_filter!(psi_flt::AbstractMatrix{T}, psi_pad::AbstractMatrix{Complex{T}},
+                             psi::AbstractMatrix{T}, Gk::AbstractMatrix{Complex{T}},
+                             pad::Int) where {T<:AbstractFloat}
+    Nz      = size(psi, 1)
     halfpad = pad ÷ 2
-    Nz_pad  = Nz + pad
 
-    # embed in zero-padded array (on psi's backend)
-    psi_pad = similar(psi, Complex{T}, Nz_pad, Nx)
     fill!(psi_pad, zero(Complex{T}))
     @views psi_pad[halfpad + 1 : halfpad + Nz, :] .= psi
 
@@ -299,7 +323,7 @@ function compute_fft_filter(psi::AbstractMatrix{T}, Gk::AbstractMatrix{Complex{T
     psi_pad .*= Gk
     ifft!(psi_pad, (1, 2))
 
-    psi_flt = real.(@view psi_pad[halfpad + 1 : halfpad + Nz, :])
+    @views @. psi_flt = real(psi_pad[halfpad + 1 : halfpad + Nz, :])
 
     # rescale to original mean and std (noise.m lines 54-56). std/mean reduce to
     # host scalars; the final broadcast stays on-device.
@@ -311,5 +335,5 @@ function compute_fft_filter(psi::AbstractMatrix{T}, Gk::AbstractMatrix{Complex{T
         @. psi_flt = (psi_flt - flt_mean) * raw_std / flt_std + raw_mean
     end
 
-    return psi_flt
+    return nothing
 end

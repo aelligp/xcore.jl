@@ -116,23 +116,40 @@ function _compute_scales_inner(D, d0, L0_in, l0_in, x0, Da, rhom0, rhox0,
     w0 = w0l
     ReL0 = W0 * L0 / (eta0 / rho0)
     Rel0 = w0 * l0 / (eta0 / rho0)
-    fReL0 = 1 - exp(-ReL0)
-    fRel0 = 1 - exp(-Rel0)
+    # -expm1(-Re) == 1 - exp(-Re) without the cancellation: the closed-form W0/w0
+    # below divide by the ramp factor, so a factor that rounds to 0 at small Re
+    # turns the whole scale set into NaN.
+    fReL0 = -expm1(-ReL0)
+    fRel0 = -expm1(-Rel0)
 
+    converged = false
+    res = Inf
     for _ in 1:maxiter
         W0prv = W0; w0prv = w0
         ReL0  = W0 * L0 / (eta0 / rho0)
         Rel0  = w0 * l0 / (eta0 / rho0)
-        fReL0 = 1 - exp(-ReL0)
-        fRel0 = 1 - exp(-Rel0)
-        # closed-form quadratic solution (mirrors scales.m lines 47–50)
-        W0 = (sqrt(4/Ri0^2 * Dchi0 * Drho0 * g0 * rho0 * fReL0 * L0^2 * D0 + eta0^2) - eta0) *
-             D0 / (2 * fReL0 * L0^2 * rho0 / Ri0^2)
-        w0 = (sqrt(4         * Drho0 * g0 * rho0 * fRel0 * l0   * d0^2 + eta0^2) - eta0) /
-             (2 * fRel0 * l0 * rho0)
+        fReL0 = -expm1(-ReL0)
+        fRel0 = -expm1(-Rel0)
+        # Closed-form quadratic solution for the drag-limited speeds (scales.m
+        # lines 47-50), written via the exact identity
+        # √(A+η²) − η = A/(√(A+η²) + η). Dividing by the sum rather than
+        # subtracting is required, not cosmetic: A ≪ η² in the drag-free limit
+        # (Δχ → 0 at Da = 0), where the difference rounds to exactly zero and the
+        # ramp factor it would be divided by is itself ~0. In this form the ramp
+        # factor cancels analytically, so that limit returns the laminar speed.
+        A_W = 4 / Ri0^2 * Dchi0 * Drho0 * g0 * rho0 * fReL0 * L0^2 * D0
+        A_w = 4         * Drho0 * g0 * rho0 * fRel0 * l0   * d0^2
+        W0 = 2 * Dchi0 * Drho0 * g0 * D0^2 / (sqrt(A_W + eta0^2) + eta0)
+        w0 = 2         * Drho0 * g0 * d0^2 / (sqrt(A_w + eta0^2) + eta0)
         res = abs(W0 - W0prv)/W0 + abs(w0 - w0prv)/w0
-        res <= tol && break
+        if res <= tol
+            converged = true
+            break
+        end
     end
+    converged || error(
+        "compute_scales: the (W0, w0) fixed point did not reach tol=$tol in " *
+        "$maxiter iterations (last residual $res, W0=$W0, w0=$w0)")
 
     # diffusivities
     eII0 = W0 / D0

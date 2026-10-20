@@ -12,7 +12,7 @@ using KernelAbstractions
 # broadcasts.
 #
 # xcore conventions (matching the matrix-assembly BCs in fluidmech.jl):
-#   * x : periodic (left ≡ right)
+#   * x : periodic (left ≡ right), or solid walls with slip set by `sds`
 #   * z : W Dirichlet (= 0) top & bottom; U free/no-slip via top_cnv/bot_cnv
 #   * P : periodic-x ghosts, Neumann-z ghosts (repeat boundary)
 #
@@ -49,19 +49,33 @@ using KernelAbstractions
     end
 end
 
-# Cols pass: periodic-x ghost columns of W and the periodic-equivalent last
-# x-face of U. Reads interior columns written by the rows pass (run after it).
-@kernel function _dyrel_vbc_cols_kernel!(W, U)
+# Cols pass: x-boundary columns of W and U. Under periodic-x the W ghosts wrap
+# onto the far interior column and U's last x-face mirrors its first (they are
+# the same physical face). At solid walls the W ghosts reflect its own
+# neighbour with sign `-sds` (sds = -1 ⇒ ∂ₓW = 0, free slip; sds = +1 ⇒ W = 0 on
+# the wall, no slip) and U — the wall-normal velocity — is pinned to zero.
+# Reads interior columns written by the rows pass (run after it).
+@kernel function _dyrel_vbc_cols_kernel!(W, U, periodic, sds)
     iz = @index(Global)
     @inbounds begin
         Wrows = size(W, 1)           # Nz+1
         Wend  = size(W, 2)           # Nx+2
         Uend  = size(U, 2)           # Nx+1
         if iz <= Wrows
-            W[iz, 1]    = W[iz, Wend - 1]   # periodic wrap
-            W[iz, Wend] = W[iz, 2]
+            if periodic
+                W[iz, 1]    = W[iz, Wend - 1]
+                W[iz, Wend] = W[iz, 2]
+            else
+                W[iz, 1]    = -sds * W[iz, 2]
+                W[iz, Wend] = -sds * W[iz, Wend - 1]
+            end
         end
-        U[iz, Uend] = U[iz, 1]
+        if periodic
+            U[iz, Uend] = U[iz, 1]
+        else
+            U[iz, 1]    = zero(eltype(U))
+            U[iz, Uend] = zero(eltype(U))
+        end
     end
 end
 
@@ -71,10 +85,12 @@ end
 Enforce velocity boundary conditions after each DR velocity update:
 
 * `W` = 0 on the top and bottom z-boundary faces (Dirichlet closed).
-* `W` x-ghost columns filled by periodic wrap.
+* `W` x-ghost columns filled by periodic wrap (`xBC = :periodic`) or by
+  reflection `W[ghost] = −sds·W[interior]` at solid walls.
 * `U` top/bottom z-ghost rows set by reflection: `U[ghost] = −cnv·U[interior]`
   (`cnv = +1` ⇒ no-slip, `cnv = −1` ⇒ free-slip), matching fluidmech.jl.
-* `U` periodic x-faces kept in sync (`U[:,end] = U[:,1]`).
+* `U` periodic x-faces kept in sync (`U[:,end] = U[:,1]`), or pinned to zero on
+  both walls when `xBC` is not `:periodic`.
 
 Fused into a rows pass + cols pass (see file header). Bit-identical to the old
 slice-broadcast version: the cols pass overwrites the ghost columns of rows
@@ -84,6 +100,8 @@ function dyrel_apply_velocity_bcs!(fluid::FluidState{T};
                                    top_cnv::Integer = 1,
                                    bot_cnv::Integer = 1,
                                    open_cnv::Bool = false,
+                                   xBC::Symbol = :periodic,
+                                   sds::Integer = -1,
                                    h::Real = 0,
                                    mfs_mean::Real = 0,
                                    Ddom::Real = 0) where {T<:AbstractFloat}
@@ -106,22 +124,30 @@ function dyrel_apply_velocity_bcs!(fluid::FluidState{T};
             .+ ρu[end, 1:end-1] .* U[end - 1, 1:end-1]
         ) ./ ρw[end, :]
     end
-    _dyrel_vbc_cols_kernel!(backend)(W, U; ndrange = size(U, 1))
+    _dyrel_vbc_cols_kernel!(backend)(W, U, xBC === :periodic, T(sds);
+                                     ndrange = size(U, 1))
     return nothing
 end
 
 """
     dyrel_apply_pressure_bcs!(fluid) -> nothing
 
-Fill the ghost ring of `fluid.P`: periodic in x, Neumann (repeat) in z.
+Fill the ghost ring of `fluid.P`: periodic or Neumann (repeat) in x depending
+on `xBC`, Neumann (repeat) in z.
 Required before each momentum-residual evaluation since the pressure gradient
 reads `P` ghost cells across boundaries.
 """
-function dyrel_apply_pressure_bcs!(fluid::FluidState{T}) where {T<:AbstractFloat}
+function dyrel_apply_pressure_bcs!(fluid::FluidState{T};
+                                   xBC::Symbol = :periodic) where {T<:AbstractFloat}
     P = fluid.P
     # x first so the subsequent z fill picks up correct corner columns
-    @views P[:, 1]   .= P[:, end - 1]     # periodic wrap
-    @views P[:, end] .= P[:, 2]
+    if xBC === :periodic
+        @views P[:, 1]   .= P[:, end - 1]     # periodic wrap
+        @views P[:, end] .= P[:, 2]
+    else
+        @views P[:, 1]   .= P[:, 2]           # Neumann repeat (x walls)
+        @views P[:, end] .= P[:, end - 1]
+    end
     @views P[1, :]   .= P[2, :]           # Neumann repeat (z)
     @views P[end, :] .= P[end - 1, :]
     return nothing
@@ -154,24 +180,37 @@ function dyrel_apply_pressure_gauge!(fluid::FluidState{T}; target::Real = 0) whe
 end
 
 """
-    dyrel_apply_pressure_gauge!(fluid, P0, γ_eff) -> nothing
+    dyrel_apply_pressure_gauge!(fluid, P0) -> nothing
 
-γ_eff-weighted gauge: shift the interior pressure so `Σ (P − P0)/γ_eff = 0`,
-i.e. so the artificial-compressibility term `comp = (P−P0)/(γ_eff·dt)`
-integrates to ZERO over the domain. Global mass balance requires exactly this
-(the bottom drain already carries Σ MFS, so any nonzero Σ comp is an
-unremovable CONSTANT continuity residual). The plain unweighted-mean gauge
-pins `Σ (P − P0) = 0` instead, which differs whenever γ_eff varies per cell —
-observed as a bit-exact P-residual floor with `corr(R_P, 1/γ_eff) ≈ −1` at
-N≥256. Weighting by 1/γ_eff makes the gauge and the solvability constraint
-coincide; the shift is a constant, so ∇P (hence velocity) is untouched.
+Shift the interior pressure so `Σ (P − P0) = 0`, i.e. so `P` keeps the mean level
+of the reference field `P0` while the free constant mode is removed. Use this
+whenever the continuity residual carries no pressure term: there is then nothing
+to weight the gauge by, and re-referencing to `P0` keeps the absolute level (which
+`update_pressure!` reads through `Pt = Pl + P`) from drifting between solves.
+"""
+function dyrel_apply_pressure_gauge!(fluid::FluidState{T},
+                                     P0::AbstractMatrix{T}) where {T<:AbstractFloat}
+    @views P0int = P0[2:end-1, 2:end-1]
+    return dyrel_apply_pressure_gauge!(fluid; target = sum(P0int) / length(P0int))
+end
+
+"""
+    dyrel_apply_pressure_gauge!(fluid, P0, η_b) -> nothing
+
+η_b-weighted gauge for the multigrid smoother, whose continuity residual does
+carry the pseudo-transient term `comp = (P−P0)/(η_b·dt)`: pinning
+`Σ (P − P0)/η_b = 0` makes that term integrate to zero over the domain, which is
+the global mass-solvability constraint. The plain unweighted gauge pins
+`Σ (P − P0) = 0` instead, which differs whenever η_b varies per cell — observed
+as a bit-exact P-residual floor with `corr(R_P, 1/η_b) ≈ −1` at N≥256. The shift
+is a constant, so ∇P (hence velocity) is untouched.
 """
 function dyrel_apply_pressure_gauge!(fluid::FluidState{T}, P0::AbstractMatrix{T},
-                                     γ_eff::AbstractMatrix{T}) where {T<:AbstractFloat}
+                                     η_b::AbstractMatrix{T}) where {T<:AbstractFloat}
     @views Pint  = fluid.P[2:end-1, 2:end-1]
     @views P0int = P0[2:end-1, 2:end-1]
-    num = sum(_bc((p, p0, γ) -> (p - p0) / γ, Pint, P0int, γ_eff))
-    den = sum(_bc(γ -> inv(γ), γ_eff))
+    num = sum(_bc((p, p0, η) -> (p - p0) / η, Pint, P0int, η_b))
+    den = sum(_bc(inv, η_b))
     Pint .-= num / den
     return nothing
 end

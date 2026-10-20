@@ -230,7 +230,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
     # Stokes/Navier-Stokes solver strategy (:direct | :dyrel | :gmg | :mg).
     # Persistent state (caches, MG hierarchy) allocated once, reused across all
     # Picard sweeps and time steps. Dispatch via `solve_fluidmech!` below.
-    solver = make_solver(par, fluid, phase, grid)
+    solver = make_solver(par, fluid, phase, grid; xBC)
 
     tend_dim = T(par.tend)
     tend_t0  = T(par.t0end) * T(scales.t0)
@@ -248,17 +248,22 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
 
         resnorm  = T(1)
         resnorm0 = T(1)
+        resmin   = T(Inf)
         iter     = 0
+        lin_ok   = true      # did the last fluidmech solve meet its own tolerance?
 
         # per-component timing accumulators (mirrors FMtime/XEtime/UDtime in
         # MATLAB src/timing.m + diagnose.m). Reset every outer step.
         t_phs = 0.0;  t_fm = 0.0;  t_upd = 0.0
 
         elapsed = @elapsed begin
-            # mirror MATLAB: at least 3 sweeps, then exit on convergence or maxit
-            while (resnorm / resnorm0 >= T(par.rtol) &&
-                   resnorm             >= T(par.atol) &&
-                   iter                <  par.maxit) || iter < 3
+            # At least 3 sweeps, then exit on convergence or maxit. A fluidmech
+            # solve that missed its own tolerance cannot end the loop: `resnorm`
+            # measures the CHANGE between sweeps, and an under-solved linear
+            # system reproduces the previous fields — small change, wrong answer.
+            while ((resnorm / resnorm0 >= T(par.rtol) &&
+                    resnorm             >= T(par.atol)) || !lin_ok) &&
+                  iter < par.maxit || iter < 3
 
                 iter += 1
                 snapshot!(res, phase, fluid)
@@ -266,7 +271,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                 t_phs += @elapsed phsevo!(phase, fluid, grid, par, scales;
                         ADVN, xBC, zBC,
                         a1, a2, a3, b1, b2, b3, dt)
-                t_fm  += @elapsed solve_fluidmech!(solver, fluid, phase, grid, par, scales;
+                t_fm  += @elapsed lin_ok = solve_fluidmech!(solver, fluid, phase, grid, par, scales;
                            dt, a1, a2, a3, b1, b2, b3,
                            sds, top_cnv, bot_cnv, open_cnv, xBC, zBC)
                 # noise + phase velocities before update! — mirrors MATLAB main.m:
@@ -280,14 +285,26 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                 end
 
                 resnorm, rm, rp = compute_resnorm(res, phase, fluid, dt)
-                # set reference on first sweep, or reset if residual increased
-                if iter == 1 || resnorm > resnorm0
-                    resnorm0 = resnorm + T(1e-32)
-                end
+                # The reference is the FIRST sweep's residual and stays fixed.
+                # Re-baselining it whenever the residual rises pins the reported
+                # ratio at 1 and makes a growing residual indistinguishable from
+                # a converging one.
+                iter == 1 && (resnorm0 = resnorm + T(1e-32))
+                resnorm > resmin * T(1e3) && error(
+                    "Picard iteration diverged at step $step, sweep $iter: " *
+                    "resnorm = $resnorm, best so far = $resmin")
+                resmin = min(resmin, resnorm)
 
                 verbose && report_iter(iter, Float64(resnorm), Float64(resnorm0), Float64(rm), Float64(rp))
             end
         end
+
+        # An exhausted budget means the step's fields do not solve the equations;
+        # continuing would march that error forward silently.
+        (resnorm / resnorm0 < T(par.rtol) || resnorm < T(par.atol)) && lin_ok || error(
+            "Picard iteration failed to converge at step $step after $iter sweeps: " *
+            "resnorm = $resnorm (atol = $(par.atol)), rel = $(resnorm / resnorm0) " *
+            "(rtol = $(par.rtol)), last fluidmech solve converged = $lin_ok")
 
         time += dt
         verbose && print_step!(step, time, dt, phase, fluid, ns, scales;

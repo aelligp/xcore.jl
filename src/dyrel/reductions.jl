@@ -13,7 +13,7 @@ using LinearAlgebra: norm
     dyrel_rayleigh_λmin(cache) -> λmin
 
 Estimate the minimum eigenvalue of the (preconditioned) velocity operator via
-the Rayleigh quotient (DESIGN §5.2, JustRelax DYREL2D.jl:331):
+the Rayleigh quotient (DESIGN §5.2, JustRelax src/DYREL/solver.jl `compute_λminV!`):
 
     λmin = |Σ ΔW·(R_W − R_W_old) + Σ ΔU·(R_U − R_U_old)|
            / (Σ ΔW² + Σ ΔU²)
@@ -68,6 +68,58 @@ function dyrel_residual_norms(cache::DyrelCache{T}, rho::AbstractMatrix{T}) wher
     normP = T(sqrt(sum(_bc((r, ρ) -> abs2(r * ρ), cache.R_P, rho))) /
               sqrt(length(cache.R_P)))
     return normW, normU, normP
+end
+
+"""
+    dyrel_pressure_update_norm(cache, fluid, h) -> RMS(δP) / max(RMS(P̃), RMS(τ_II))
+
+Size of the pending Powell-Hestenes multiplier update `δP = γ_eff·R_P`, measured
+against the pressure scale of the current flow. `≤ atol` is the mixed criterion
+
+    RMS(δP) ≤ atol · max(RMS(P̃), RMS(τ_II))
+
+where `P̃ = P − mean(P)` is the interior pressure without its free constant mode
+(relative part) and `τ_II` the second invariant of the deviatoric stress
+`τ = η(ε̇ − ∇·v/3)` (absolute part: the stress the pressure balances in the
+momentum equation, independent of the pressure field). Both are invariant under
+a constant pressure offset, and the stress keeps the scale nonzero when the
+pressure is uniform. With neither (fluid at rest under a uniform pressure) the
+update is returned unscaled.
+
+The continuity residual alone does not bound the pressure error: the multiplier
+step is γ_eff·R_P, so at a fixed `R_P` the pressure a solve returns is off by an
+amount that grows with the penalty. Gating on this instead makes the accepted
+pressure independent of how strongly the constraint is penalised.
+"""
+function dyrel_pressure_update_norm(cache::DyrelCache{T}, fluid::FluidState{T},
+                                    h::Real) where {T<:AbstractFloat}
+    dP    = sqrt(sum(_bc((g, r) -> abs2(g * r), cache.γ_eff, cache.R_P)) / length(cache.R_P))
+    scale = max(_pressure_deviation_rms(fluid.P), _deviatoric_stress_rms(fluid, T(inv(h))))
+    return scale > zero(T) ? T(dP / scale) : T(dP)
+end
+
+# RMS of the interior pressure about its mean (two passes: the mean can dominate).
+function _pressure_deviation_rms(P::AbstractMatrix{T}) where {T}
+    Pint = @view P[2:end-1, 2:end-1]
+    Pm   = sum(Pint) / length(Pint)
+    return sqrt(sum(_bc(p -> abs2(p - Pm), Pint)) / length(Pint))
+end
+
+# RMS of τ_II = √(½τxx² + ½τzz² + τxz²), with the stencils of the residual kernels:
+# normal stresses at cell centres, shear at corners (boundary ghosts carry the BCs).
+function _deviatoric_stress_rms(fluid::FluidState{T}, invh::T) where {T}
+    W, U = fluid.W, fluid.U
+    third = T(1//3);  half = T(1//2)
+    normal = sum(_bc(@view(W[2:end, 2:end-1]), @view(W[1:end-1, 2:end-1]),
+                     @view(U[2:end-1, 2:end]), @view(U[2:end-1, 1:end-1]), fluid.eta) do w1, w0, u1, u0, η
+        Wz = (w1 - w0) * invh;  Ux = (u1 - u0) * invh;  div = (Wz + Ux) * third
+        half * (abs2(η * (Wz - div)) + abs2(η * (Ux - div)))
+    end) / length(fluid.eta)
+    shear = sum(_bc(@view(U[2:end, :]), @view(U[1:end-1, :]),
+                    @view(W[:, 2:end]), @view(W[:, 1:end-1]), fluid.etaco) do u1, u0, w1, w0, η
+        abs2(η * ((u1 - u0) + (w1 - w0)) * invh * half)
+    end) / length(fluid.etaco)
+    return sqrt(normal + shear)
 end
 
 """

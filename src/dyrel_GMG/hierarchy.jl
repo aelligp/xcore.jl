@@ -13,7 +13,7 @@
 Halve `Nz`,`Nx` and double `h` (h_c = 2h). Errors if a dimension is odd (the
 hierarchy builder enforces power-of-two-friendly sizes down to `minlvl`).
 """
-function coarsen_grid(grid::Grid{T}) where {T}
+function coarsen_grid(grid::Grid{T}; xBC::Symbol = :periodic) where {T}
     Nz, Nx = grid.Nz, grid.Nx
     (iseven(Nz) && (iseven(Nx) || Nx == 1)) ||
         error("GMG: cannot coarsen grid $(Nz)×$(Nx) (need even dims)")
@@ -22,19 +22,20 @@ function coarsen_grid(grid::Grid{T}) where {T}
     # Build a coarse Grid via the same Parameters-free path: reuse Grid fields,
     # scaling h. We reconstruct coordinate/index vectors at the coarse size.
     hc = grid.h * 2
-    return _grid_at(T, Nzc, Nxc, hc, grid.D, grid.L)
+    return _grid_at(T, Nzc, Nxc, hc, grid.D, grid.L; xBC)
 end
 
 # Construct a Grid at an explicit (Nz,Nx,h) without going through Parameters.
 # Mirrors `Grid(par)` coordinate/index construction.
-function _grid_at(::Type{T}, Nz::Int, Nx::Int, h::T, D::T, L::T) where {T}
+function _grid_at(::Type{T}, Nz::Int, Nx::Int, h::T, D::T, L::T;
+                  xBC::Symbol = :periodic) where {T}
     Xc = collect(((1:Nx) .- T(0.5)) .* h)
     Zc = collect(((1:Nz) .- T(0.5)) .* h)
     Xf = collect((0:Nx) .* h)
     Zf = collect((0:Nz) .* h)
     XX = repeat(reshape(Xc, 1, Nx), Nz, 1)
     ZZ = repeat(reshape(Zc, Nz, 1), 1, Nx)
-    icx = [Nx; collect(1:Nx); 1]
+    icx = xBC === :periodic ? [Nx; collect(1:Nx); 1] : [1; collect(1:Nx); Nx]
     icz = [1;  collect(1:Nz); Nz]
     ifx = [Nx; collect(1:Nx + 1); 2]
     ifz = [2;  collect(1:Nz + 1); Nz]
@@ -70,11 +71,12 @@ the level's `(W,U,P)` solution + restricted coefficients + stress scratch, and a
 scratch). Level 1 (finest) wraps the caller's own fluid/phase; coarse levels own
 freshly-allocated coarse-sized state.
 """
-struct MGLevel{T, FS, PS, CA}
+struct MGLevel{T, FS, PS, CA, A}
     grid::Grid{T}
     fluid::FS
     phase::PS
     cache::CA
+    P0::A          # artificial-compressibility reference (see `vcycle.jl`)
 end
 
 struct MGHierarchy{T, L}
@@ -104,7 +106,8 @@ function build_hierarchy(fluid::FluidState{T}, phase::PhaseState{T}, grid::Grid{
                          minlvl::Int = par.mg_minlvl, npre::Int = par.mg_npre,
                          npost::Int = par.mg_npost, ncoarse::Int = par.mg_ncoarse,
                          coarse_rtol::Real = par.mg_coarse_rtol, inner::Int = par.mg_inner,
-                         γ_mg::Real = par.mg_gamma) where {T}
+                         γ_mg::Real = par.mg_gamma,
+                         xBC::Symbol = :periodic) where {T}
     # GPU-friendliness + clean coarsening: both grid dims must be multiples of 32
     # (warp size; and 32 = 2·16 halves cleanly down to the 16² coarsest floor that
     # still resolves the nonlinear rheology). Awkward sizes (e.g. 200×300) coarsen
@@ -117,15 +120,21 @@ function build_hierarchy(fluid::FluidState{T}, phase::PhaseState{T}, grid::Grid{
     backend = KernelAbstractions.get_backend(fluid.W)
     nlev = n_levels(grid; minlvl = minlvl)
 
-    L1 = MGLevel(grid, fluid, phase, DyrelCache(T, backend, grid.Nz, grid.Nx))
+    # Level 1's P0 is supplied per solve by `fluidmech_gmg!`; the field carries a
+    # correctly-shaped placeholder. Coarse levels keep a permanently-zero P0: their
+    # `P` IS the pressure correction (started at 0 by `_zero_solution!`), so
+    # comp = (P - 0)/(η_b·dt) is exactly the linearised compressibility term the
+    # fine operator applies to its own per-cycle increment.
+    L1 = MGLevel(grid, fluid, phase, DyrelCache(T, backend, grid.Nz, grid.Nx),
+                 xcore_zeros(backend, T, grid.Nz + 2, grid.Nx + 2))
     levels = Any[L1]
     g = grid
     for _ in 2:nlev
-        g = coarsen_grid(g)
+        g = coarsen_grid(g; xBC)
         cf = FluidState(T, backend, g.Nz, g.Nx)
         cp = PhaseState(T, backend, g.Nz, g.Nx)
         cc = DyrelCache(T, backend, g.Nz, g.Nx)
-        push!(levels, MGLevel(g, cf, cp, cc))
+        push!(levels, MGLevel(g, cf, cp, cc, xcore_zeros(backend, T, g.Nz + 2, g.Nx + 2)))
     end
     levels = [l for l in levels]                      # narrow eltype
     return MGHierarchy{T, eltype(levels)}(levels, minlvl, npre, npost, ncoarse,
@@ -133,7 +142,7 @@ function build_hierarchy(fluid::FluidState{T}, phase::PhaseState{T}, grid::Grid{
 end
 
 """
-    refresh_coefficients!(hier, par; a1, gamma, dt)
+    refresh_coefficients!(hier, par; a1, gamma, dt, xBC)
 
 Restrict the fine-grid coefficients (η, ρ, ρw, ρu) down the hierarchy, recompute
 `etaco` from coarse η, and (re)build the per-level Gershgorin diagonals + γ_eff +
@@ -142,7 +151,8 @@ The finest level already has live coefficients (from `update!`); only its cache
 autotune is refreshed.
 """
 function refresh_coefficients!(hier::MGHierarchy{T}, par::Parameters{T};
-                               a1::Real, gamma::Real, dt::Real) where {T}
+                               a1::Real, gamma::Real, dt::Real,
+                               xBC::Symbol = :periodic, γfact = nothing) where {T}
     h1 = hier.levels[1]
     nlev = length(hier.levels)
     # Per-level AL penalty: SMOOTHING levels (all but the coarsest, incl. the
@@ -152,26 +162,39 @@ function refresh_coefficients!(hier::MGHierarchy{T}, par::Parameters{T};
     # mg_gfact). The hierarchy replaces the multiplier acceleration the big
     # penalty buys single-grid. The COARSEST level is a true solve with no
     # coarser correction ⇒ it keeps the strong single-grid γfact_PT.
-    γf(l) = l == nlev ? T(par.γfact_PT) : T(par.mg_gfact)
+    # The coarsest level re-derives its penalty from the contraction it measures
+    # (`coarse_solve!`) and leaves it in its cache; re-entering at `par.γfact_PT`
+    # would discard that every Picard sweep. The cache constructor zeroes it, so
+    # the first solve of a run starts from the parameter.
+    γ_coarse = hier.levels[nlev].cache.γfact[]
+    γf(l) = γfact !== nothing ? T(γfact) :
+            l == nlev ? (γ_coarse > zero(T) ? γ_coarse : T(par.γfact_PT)) : T(par.mg_gfact)
     # finest level: coefficients are live; build the operator-derived penalty
     # (γ_eff = γfact/s_P_phys, leaves D_W/D_U = D_full) exactly as the
     # single-grid solver. `compute_AL_penalty!` leaves `cache.s_P` holding the
     # PENALTY-FREE Schur diagonal it derived γ_eff from; recomputing it here from
     # the penalised D_full would silently replace it with a different quantity.
-    compute_AL_penalty!(h1.cache, h1.fluid, h1.grid.h; γfact = γf(1), a1, gamma, dt, g0 = par.g0)
+    compute_AL_penalty!(h1.cache, h1.fluid, h1.grid.h; γfact = γf(1), a1, gamma, dt,
+                        g0 = par.g0, xBC)
+    _check_dyrel_preconditioner(h1.cache)
     _set_smoother_damping!(h1.cache, par.mg_cfact)
     update_dτ_α_β!(h1.cache, par.CFL_PT)
 
     for l in 2:length(hier.levels)
         f = hier.levels[l].fluid;  ff = hier.levels[l - 1].fluid
+        g = hier.levels[l].grid
         restrict_p!(f.eta,  ff.eta)
         restrict_p!(f.rho,  ff.rho)
-        restrict_w!(f.rhow, ff.rhow)
-        restrict_u!(f.rhou, ff.rhou)
-        # etaco recomputed from coarse η (consistent with the fine construction)
-        compute_corner_eta!(f.etaco, f.eta; xBC = :periodic, zBC = :closed)
+        # Face densities and corner viscosity are DERIVED from the cell fields,
+        # so they are rebuilt from the coarse cell values rather than restricted
+        # from the fine faces: restricting them independently yields a
+        # coefficient set that no coarse cell field generates, and the coarse
+        # operator then stops being a discretisation of the fine one.
+        _face_rho!(f.rhow, f.rhou, f.rho, g)
+        compute_corner_eta!(f.etaco, f.eta; xBC, zBC = :closed)
         compute_AL_penalty!(hier.levels[l].cache, f, hier.levels[l].grid.h;
-                            γfact = γf(l), a1, gamma, dt, g0 = par.g0)
+                            γfact = γf(l), a1, gamma, dt, g0 = par.g0, xBC)
+        _check_dyrel_preconditioner(hier.levels[l].cache)
         _set_smoother_damping!(hier.levels[l].cache, par.mg_cfact)
         update_dτ_α_β!(hier.levels[l].cache, par.CFL_PT)
     end
@@ -189,5 +212,15 @@ function _set_smoother_damping!(cache::DyrelCache{T}, mg_cfact::Real) where {T}
     λ̄ = (sum(cache.λmax_W) + sum(cache.λmax_U)) /
         (length(cache.λmax_W) + length(cache.λmax_U))
     cache.c[] = T(mg_cfact) * sqrt(λ̄)
+    return nothing
+end
+
+# Arithmetic face-averaged densities from cell ρ, the same averaging
+# `update_interpolations!` applies on the fine grid. `grid.icz`/`icx` carry the
+# closed-z / periodic-x ghost indexing.
+function _face_rho!(rhow, rhou, rho, grid::Grid{T}) where {T}
+    icz = grid.icz;  icx = grid.icx
+    @views rhow .= (rho[icz[1:end-1], :] .+ rho[icz[2:end], :]) ./ T(2)
+    @views rhou .= (rho[:, icx[1:end-1]] .+ rho[:, icx[2:end]]) ./ T(2)
     return nothing
 end

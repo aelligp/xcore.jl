@@ -4,6 +4,7 @@
 # `test_schur3d.jl` checks for correctness on NamedTuples). Here we confirm the
 # struct field names/shapes line up and the wrappers run end-to-end producing
 # finite, correctly-shaped output.
+using Test
 using xcore
 using KernelAbstractions: CPU
 using Random
@@ -35,44 +36,50 @@ for fld in (c.bext_W, c.bext_U, c.bext_V, c.bext_P, c.advn_mz, c.advn_mx, c.advn
 end
 P0 = randn(Nz + 2, Nx + 2, Ny + 2)
 
-# shapes the kernels expect (sanity on the struct constructors)
-@assert size(f.W)   == (Nz + 1, Nx + 2, Ny + 2)
-@assert size(f.U)   == (Nz + 2, Nx + 1, Ny + 2)
-@assert size(f.V)   == (Nz + 2, Nx + 2, Ny + 1)
-@assert size(c.R_W) == (Nz + 1, Nx, Ny)
-@assert size(c.R_U) == (Nz, Nx + 1, Ny)
-@assert size(c.R_V) == (Nz, Nx, Ny + 1)
-@assert size(c.s_P) == (Nz, Nx, Ny)
-println("OK  FluidState3D / DyrelCache3D shapes match the schur.jl header table")
+@testset "FluidState3D / DyrelCache3D shapes" begin
+    # must match the field table in the header of src/dyrel3D/schur.jl
+    @test size(f.W)   == (Nz + 1, Nx + 2, Ny + 2)
+    @test size(f.U)   == (Nz + 2, Nx + 1, Ny + 2)
+    @test size(f.V)   == (Nz + 2, Nx + 2, Ny + 1)
+    @test size(c.R_W) == (Nz + 1, Nx, Ny)
+    @test size(c.R_U) == (Nz, Nx + 1, Ny)
+    @test size(c.R_V) == (Nz, Nx, Ny + 1)
+    @test size(c.s_P) == (Nz, Nx, Ny)
+end
 
 h, g0, dt = 0.37, 9.81, 0.7
-for dr in (false, true)
+
+@testset "dyrel3d kernels on real structs (dr = $dr)" for dr in (false, true)
     GMG3D.dyrel3d_residual_P!(c, f, h, P0, dt)
     GMG3D.dyrel3d_residual_V!(c, f, h, g0; dr, a1 = 1.5, a2 = -0.6, a3 = 0.1,
                               gamma = 1e-3, dt)
-    for (name, A) in (("R_W", c.R_W), ("R_U", c.R_U), ("R_V", c.R_V),
-                      ("R_P", c.R_P), ("P_num", c.P_num))
-        all(isfinite, A) || error("FAIL $name dr=$dr has non-finite entries")
-    end
-    println("OK  dyrel3d residuals run on real structs (dr=$dr, all finite)")
+    @test all(isfinite, c.R_W)
+    @test all(isfinite, c.R_U)
+    @test all(isfinite, c.R_V)
+    @test all(isfinite, c.R_P)
+    @test all(isfinite, c.P_num)
 end
 
-GMG3D.compute_schur_diag3d!(c, f, h)
-all(isfinite, c.s_P) && all(c.s_P .> 0) || error("FAIL s_P not finite/positive")
-println("OK  compute_schur_diag3d! on real structs")
+@testset "compute_schur_diag3d!" begin
+    GMG3D.compute_schur_diag3d!(c, f, h)
+    @test all(isfinite, c.s_P)
+    @test all(>(0), c.s_P)
+end
 
-Pbefore = copy(f.P)
-GMG3D.dyrel3d_update_pressure!(c, f; ω = 0.8)
-expect = Pbefore[2:end-1, 2:end-1, 2:end-1] .+ 0.8 .* c.γ_eff .* c.R_P
-maximum(abs.(f.P[2:end-1, 2:end-1, 2:end-1] .- expect)) < 1e-13 ||
-    error("FAIL P update interior")
-println("OK  dyrel3d_update_pressure! on real structs")
+@testset "dyrel3d_update_pressure! touches the interior only" begin
+    Pbefore = copy(f.P)
+    GMG3D.dyrel3d_update_pressure!(c, f; ω = 0.8)
+    expect = Pbefore[2:end-1, 2:end-1, 2:end-1] .+ 0.8 .* c.γ_eff .* c.R_P
+    @test f.P[2:end-1, 2:end-1, 2:end-1] ≈ expect atol = 1e-13
+    # ghost ring untouched
+    @test f.P[1, :, :] == Pbefore[1, :, :]
+    @test f.P[:, 1, :] == Pbefore[:, 1, :]
+    @test f.P[:, :, 1] == Pbefore[:, :, 1]
+end
 
-# coarsening geometry
-g  = Grid3D(xcore.Parameters(T; N = 32, solver = :gmg))
-gc = coarsen_grid3d(g)
-@assert (gc.Nz, gc.Nx, gc.Ny) == (g.Nz ÷ 2, g.Nx ÷ 2, g.Ny ÷ 2)
-@assert gc.h ≈ 2g.h
-println("OK  Grid3D + coarsen_grid3d")
-
-println("\nAll Phase-1 3-D scaffold checks passed.")
+@testset "Grid3D + coarsen_grid3d" begin
+    g  = Grid3D(xcore.Parameters(T; N = 32, solver = :gmg))
+    gc = coarsen_grid3d(g)
+    @test (gc.Nz, gc.Nx, gc.Ny) == (g.Nz ÷ 2, g.Nx ÷ 2, g.Ny ÷ 2)
+    @test gc.h ≈ 2g.h
+end

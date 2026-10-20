@@ -17,10 +17,10 @@ using TimerOutputs
 #
 const TO = TimerOutput()
 
-"""Enable `@timeit_debug` regions in xcore (e.g. the direct-solver phases)."""
-enable_solver_timings()  = (TimerOutputs.enable_debug_timings(@__MODULE__); nothing)
+"""Enable `@timeit_debug` regions in xcore and its GMG submodule (all solver phases)."""
+enable_solver_timings()  = (foreach(TimerOutputs.enable_debug_timings, (@__MODULE__, GMG)); nothing)
 """Disable `@timeit_debug` regions, restoring zero-overhead production behaviour."""
-disable_solver_timings() = (TimerOutputs.disable_debug_timings(@__MODULE__); nothing)
+disable_solver_timings() = (foreach(TimerOutputs.disable_debug_timings, (@__MODULE__, GMG)); nothing)
 
 include("parameters.jl")
 include("grid.jl")
@@ -38,6 +38,7 @@ include("dyrel3D/grid3d.jl")
 include("dyrel3D/state3d.jl")
 include("dyrel3D/cache3d.jl")
 include("fluidmech.jl")
+include("direct_mg.jl")
 # DYREL pseudo-transient Stokes solver (standalone — its cache is NOT a field
 # of FluidState; construct a `DyrelCache` and pass it to `fluidmech_dyrel!`,
 # mirroring JustRelax's `DYREL` + `solve_DYREL!` separation).

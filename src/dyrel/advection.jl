@@ -41,16 +41,28 @@ function dyrel_momentum_advection!(cache::DyrelCache{T}, fluid::FluidState{T},
     advect_centered!(cache.advn_mz, f_mz, u_mz, w_mz, h, par.ADVN; xBC, zBC)
 
     # --- x-momentum advection (mirrors fluidmech.jl U-block) ---
-    ifx = [Nx; collect(1:(Nx + 1)); 2]                              # length Nx+3
-    u_mx = @views (U[2:end-1, ifx[1:end-1]] .+ U[2:end-1, ifx[2:end]]) ./ T(2)  # (Nz, Nx+2)
-    w_mx = @views (W[:, 1:end-1] .+ W[:, 2:end]) ./ T(2)            # (Nz+1, Nx+1)
-    f_mx = @views rhou .* U[2:end-1, :]                            # (Nz, Nx+1)
-    advect_centered!(cache.advn_mx, f_mx, u_mx, w_mx, h, par.ADVN; xBC, zBC)
-    # average the periodic-equivalent boundary columns (fluidmech.jl:271-274)
-    @views begin
-        col_avg = (cache.advn_mx[:, 1] .+ cache.advn_mx[:, end]) ./ T(2)
-        cache.advn_mx[:, 1]   .= col_avg
-        cache.advn_mx[:, end] .= col_avg
+    # Under periodic-x every x-face carries momentum and the two
+    # periodic-equivalent boundary columns are averaged so they agree. At solid
+    # walls the wall faces are Dirichlet, so advection spans only the interior
+    # faces and the wall columns stay zero.
+    if xBC === :periodic
+        ifx = [Nx; collect(1:(Nx + 1)); 2]                              # length Nx+3
+        u_mx = @views (U[2:end-1, ifx[1:end-1]] .+ U[2:end-1, ifx[2:end]]) ./ T(2)  # (Nz, Nx+2)
+        w_mx = @views (W[:, 1:end-1] .+ W[:, 2:end]) ./ T(2)            # (Nz+1, Nx+1)
+        f_mx = @views rhou .* U[2:end-1, :]                            # (Nz, Nx+1)
+        advect_centered!(cache.advn_mx, f_mx, u_mx, w_mx, h, par.ADVN; xBC, zBC)
+        @views begin
+            col_avg = (cache.advn_mx[:, 1] .+ cache.advn_mx[:, end]) ./ T(2)
+            cache.advn_mx[:, 1]   .= col_avg
+            cache.advn_mx[:, end] .= col_avg
+        end
+    else
+        u_mx = @views (U[2:end-1, 1:end-1] .+ U[2:end-1, 2:end]) ./ T(2)   # (Nz, Nx)
+        w_mx = @views (W[:, 2:end-2] .+ W[:, 3:end-1]) ./ T(2)             # (Nz+1, Nx-1)
+        f_mx = @views rhou[:, 2:end-1] .* U[2:end-1, 2:end-1]              # (Nz, Nx-1)
+        fill!(cache.advn_mx, zero(T))
+        advect_centered!(view(cache.advn_mx, :, 2:Nx), f_mx, u_mx, w_mx, h,
+                         par.ADVN; xBC, zBC)
     end
     return nothing
 end

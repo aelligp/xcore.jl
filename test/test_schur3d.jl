@@ -4,6 +4,7 @@
 #  Test 2: x↔y permutation symmetry — the V kernel on a fully RANDOM state must
 #          equal the U kernel applied to the axis-swapped state.
 #  Test 3: Schur diagonal vs brute-force; pressure-update kernel vs broadcast.
+using Test
 using xcore
 using KernelAbstractions
 using KernelAbstractions: CPU
@@ -28,13 +29,14 @@ be = CPU()
 σ(A) = permutedims(A, (1, 3, 2))                 # x↔y axis swap
 rep(A, n) = repeat(A, 1, 1, n)                   # replicate 2-D array along y
 
+# every y-slice of the 3-D result must equal the 2-D reference
 function checkslices(A3, A2, name)
-    scale = max(1.0, maximum(abs.(A2)))
-    for iy in axes(A3, 3)
-        err = maximum(abs.(A3[:, :, iy] .- A2))
-        err < 1e-10 * scale || error("FAIL $name slice iy=$iy: max abs diff = $err")
+    tol = 1e-10 * max(1.0, maximum(abs.(A2)))
+    @testset "$name" begin
+        for iy in axes(A3, 3)
+            @test maximum(abs.(A3[:, :, iy] .- A2)) < tol
+        end
     end
-    println("OK  $name  (y-uniform 3D == 2D, all $(size(A3,3)) slices)")
 end
 
 # ============================ 2-D random state ==============================
@@ -74,7 +76,7 @@ c3 = (; R_W = zeros(Nz+1, Nx, Ny), R_U = zeros(Nz, Nx+1, Ny), R_V = zeros(Nz, Nx
         γ_eff = rep(γ2, Ny), η_b = rep(ηb2, Ny), s_P = zeros(Nz, Nx, Ny))
 P03 = rep(P02, Ny+2)
 
-for dr in (false, true)
+@testset "y-uniform 3-D reproduces the 2-D kernels (dr = $dr)" for dr in (false, true)
     # 2-D reference (the validated single-grid kernels; P first to fill P_num)
     xcore.compute_dyrel_residual_P_kernel!(be)(
         R_P2, Pn2, W2, U2, P2, P02, MFS2, rho2, rhow2, rhou2, ηb2, bP2, γ2,
@@ -85,7 +87,8 @@ for dr in (false, true)
         ndrange = size(R_W2))
     xcore.compute_dyrel_residual_U_kernel!(be)(
         R_U2, U2, W2, eta2, etaco2, P2, Pn2, rho2, rhou2, rhoUo2, rhoUoo2,
-        advn_mx2, D_U2, bU2, invh, g0, third, half, a1, a2, a3, gamma, inv_dt, dt, 1.0, dr;
+        advn_mx2, D_U2, bU2, invh, g0, third, half, a1, a2, a3, gamma, inv_dt, dt, 1.0, dr,
+        true;   # periodic x, matching the 3-D kernel under test
         ndrange = size(R_U2))
     # 3-D under test
     dyrel3d_residual_P!(c3, f3, h, P03, dt)
@@ -121,7 +124,7 @@ cr = (; R_W = zeros(Nz+1, Nx, Ny), R_U = zeros(Nz, Nx+1, Ny), R_V = zeros(Nz, Nx
         s_P = zeros(Nz, Nx, Ny))
 P0r = randn(Nz+2, Nx+2, Ny+2)
 
-for dr in (false, true)
+@testset "R_V x↔y permutation symmetry vs the U kernel (dr = $dr)" for dr in (false, true)
     dyrel3d_residual_P!(cr, fr, h, P0r, dt)
     dyrel3d_residual_V!(cr, fr, h, g0; dr, a1, a2, a3, gamma, dt)
     # U kernel in the axis-swapped world should reproduce the V residual
@@ -132,28 +135,25 @@ for dr in (false, true)
         σ(cr.advn_my), σ(cr.D_V), σ(cr.bext_V),
         invh, g0, third, half, a1, a2, a3, gamma, inv_dt, dt, 1.0, dr;
         ndrange = size(R_U_sw))
-    err = maximum(abs.(σ(R_U_sw) .- cr.R_V))
-    err < 1e-10 * max(1.0, maximum(abs.(cr.R_V))) ||
-        error("FAIL V↔U permutation symmetry dr=$dr: max abs diff = $err")
-    println("OK  R_V dr=$dr  (x↔y permutation symmetry vs U kernel)")
+    @test maximum(abs.(σ(R_U_sw) .- cr.R_V)) < 1e-10 * max(1.0, maximum(abs.(cr.R_V)))
 end
 
 # =================== Schur diagonal + pressure update =======================
-compute_schur_diag3d!(cr, fr, h)
-sref = [ (fr.rhou[iz,ix,iy]/cr.D_U[iz,ix,iy] + fr.rhou[iz,ix+1,iy]/cr.D_U[iz,ix+1,iy] +
-          fr.rhov[iz,ix,iy]/cr.D_V[iz,ix,iy] + fr.rhov[iz,ix,iy+1]/cr.D_V[iz,ix,iy+1] +
-          fr.rhow[iz,ix,iy]/cr.D_W[iz,ix,iy] + fr.rhow[iz+1,ix,iy]/cr.D_W[iz+1,ix,iy]) /
-          h^2 / fr.rho[iz,ix,iy]
-         for iz in 1:Nz, ix in 1:Nx, iy in 1:Ny ]
-maximum(abs.(cr.s_P .- sref)) < 1e-12 * maximum(abs.(sref)) || error("FAIL s_P vs brute force")
-println("OK  s_P  (3D Schur diagonal vs brute force)")
+@testset "s_P vs brute force" begin
+    compute_schur_diag3d!(cr, fr, h)
+    sref = [ (fr.rhou[iz,ix,iy]/cr.D_U[iz,ix,iy] + fr.rhou[iz,ix+1,iy]/cr.D_U[iz,ix+1,iy] +
+              fr.rhov[iz,ix,iy]/cr.D_V[iz,ix,iy] + fr.rhov[iz,ix,iy+1]/cr.D_V[iz,ix,iy+1] +
+              fr.rhow[iz,ix,iy]/cr.D_W[iz,ix,iy] + fr.rhow[iz+1,ix,iy]/cr.D_W[iz+1,ix,iy]) /
+              h^2 / fr.rho[iz,ix,iy]
+             for iz in 1:Nz, ix in 1:Nx, iy in 1:Ny ]
+    @test maximum(abs.(cr.s_P .- sref)) < 1e-12 * maximum(abs.(sref))
+end
 
-Pbefore = copy(fr.P)
-dyrel3d_update_pressure!(cr, fr; ω = 0.8)
-expect = Pbefore[2:end-1, 2:end-1, 2:end-1] .+ 0.8 .* cr.γ_eff .* cr.R_P
-maximum(abs.(fr.P[2:end-1, 2:end-1, 2:end-1] .- expect)) < 1e-13 || error("FAIL P update interior")
-fr.P[2:end-1, 2:end-1, 2:end-1] .= Pbefore[2:end-1, 2:end-1, 2:end-1]
-fr.P ≈ Pbefore || error("FAIL P update touched the ghost ring")
-println("OK  P += ω·γ_eff·R_P  (interior only, ghosts untouched)")
-
-println("\nAll 3-D Schur-complement kernel checks passed.")
+@testset "P += ω·γ_eff·R_P touches the interior only" begin
+    Pbefore = copy(fr.P)
+    dyrel3d_update_pressure!(cr, fr; ω = 0.8)
+    expect = Pbefore[2:end-1, 2:end-1, 2:end-1] .+ 0.8 .* cr.γ_eff .* cr.R_P
+    @test maximum(abs.(fr.P[2:end-1, 2:end-1, 2:end-1] .- expect)) < 1e-13
+    fr.P[2:end-1, 2:end-1, 2:end-1] .= Pbefore[2:end-1, 2:end-1, 2:end-1]
+    @test fr.P ≈ Pbefore
+end

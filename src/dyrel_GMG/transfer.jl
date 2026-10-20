@@ -9,12 +9,15 @@
 #   u (x-face) : (Nz,   Nx+1) → (Nz_c,   Nx_c+1)
 #
 # BCs in the prolongation ghosts: periodic in x, "closed" (linear extrapolation)
-# in z — matching `dyrel_apply_*_bcs!`. Ported from the MATLAB restrict_*/prolong_*.
+# in z — matching `dyrel_apply_*_bcs!`.
 
 # ============================================================================
 # RESTRICTION  (fine → coarse)
 # ============================================================================
 
+# Cell fields (η, ρ) restrict as a plain arithmetic 2x2 mean. Geometric and
+# harmonic means were both measured to contract more slowly on a high-η-contrast
+# state, and to diverge where the arithmetic mean still converges.
 @kernel function restrict_p_kernel!(coarse, @Const(fine))
     J, I = @index(Global, NTuple)
     @inbounds begin
@@ -64,20 +67,24 @@ function restrict_u!(coarse, fine)
 end
 
 # ============================================================================
-# PROLONGATION  (coarse → fine), bilinear with periodic-x / closed-z ghosts.
+# PROLONGATION  (coarse → fine), bilinear with periodic-or-wall x and closed-z ghosts.
 # Each fine point reads coarse values via index arithmetic; BC-aware neighbour
 # lookups are done inline (periodic wrap in x, clamp+extrapolate in z).
 # ============================================================================
 
 # periodic-x coarse column index
 @inline _wrapx(I, Nxc) = I < 1 ? Nxc : (I > Nxc ? 1 : I)
-# closed-z: clamp the coarse row (boundary uses nearest; extrapolation handled by
-# the 3/4–1/4 weighting falling back to the edge cell)
+# solid-wall x: the ghost column repeats the edge column, so clamping to the
+# edge IS the ghost value for cell-centred fields (Neumann, as
+# `dyrel_apply_pressure_bcs!` fills it).
+@inline _clampx(I, Nxc) = I < 1 ? 1 : (I > Nxc ? Nxc : I)
+# closed-z for cell-centred p: the z-ghost repeats the boundary cell (Neumann,
+# `dyrel_apply_pressure_bcs!`), so clamping to the edge row IS the ghost value.
 @inline _clampz(J, Nzc) = J < 1 ? 1 : (J > Nzc ? Nzc : J)
 
 # --- p (cell): tensor-product {1/4,3/4} bilinear. Fine cell (jf,iff) maps to a
 # coarse cell plus the neighbour toward its half of that cell. ---
-@kernel function prolong_p_kernel!(fine, @Const(coarse))
+@kernel function prolong_p_kernel!(fine, @Const(coarse), periodic)
     jf, iff = @index(Global, NTuple)
     @inbounds begin
         Nzc, Nxc = size(coarse)
@@ -90,7 +97,7 @@ end
         xlow = isodd(iff)
         Jn = zlow ? Jc - 1 : Jc + 1
         In = xlow ? Ic - 1 : Ic + 1
-        Jn = _clampz(Jn, Nzc);  In = _wrapx(In, Nxc)
+        Jn = _clampz(Jn, Nzc);  In = periodic ? _wrapx(In, Nxc) : _clampx(In, Nxc)
         wz_self = T(0.75);  wz_nb = T(0.25)
         wx_self = T(0.75);  wx_nb = T(0.25)
         fine[jf, iff] =
@@ -103,16 +110,25 @@ end
 
 # --- w (z-face): coarse z-faces coincide with odd fine z-faces. Even fine
 # z-faces interpolate between two coarse z-faces. x uses {1/4,3/4}. ---
-@kernel function prolong_w_kernel!(fine, @Const(coarse))
+@kernel function prolong_w_kernel!(fine, @Const(coarse), periodic, sds)
     jf, iff = @index(Global, NTuple)
     @inbounds begin
         Nzc1, Nxc = size(coarse)        # coarse is (Nz_c+1, Nx_c)
         T = eltype(fine)
         Ic = (iff + 1) ÷ 2
         xlow = isodd(iff)
-        In = xlow ? Ic - 1 : Ic + 1
-        In = _wrapx(In, Nxc)
-        wx_self = T(0.75);  wx_nb = T(0.25)
+        Ir = xlow ? Ic - 1 : Ic + 1     # raw neighbour column, may be a ghost
+        sgn = one(T)
+        if periodic
+            In = _wrapx(Ir, Nxc)
+        elseif Ir < 1
+            In = 1;    sgn = -T(sds)
+        elseif Ir > Nxc
+            In = Nxc;  sgn = -T(sds)
+        else
+            In = Ir
+        end
+        wx_self = T(0.75);  wx_nb = T(0.25) * sgn
         if isodd(jf)                    # coincides with coarse face Jc=(jf+1)/2
             Jc = (jf + 1) ÷ 2
             fine[jf, iff] = wx_self * coarse[Jc, Ic] + wx_nb * coarse[Jc, In]
@@ -126,17 +142,28 @@ end
 end
 
 # --- u (x-face): mirror of w with z↔x. Coarse x-faces coincide with odd fine
-# x-faces; even fine x-faces interpolate between two coarse x-faces; z {1/4,3/4}. ---
-@kernel function prolong_u_kernel!(fine, @Const(coarse))
+# x-faces; even fine x-faces interpolate between two coarse x-faces; z {1/4,3/4}.
+# The z-neighbour of a boundary row is a ghost, and U's z-ghost is
+# `U[0] = -cnv·U[1]` (`_dyrel_vbc_rows_kernel!`): free-slip (cnv = -1) mirrors,
+# no-slip (cnv = +1) reflects with a sign flip. `sgn` carries that factor, so the
+# prolongation honours the same BC the smoother enforces. ---
+@kernel function prolong_u_kernel!(fine, @Const(coarse), top_cnv, bot_cnv)
     jf, iff = @index(Global, NTuple)
     @inbounds begin
         Nzc, Nxc1 = size(coarse)        # coarse is (Nz_c, Nx_c+1)
         T = eltype(fine)
         Jc = (jf + 1) ÷ 2
         zlow = isodd(jf)
-        Jn = zlow ? Jc - 1 : Jc + 1
-        Jn = _clampz(Jn, Nzc)
-        wz_self = T(0.75);  wz_nb = T(0.25)
+        Jr = zlow ? Jc - 1 : Jc + 1     # raw neighbour row, may be a ghost
+        sgn = one(T)
+        if Jr < 1
+            Jn = 1;    sgn = -T(top_cnv)
+        elseif Jr > Nzc
+            Jn = Nzc;  sgn = -T(bot_cnv)
+        else
+            Jn = Jr
+        end
+        wz_self = T(0.75);  wz_nb = T(0.25) * sgn
         if isodd(iff)
             Ic = (iff + 1) ÷ 2
             fine[jf, iff] = wz_self * coarse[Jc, Ic] + wz_nb * coarse[Jn, Ic]
@@ -149,18 +176,21 @@ end
     end
 end
 
-function prolong_p!(fine, coarse)
+function prolong_p!(fine, coarse; xBC::Symbol = :periodic)
     backend = KernelAbstractions.get_backend(fine)
-    prolong_p_kernel!(backend)(fine, coarse; ndrange = size(fine))
+    prolong_p_kernel!(backend)(fine, coarse, xBC === :periodic; ndrange = size(fine))
     return fine
 end
-function prolong_w!(fine, coarse)
+function prolong_w!(fine, coarse; xBC::Symbol = :periodic, sds::Integer = -1)
     backend = KernelAbstractions.get_backend(fine)
-    prolong_w_kernel!(backend)(fine, coarse; ndrange = size(fine))
+    T = eltype(fine)
+    prolong_w_kernel!(backend)(fine, coarse, xBC === :periodic, T(sds);
+                               ndrange = size(fine))
     return fine
 end
-function prolong_u!(fine, coarse)
+function prolong_u!(fine, coarse; top_cnv, bot_cnv)
     backend = KernelAbstractions.get_backend(fine)
-    prolong_u_kernel!(backend)(fine, coarse; ndrange = size(fine))
+    T = eltype(fine)
+    prolong_u_kernel!(backend)(fine, coarse, T(top_cnv), T(bot_cnv); ndrange = size(fine))
     return fine
 end

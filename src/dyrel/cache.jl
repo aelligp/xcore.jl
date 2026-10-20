@@ -17,6 +17,19 @@
 # `FluidState.U` (= U[2:end-1, :]). The full halo'd W/U fields live on
 # `FluidState`; the cache only holds what DYREL needs to update each iter.
 
+# Anderson-acceleration history of the Powell-Hestenes multiplier iteration
+# (see `_anderson_pressure_update!`). Arrays are cell-centred (Nz, Nx) and are
+# allocated on first use, so a cache that never accelerates holds none.
+mutable struct AndersonPH{T<:AbstractFloat, A<:AbstractMatrix{T}}
+    prev::Vector{A}     # [pressure, update] of the previous sweep
+    dX::Vector{A}       # pressure differences, ring buffer of depth m
+    dF::Vector{A}       # update differences, same slots as dX
+    n::Int              # valid history columns
+    slot::Int           # last column written
+    have_prev::Bool     # `prev` holds the previous sweep
+end
+AndersonPH{T,A}() where {T,A} = AndersonPH{T,A}(A[], A[], A[], 0, 0, false)
+
 mutable struct DyrelCache{T<:AbstractFloat, A<:AbstractMatrix{T}}
     # one-time setup flag; bumped to true once init_dyrel! completes
     initialized::Bool
@@ -64,8 +77,16 @@ mutable struct DyrelCache{T<:AbstractFloat, A<:AbstractMatrix{T}}
     # the homogeneous error equation A·e = bext.
     bext_W::A;  bext_U::A;  bext_P::A
 
+    # Previous-iterate viscosity for the in-solve rheology refresh (see
+    # `update_viscosity!`'s `relaxation` continuation). Held here so the refresh
+    # does not allocate once per retune.
+    eta_prev::A
+
+    anderson::AndersonPH{T,A}
+
     # ---- Global scalars (boxed in Refs to keep struct fully-typed) ---------
     c::Base.RefValue{T}              # damping; updated by Rayleigh quotient
+    γfact::Base.RefValue{T}          # augmented-Lagrangian factor learned by the last solve (0 = use par.γfact_PT)
     last_PH_iters::Base.RefValue{Int}  # diagnostic counter
     last_DR_iters::Base.RefValue{Int}  # diagnostic counter
 end
@@ -94,7 +115,9 @@ function DyrelCache(::Type{T}, backend, Nz::Integer, Nx::Integer) where {T<:Abst
         z(Nz, Nx),  z(Nz, Nx),  z(Nz, Nx),                              # R_P, P_num, s_P
         z(max(Nz - 1, 1), Nx),  z(Nz, nxf),                             # advn_mz, advn_mx
         z(nzf, Nx), z(Nz, nxf), z(Nz, Nx),                              # bext_W, bext_U, bext_P
-        Ref(zero(T)),  Ref(0),  Ref(0),                                 # c, counters
+        z(Nz, Nx),                                                      # eta_prev
+        AndersonPH{T, AT}(),
+        Ref(zero(T)),  Ref(zero(T)),  Ref(0),  Ref(0),                  # c, γfact, counters
     )
 end
 

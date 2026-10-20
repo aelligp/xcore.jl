@@ -17,6 +17,7 @@ using KernelAbstractions: CPU
     include("test_diagnose.jl")
     include("test_run.jl")
     include("test_dyrel.jl")
+    include("test_gmg_direct.jl")
     include("test_state3d.jl")
     include("test_schur3d.jl")
 end

@@ -314,18 +314,29 @@ end
 end
 
 """
-    update_viscosity!(phase, fluid, grid, par, scales) -> nothing
+    update_viscosity!(phase, fluid, grid, par, scales; xBC=:periodic, zBC=:closed,
+                      relaxation = 1//2, eta_prev = nothing) -> nothing
 
-Blend `etamix + etae` into `eta` with 50/50 Picard relaxation (matching
-`update.m`'s `eta = (etai + eta)/2`). Computes `ke`, `kx`, `ReL`, `ReD`,
-`fReL` along the way.
+Blend `etamix + etae` into `eta` by the linear continuation
+`eta = relaxation*etai + (1 - relaxation)*eta_old`. Computes `ke`, `kx`, `ReL`,
+`ReD`, `fReL` along the way.
+
+`relaxation` must match how often the caller applies it: once per Picard sweep
+wants a large step (`1//2`, the `update.m` blend), whereas a refresh inside the
+DYREL iteration is applied many times per solve and needs a proportionally
+smaller one. `eta_prev` supplies scratch for the previous iterate so a repeated
+in-solve refresh does not allocate.
 """
 function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
                            grid::Grid{T}, par::Parameters{T},
-                           scales::Scales{T}) where {T<:AbstractFloat}
+                           scales::Scales{T};
+                           xBC::Symbol = :periodic,
+                           zBC::Symbol = :closed,
+                           relaxation::Real = T(1//2),
+                           eta_prev::Union{Nothing,AbstractMatrix{T}} = nothing) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.etamix)
     # copy current eta as the "previous" iterate, write uncapped etai into fluid.eta
-    eta_prev = copy(fluid.eta)
+    eta_prev = eta_prev === nothing ? copy(fluid.eta) : copyto!(eta_prev, fluid.eta)
     compute_viscblend_kernel!(backend)(fluid.eta, phase.etae, phase.ke, phase.kx,
                                           phase.ReL, phase.fReL,
                                           phase.etamix, phase.eII, fluid.rho, phase.V,
@@ -336,15 +347,17 @@ function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
     # global contrast cap: etamax = min(etai) * etacntr, then harmonic-blend (update.m:118-120)
     emax = minimum(fluid.eta) * T(par.etacntr)
     @. fluid.eta = T(1) / (T(1) / emax + T(1) / fluid.eta)
-    # Picard relaxation against the previous iterate (update.m:126)
-    blend_w = T(0.5)
+    # linear continuation against the previous iterate (update.m:126)
+    blend_w = T(relaxation)
     @. fluid.eta = blend_w * fluid.eta + (T(1) - blend_w) * eta_prev
     # ReD uses the capped+blended eta
     @. phase.ReD = phase.V * scales.D0 / (fluid.eta / fluid.rho)
 
     # corner-interpolated etaco from the geometric mean over 4 surrounding cells
-    # (matches update.m line 130). Mirror-pad in z for closed BC; periodic in x.
-    compute_corner_eta!(fluid.etaco, fluid.eta; xBC = :periodic, zBC = :closed)
+    # (matches update.m line 130). The ghost extension must match the one
+    # `update_interpolations!` uses for the face densities: wrapping the x-ghost of
+    # a walled domain averages in the viscosity of the opposite wall.
+    compute_corner_eta!(fluid.etaco, fluid.eta; xBC, zBC)
     return nothing
 end
 
@@ -537,7 +550,7 @@ function update!(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
     update_pressure!(phase, fluid, grid, par)
     update_rheology!(phase, par)
     update_kinematics!(phase, fluid, grid)
-    update_viscosity!(phase, fluid, grid, par, scales)
+    update_viscosity!(phase, fluid, grid, par, scales; xBC, zBC)
     update_segregation_viscosity!(phase, fluid, par, scales; zBC)
     update_stresses!(phase, fluid, grid, scales)
     return nothing

@@ -15,7 +15,7 @@ be = xcore_backend()
 # ---------------------------------------------------------------------------
 
 par = Parameters(Float64;
-    runID   = "D1_dm2_e1_N512_gmg",
+    runID   = "D1_dm2_e1_N1024_vmg",
     outdir  = joinpath(@__DIR__, "..", "out"),
     save_op = true,
     nop     = 10,          # save figures every nop steps
@@ -24,7 +24,7 @@ par = Parameters(Float64;
 
     # domain
     D  = 1e1,
-    N  = 256,
+    N  = 1024,
     L  = 1e1 * 1.5,         # 1.5 × D
 
     # timing
@@ -38,7 +38,7 @@ par = Parameters(Float64;
     Da    = 0.01,
     Xi    = 0.5,
 
-    solver= :gmg,           # :direct (sparse-LU) | :dyrel (pseudo-transient) | :gmg (geometric MG)
+    solver= :vmg,           # :direct (sparse-LU) | :dyrel (pseudo-transient) | :gmg (geometric MG) | :vmg (velocity MG + Cahouet–Chabard) | :gmg_direct (assembled, AMG-FGMRES)
     atol = 1e-6,                # Picard convergence tolerance (nonlinear residual)
     # maxit_PH       = 100,                # outer Powell-Hestenes iterations
     # maxit_PT       = 50000,            # inner Dynamic-Relaxation iterations per PH step

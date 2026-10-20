@@ -8,7 +8,9 @@
 #
 # Usage:  julia --project=. usr/run_gmg_harness.jl
 # Tweak `Ns` / `configs(N)` below. Acceptance for a good smoother config:
-# ρ ≤ ~0.5, flat in N and in hierarchy depth (mg_minlvl sweep).
+# ρ ≤ ~0.5, flat in N and in hierarchy depth (mg_minlvl sweep). Set
+# `atol = 1e-6` (the production value) rather than 1e-4: at 1e-4 the solve stops
+# after 2-3 cycles, too few for a meaningful contraction factor.
 
 using xcore
 using KernelAbstractions: CPU
@@ -25,11 +27,14 @@ base_par(N; kw...) = Parameters(Float64;
 
 """
 Build the frozen probe state for resolution N. `evolve_steps > 0` advances the
-state by that many full time steps with the (stable) single-grid `:dyrel`
-solver at γfact_PT=500 first — the production GMG failure appears only on
-EVOLVED states (developed η contrast), so tuning against the pristine IC state
-is not sufficient (measured: IC-state ρ≈0.10 for the config that NaNs in
-production at Picard iter 3).
+state by that many full time steps with the single-grid `:dyrel` solver at
+γfact_PT=500 first.
+
+At these parameters η stays within 10.0–10.9 however far the state is evolved,
+so `evolve_steps` does NOT sweep the viscosity contrast — it only changes the
+velocity/pressure field the V-cycle starts from. To probe the contrast axis,
+build a synthetic η field instead (see the contrast testset in
+`test/test_dyrel.jl`).
 """
 function build_state(N; evolve_steps::Int = 0)
     par    = base_par(N; solver = :dyrel, γfact_PT = 500.0)
@@ -53,23 +58,13 @@ function probe(base, par)
     fc = deepcopy(base.fluid)
     pc = deepcopy(base.phase)
     hier = xcore.GMG.build_hierarchy(fc, pc, base.grid, par)
-    logf = tempname()
-    local st, wall
-    open(logf, "w") do io
-        redirect_stdout(io) do
-            wall = @elapsed st = xcore.GMG.fluidmech_gmg!(
-                fc, pc, hier, base.grid, par, base.scales;
-                dt = base.dt0, a1 = 1, a2 = 1, a3 = 0, verbose = true)
-        end
-    end
-    errs = Float64[]
-    for ln in eachline(logf)
-        m = match(r"err=([0-9.eE+\-]+|NaN|Inf)", ln)
-        m === nothing || push!(errs, parse(Float64, m.captures[1]))
-    end
+    wall = @elapsed st = xcore.GMG.fluidmech_gmg!(
+        fc, pc, hier, base.grid, par, base.scales;
+        dt = base.dt0, a1 = 1, a2 = 1, a3 = 0)
+    errs = st.errs
     ρ = length(errs) ≥ 3 && errs[1] > 0 && isfinite(errs[end]) ?
         (errs[end] / errs[1])^(1 / (length(errs) - 1)) : NaN
-    return (; ncyc = st.ncyc, ρ, errs, wall, conv = st.converged,
+    return (; st.ncyc, ρ, errs, wall, conv = st.converged,
               nlev = length(hier.levels))
 end
 

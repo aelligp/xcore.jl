@@ -15,6 +15,17 @@ using Statistics
 # include the field. Helpers (`_compute_nzmap`, `_scatter!`) are defined below.
 
 """
+    _mround(x) -> Int
+
+Round half away from zero, as MATLAB's `round` does. `round(Int, x)` rounds half
+to even, which picks a different cell than `fluidmech.m` whenever the argument
+lands exactly on a half — `(N+2)/2` at odd `N`, `(N+2)*3/8` at `N = 10, 18, 26, …`
+— so the MMS pins would sit elsewhere and the manufactured-solution comparison
+would not be against the same discrete problem.
+"""
+_mround(x::Real) = floor(Int, x + 1//2)
+
+"""
     _compute_nzmap(I, J, M) -> Vector{Int}
 
 For each triplet `k`, return the linear index into `M.nzval` where
@@ -119,9 +130,11 @@ the manufactured-solution branch is taken: RHS gains `src_*` forcing and one
 `P` and one `U` cell are pinned to the exact solution values.
 
 Boundary flags follow the MATLAB convention:
-* `sds == -1` (default) → periodic in x for the velocity equations.
-* `top_cnv`, `bot_cnv` ∈ {-1, +1} encode free-slip (-1) vs no-slip (+1) at
-  top/bottom z-boundaries for the x-velocity equation.
+* `xBC` selects the side boundaries: `:periodic` wraps left onto right,
+  anything else makes them solid walls.
+* `sds`, `top_cnv`, `bot_cnv` ∈ {-1, +1} encode free-slip (-1) vs no-slip (+1)
+  on the sides and on the top/bottom z-boundaries. `sds` must be `-1` under
+  `xBC = :periodic`, where it carries the wrap instead.
 * `open_cnv = true` opens the bottom z-boundary for the z-velocity equation.
 
 Time-integration coefficients `a1, a2, a3` come from `src/timing.m`. In MMS
@@ -137,6 +150,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
                     dt::Real = T(1e32),
                     a1::Real = T(1), a2::Real = T(1), a3::Real = T(0),
                     b1::Real = T(1), b2::Real = T(0), b3::Real = T(0),
+                    mg = nothing,
                     verbose = false) where {T<:AbstractFloat}
     bnchm = bnchm_data !== nothing
     Nz = grid.Nz;  Nx = grid.Nx;  h = grid.h
@@ -146,7 +160,8 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     # ---------------- solver cache (built lazily on first call) -------------
     cache = state.solver
     # Invalidate if grid size or MMS flag changed (different sparsity).
-    if cache.initialized && (cache.sig_Nz != Nz || cache.sig_Nx != Nx || cache.sig_bnchm != bnchm)
+    if cache.initialized && (cache.sig_Nz != Nz || cache.sig_Nx != Nx ||
+                             cache.sig_bnchm != bnchm || cache.sig_xBC != xBC)
         cache.initialized = false
         cache.LL_initialized = false
         cache.lu_F = nothing
@@ -188,10 +203,16 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     MFSmean = T(mean(MFS))
 
 
-    # ghost-index arrays — periodic-x always; periodic-z when `bnchm` (per
+    # Side-boundary mode. With `xBC = :periodic` the left and right boundaries
+    # wrap onto each other; otherwise they are solid walls whose slip is set by
+    # `sds` (−1 free slip, +1 no slip). The two cases differ in which column a
+    # boundary row couples to, in the x-extent of the U equations, and in
+    # whether the x-neighbour indices wrap — see the branches below.
+    periodic = xBC === :periodic
+
+    # ghost-index arrays — periodic-x wrap; periodic-z when `bnchm` (per
     # mms.m), reflect otherwise.
-    icx = [Nx; collect(1:Nx); 1]
-    icz = bnchm ? [Nz; collect(1:Nz); 1] : [1; collect(1:Nz); Nz]
+    icx = periodic ? [Nx; collect(1:Nx); 1] : [1; collect(1:Nx); Nx]
     ifx = [Nx; collect(1:(Nx+1)); 2]
 
     # ----------------- z-stress divergence block (KV rows for W eqns) -------
@@ -203,10 +224,13 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
 
     ## Assemble coefficients of the z-stess divergence
 
-    # left boundary (i = 1, all rows): W[:,1] + sds * W[:,end-1] = 0
+    # left boundary (i = 1, all rows): W[:,1] + sds * W[:,j] = 0. Periodic pairs
+    # the ghost column with the far interior column; a solid wall pairs it with
+    # its own neighbour, so sds = −1 gives ∂ₓW = 0 (free slip) and sds = +1
+    # gives W = 0 on the wall (no slip).
     let ii  = vec(MapW[:, 1]),
         jj1 = ii,
-        jj2 = vec(MapW[:, end - 1]),
+        jj2 = periodic ? vec(MapW[:, end - 1]) : vec(MapW[:, 2]),
         aa   = length(ii)
         append!(IIL, ii); append!(JJL, jj1); append!(AAL, fill(T(1),   aa))
         append!(IIL, ii); append!(JJL, jj2); append!(AAL, fill(T(sds), aa))
@@ -215,7 +239,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     # right boundary (i = Nx+2)
     let ii  = vec(MapW[:, end]),
         jj1 = vec(MapW[:, end]),
-        jj2 = vec(MapW[:, 2]),
+        jj2 = periodic ? vec(MapW[:, 2]) : vec(MapW[:, end - 1]),
         aa   = length(ii)
         append!(IIL, ii); append!(JJL, jj1); append!(AAL, fill(T(1),   aa))
         append!(IIL, ii); append!(JJL, jj2); append!(AAL, fill(T(sds), aa))
@@ -327,21 +351,41 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIR, ii); append!(AAR, zeros(T, n))
     end
 
+    # left & right walls: U is the wall-normal velocity, pinned to zero. These
+    # rows exist only for solid walls; under periodic-x the outermost x-faces
+    # are interior faces carrying the full stencil below.
+    if !periodic
+        let ii = vcat(vec(MapU[2:end-1, 1]), vec(MapU[2:end-1, end])),
+            aa  = length(ii)
+            append!(IIL, ii); append!(JJL, ii); append!(AAL, fill(T(1), aa))
+            append!(IIR, ii); append!(AAR, zeros(T, aa))
+        end
+    end
+
     # internal points
     @timeit_debug TO "assemble:stencils" let
-        EtaC1 = vec(etaco[1:end-1, :]);        EtaC2 = vec(etaco[2:end, :])
-        EtaP1 = vec(eta[:, icx[1:end-1]]);     EtaP2 = vec(eta[:, icx[2:end]])
-        ii    = vec(MapU[2:end-1, :])          # row index — needed every sweep for the RHS
+        # Solid walls drop the outermost x-faces from the equation set (they are
+        # Dirichlet rows above), so every x-indexed slice narrows by one column
+        # on each side and the neighbour indices no longer wrap.
+        EtaC1 = periodic ? vec(etaco[1:end-1, :])    : vec(etaco[1:end-1, 2:end-1])
+        EtaC2 = periodic ? vec(etaco[2:end, :])      : vec(etaco[2:end, 2:end-1])
+        EtaP1 = periodic ? vec(eta[:, icx[1:end-1]]) : vec(eta[:, 1:end-1])
+        EtaP2 = periodic ? vec(eta[:, icx[2:end]])   : vec(eta[:, 2:end])
+        ii    = periodic ? vec(MapU[2:end-1, :]) : vec(MapU[2:end-1, 2:end-1])
+        rhou_i = periodic ? rhou : rhou[:, 2:end-1]
 
-        # coefficient VALUES (every sweep, fixed band order)
-        append!(AAL, vec((a1 + gamma) .* rhou ./ T(dt)))                                # 1 inertial  (ii,ii)
+        # coefficient VALUES (every sweep, fixed band order). γ is the artificial
+        # horizontal inertia, defined only for periodic sides.
+        append!(AAL, vec((a1 + (periodic ? gamma : zero(gamma))) .* rhou_i ./ T(dt)))    # 1 inertial  (ii,ii)
         append!(AAL, T(2/3).*(EtaP1.+EtaP2).*invh2 .+ T(1/2).*(EtaC1.+EtaC2).*invh2)    # 2 center    (ii,ii)
         append!(AAL, -T(2/3) .* EtaP1 .* invh2)                                         # 3 left      (ii,jj1)
         append!(AAL, -T(2/3) .* EtaP2 .* invh2)                                         # 4 right     (ii,jj2)
         append!(AAL, -T(1/2) .* EtaC1 .* invh2)                                         # 5 top       (ii,jj3)
         append!(AAL, -T(1/2) .* EtaC2 .* invh2)                                         # 6 bottom    (ii,jj4)
         if !bnchm                                                                        # 7 drunken   (ii,ii)
-            append!(AAL, vec((rho[:, icx[2:end]] .- rho[:, icx[1:end-1]]) .* invh) .* g0 .* T(dt))
+            ddx_rho = periodic ? (rho[:, icx[2:end]] .- rho[:, icx[1:end-1]]) :
+                                 (rho[:, 2:end] .- rho[:, 1:end-1])
+            append!(AAL, vec(ddx_rho .* invh) .* g0 .* T(dt))
         end
         append!(AAL, -(T(1/2).*EtaC1 .- T(1/3).*EtaP1) .* invh2)                        # 8  Wtl (ii,jW1)
         append!(AAL, +(T(1/2).*EtaC1 .- T(1/3).*EtaP2) .* invh2)                        # 9  Wtr (ii,jW2)
@@ -350,10 +394,14 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
 
         # INDEX bands (first call only — identical band order to the values)
         if !cache.initialized
-            jj1 = vec(MapU[2:end-1, ifx[1:end-2]]); jj2 = vec(MapU[2:end-1, ifx[3:end]])
-            jj3 = vec(MapU[1:end-2, ifx[2:end-1]]); jj4 = vec(MapU[3:end, ifx[2:end-1]])
-            jW1 = vec(MapW[1:end-1, 1:end-1]); jW2 = vec(MapW[1:end-1, 2:end])
-            jW3 = vec(MapW[2:end, 1:end-1]);   jW4 = vec(MapW[2:end, 2:end])
+            jj1 = periodic ? vec(MapU[2:end-1, ifx[1:end-2]]) : vec(MapU[2:end-1, 1:end-2])
+            jj2 = periodic ? vec(MapU[2:end-1, ifx[3:end]])   : vec(MapU[2:end-1, 3:end])
+            jj3 = periodic ? vec(MapU[1:end-2, ifx[2:end-1]]) : vec(MapU[1:end-2, 2:end-1])
+            jj4 = periodic ? vec(MapU[3:end,   ifx[2:end-1]]) : vec(MapU[3:end,   2:end-1])
+            jW1 = periodic ? vec(MapW[1:end-1, 1:end-1]) : vec(MapW[1:end-1, 2:end-2])
+            jW2 = periodic ? vec(MapW[1:end-1, 2:end])   : vec(MapW[1:end-1, 3:end-1])
+            jW3 = periodic ? vec(MapW[2:end,   1:end-1]) : vec(MapW[2:end,   2:end-2])
+            jW4 = periodic ? vec(MapW[2:end,   2:end])   : vec(MapW[2:end,   3:end-1])
             append!(IIL, ii); append!(JJL, ii)                                # 1 inertial
             append!(IIL, ii); append!(JJL, ii)                                # 2 center
             append!(IIL, ii); append!(JJL, jj1)                               # 3 left
@@ -367,20 +415,33 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
             append!(IIL, ii); append!(JJL, jW4)                               # 11
         end
 
-        # x-momentum RHS (every sweep; reuses the cached advection out-buffer)
-        u_mx = (U[2:end-1, ifx[1:end-1]] .+ U[2:end-1, ifx[2:end]]) ./ T(2)
-        w_mx = (W[:, 1:end-1] .+ W[:, 2:end]) ./ T(2)
-        f_mx = rhou .* U[2:end-1, :]
+        # x-momentum RHS (every sweep; reuses the cached advection out-buffer).
+        # Under periodic-x the advected momentum spans all x-faces and the two
+        # periodic-equivalent boundary columns are averaged so they agree
+        # (fluidmech.m:164); with solid walls it spans only the interior faces.
+        if periodic
+            u_mx = (U[2:end-1, ifx[1:end-1]] .+ U[2:end-1, ifx[2:end]]) ./ T(2)
+            w_mx = (W[:, 1:end-1] .+ W[:, 2:end]) ./ T(2)
+            f_mx = rhou .* U[2:end-1, :]
+        else
+            u_mx = (U[2:end-1, 1:end-1] .+ U[2:end-1, 2:end]) ./ T(2)
+            w_mx = (W[:, 2:end-2] .+ W[:, 3:end-1]) ./ T(2)
+            f_mx = rhou[:, 2:end-1] .* U[2:end-1, 2:end-1]
+        end
         size(cache.advn_mx) == size(f_mx) || (cache.advn_mx = similar(f_mx))
         advn_mx = cache.advn_mx
         advect_centered!(advn_mx, f_mx, u_mx, w_mx, h, par.ADVN; xBC, zBC)
-        # average the periodic-equivalent boundary columns (fluidmech.m:164)
-        col_avg = (advn_mx[:, 1] .+ advn_mx[:, end]) ./ T(2)
-        advn_mx[:, 1]   .= col_avg
-        advn_mx[:, end] .= col_avg
-        rr = (a2 .* rhoUo .+ a3 .* rhoUoo) ./ T(dt) .- advn_mx
+        if periodic
+            col_avg = (advn_mx[:, 1] .+ advn_mx[:, end]) ./ T(2)
+            advn_mx[:, 1]   .= col_avg
+            advn_mx[:, end] .= col_avg
+        end
+        rr = periodic ?
+            (a2 .* rhoUo .+ a3 .* rhoUoo) ./ T(dt) .- advn_mx :
+            (a2 .* rhoUo[:, 2:end-1] .+ a3 .* rhoUoo[:, 2:end-1]) ./ T(dt) .- advn_mx
         if bnchm
-            rr .+= bnchm_data.src_U[2:end-1, :]
+            rr .+= periodic ? bnchm_data.src_U[2:end-1, :] :
+                              bnchm_data.src_U[2:end-1, 2:end-1]
         end
         append!(IIR, ii); append!(AAR, vec(rr))
     end
@@ -409,9 +470,9 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIL_g, ii); append!(JJL_g, jj1); append!(AAL_g, fill(-invh, aa))    # one to the top
         append!(IIL_g, ii); append!(JJL_g, jj2); append!(AAL_g, fill(+invh, aa))    # one to the bottom
     end
-    let ii  = vec(MapU[2:end-1, :]),        # coefficients for x-gradient
-        jj1 = vec(MapP[2:end-1, 1:end-1]),  # left
-        jj2 = vec(MapP[2:end-1, 2:end]),    # right
+    let ii  = periodic ? vec(MapU[2:end-1, :]) : vec(MapU[2:end-1, 2:end-1]),
+        jj1 = periodic ? vec(MapP[2:end-1, 1:end-1]) : vec(MapP[2:end-1, 2:end-2]),
+        jj2 = periodic ? vec(MapP[2:end-1, 2:end])   : vec(MapP[2:end-1, 3:end-1]),
         aa   = length(ii)
         append!(IIL_g, ii); append!(JJL_g, jj1); append!(AAL_g, fill(-invh, aa))    # one to the left
         append!(IIL_g, ii); append!(JJL_g, jj2); append!(AAL_g, fill(+invh, aa))    # one to the right
@@ -473,9 +534,11 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         append!(IIL_p, ii); append!(JJL_p, ii);  append!(AAL_p, fill(T(1),  aa))
         append!(IIL_p, ii); append!(JJL_p, jj2); append!(AAL_p, fill(T(-1), aa))
     end
-    # left & right cols
-    let ii  = vcat(vec(MapP[2:end-1, 1]),     vec(MapP[2:end-1, end])),
-        jj2 = vcat(vec(MapP[2:end-1, end-1]), vec(MapP[2:end-1, 2])),
+    # left & right cols: periodic wraps the ghost onto the far interior column,
+    # a solid wall repeats its own neighbour (Neumann).
+    let ii  = vcat(vec(MapP[2:end-1, 1]), vec(MapP[2:end-1, end])),
+        jj2 = periodic ? vcat(vec(MapP[2:end-1, end-1]), vec(MapP[2:end-1, 2])) :
+                         vcat(vec(MapP[2:end-1, 2]),     vec(MapP[2:end-1, end-1])),
         aa   = length(ii)
         append!(IIL_p, ii); append!(JJL_p, ii);  append!(AAL_p, fill(T(1),  aa))
         append!(IIL_p, ii); append!(JJL_p, jj2); append!(AAL_p, fill(T(-1), aa))
@@ -484,7 +547,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     # `KP[np0, np0] = T(1)` writes into an existing nzval slot instead of
     # restructuring KP — required for `_scatter!` reuse on later calls.
     if bnchm
-        nzp_pin = round(Int, (Nz + 2) * 3 / 8);  nxp_pin = round(Int, (Nx + 2) / 2)
+        nzp_pin = _mround((Nz + 2) * 3 / 8);  nxp_pin = _mround((Nx + 2) / 2)
         push!(IIL_p, MapP[nzp_pin, nxp_pin])
         push!(JJL_p, MapP[nzp_pin, nxp_pin])
         push!(AAL_p, zero(T))
@@ -493,7 +556,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
             push!(IIL_p, np0); push!(JJL_p, np0); push!(AAL_p, zero(T))
         end
     else
-        np0 = MapP[round(Int, Nz / 2), round(Int, Nx / 2)]
+        np0 = MapP[_mround(Nz / 2), _mround(Nx / 2)]
         push!(IIL_p, np0); push!(JJL_p, np0); push!(AAL_p, zero(T))
     end
     @timeit_debug TO "assemble:build" if cache.initialized
@@ -505,7 +568,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         cache.nz_KP = _compute_nzmap(IIL_p, JJL_p, KP)
         # mark cache initialized after all four block patterns are built
         cache.initialized = true
-        cache.sig_Nz = Nz;  cache.sig_Nx = Nx;  cache.sig_bnchm = bnchm
+        cache.sig_Nz = Nz;  cache.sig_Nx = Nx;  cache.sig_bnchm = bnchm;  cache.sig_xBC = xBC
     end
 
     # RHS for pressure: mass-flux source
@@ -525,7 +588,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
 
     # ----------------- pin one P (and one U in MMS) -------------------------
     if bnchm
-        nzp = round(Int, (Nz + 2) * 3 / 8);  nxp = round(Int, (Nx + 2) / 2)
+        nzp = _mround((Nz + 2) * 3 / 8);  nxp = _mround((Nx + 2) / 2)
         np0 = MapP[nzp, nxp]
         _zero_row!(KP, np0);
         KP[np0, np0] = T(1);
@@ -533,7 +596,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         RP_vec[np0] = bnchm_data.P_exact[nzp, nxp];
         RP = sparsevec(1:NP, RP_vec, NP)
 
-        nzu = round(Int, (Nz + 2) / 2);  nxu = round(Int, (Nx + 2) / 2)
+        nzu = _mround((Nz + 2) / 2);  nxu = _mround((Nx + 2) / 2)
         nu0 = MapU[nzu, nxu]
         _zero_row!(KV, nu0);  KV[nu0, nu0] = T(1)
         _zero_row!(GG, nu0)
@@ -543,7 +606,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         if open_cnv
             nzp = Nz + 1;  nxp = 1:(Nx + 2)
         else
-            nzp = round(Int, Nz / 2);  nxp = [round(Int, Nx / 2)]
+            nzp = _mround(Nz / 2);  nxp = [_mround(Nx / 2)]
         end
         np0s = vec(MapP[nzp, nxp])
         for np0 in np0s
@@ -597,20 +660,36 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
     # \ needs a dense RHS, so collect.
     FF::Vector{T} = @timeit_debug TO "scale" collect(scl .* (LL * SOL .- Vector(RR)))
 
-    # UMFPACK numeric-refactor reuse: keep one UmfpackLU instance, refactor
-    # in-place via `lu!(F, LLs)` on subsequent calls (symbolic stays valid
-    # because LLs has the same sparsity each call).
-    @timeit_debug TO "factor" if cache.lu_F === nothing
-        cache.lu_F = lu(LLs)
+    if mg !== nothing
+        # `mg` (a DirectMGSolver) replaces the LU solve by AMG-preconditioned
+        # FGMRES; it needs the inertial part of the momentum diagonal, scaled
+        # like LLs.
+        iiW    = vec(MapW[2:end-1, 2:end-1])
+        iiU    = periodic ? vec(MapU[2:end-1, :]) : vec(MapU[2:end-1, 2:end-1])
+        rhou_i = periodic ? rhou : rhou[:, 2:end-1]
+        minert = zeros(T, NW + NU)
+        minert[iiW] .= T(a1) .* vec(rhow[2:end-1, :]) ./ T(dt)
+        minert[iiU] .= (T(a1) + (periodic ? T(gamma) : zero(T))) .* vec(rhou_i) ./ T(dt)
+        minert .*= view(scl, 1:(NW + NU)) .^ 2
+        UPD_perm, mg.stats = @timeit_debug TO "solve" direct_mg_solve(
+            LLs, FF, NW + NU, minert, [iiW, iiU], vec(MapP[2:end-1, 2:end-1]);
+            rtol = mg.rtol, itmax = mg.itmax)
     else
-        try
-            lu!(cache.lu_F, LLs)
-        catch err
-            err isa SparseArrays.UMFPACK.UMFPACKException || rethrow()
+        # UMFPACK numeric-refactor reuse: keep one UmfpackLU instance, refactor
+        # in-place via `lu!(F, LLs)` on subsequent calls (symbolic stays valid
+        # because LLs has the same sparsity each call).
+        @timeit_debug TO "factor" if cache.lu_F === nothing
             cache.lu_F = lu(LLs)
+        else
+            try
+                lu!(cache.lu_F, LLs)
+            catch err
+                err isa SparseArrays.UMFPACK.UMFPACKException || rethrow()
+                cache.lu_F = lu(LLs)
+            end
         end
+        UPD_perm = @timeit_debug TO "solve" cache.lu_F \ FF
     end
-    UPD_perm = @timeit_debug TO "solve" cache.lu_F \ FF
     UPD      = scl .* UPD_perm
 
     # decode update (matching MATLAB sign convention)

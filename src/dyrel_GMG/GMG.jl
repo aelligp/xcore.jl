@@ -16,10 +16,11 @@ using KernelAbstractions
 using LinearAlgebra
 using Statistics
 using Printf
+using TimerOutputs: @timeit_debug
 
 # State types + the single-grid DYREL solver kernels from the parent module.
 # Nothing below is duplicated: both solvers run the same operator.
-using ..xcore: Grid, Parameters, Scales, FluidState, PhaseState,
+using ..xcore: TO, Grid, Parameters, Scales, FluidState, PhaseState,
                xcore_zeros, adapt_backend, advect_centered!, compute_corner_eta!,
                DyrelCache, compute_AL_penalty!, gershgorin!,
                update_dτ_α_β!, dyrel_momentum_advection!,
@@ -27,7 +28,8 @@ using ..xcore: Grid, Parameters, Scales, FluidState, PhaseState,
                dyrel_apply_velocity_bcs!, dyrel_apply_pressure_bcs!,
                dyrel_apply_pressure_gauge!,
                dyrel_residual_norms, dyrel_velocity_residual_norm,
-               dyrel_rayleigh_λmin,
+               dyrel_rayleigh_λmin, _check_dyrel_preconditioner,
+               ρ_want, γ_win_width, γ_max_retunes, γ_max_growth,
                compute_dyrel_residual_W_kernel!, compute_dyrel_residual_U_kernel!,
                compute_dyrel_residual_P_kernel!
 
@@ -35,5 +37,6 @@ include("transfer.jl")     # restrict/prolong kernels (p/w/u)
 include("hierarchy.jl")    # MGLevel / MGHierarchy + coefficient coarsening
 include("smoother.jl")     # smooth!(level; nsweeps) — truncated DR sub-solve + AL pressure update
 include("vcycle.jl")       # V-cycle recursion + outer driver `fluidmech_gmg!`
+include("velocity_vcycle.jl")  # velocity-block V-cycle at fixed pressure
 
 end # module GMG

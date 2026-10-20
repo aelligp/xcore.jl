@@ -129,6 +129,9 @@ function record_history!(hst::History{T},
     # interior x-columns are 2:end-1. Each `sum(qz[...,2:end-1]*h)` is the
     # line integral of the z-flux across the top/bottom boundary, in [kg/s].
     qzaX = phase.qz_advn_X;  qzaM = phase.qz_advn_M
+    # `qz_dffn_M` is identically zero: only X diffuses, so `phsevo!` emits no melt
+    # diffusive flux. It stays in the budget because adding melt diffusion (or an
+    # open diffusive boundary) must show up here rather than be silently dropped.
     qzdX = phase.qz_dffn_X;  qzdM = phase.qz_dffn_M
     Nz1, Nxp2 = size(qzaX)
     interior = 2:(Nxp2 - 1)

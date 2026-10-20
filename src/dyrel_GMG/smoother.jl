@@ -21,7 +21,7 @@
 #
 # The coarsest level must actually SOLVE its (tiny) system including the
 # smooth modes only it sees, so `adaptive = true` restores the single-grid
-# behaviour there: early-stop polling on the preconditioned velocity norm +
+# behavior there: early-stop polling on the preconditioned velocity norm +
 # periodic Rayleigh-λmin / Gershgorin retune.
 #
 # CRITICAL (kept from the first working version): P stays FROZEN during the
@@ -37,10 +37,11 @@ Fill `lvl.cache.R_{W,U,P}` with the PH-form residual `b − A·v` at the current
 `(W,U,P)` (un-preconditioned, `dr=false`). Stress is recomputed inline inside
 `dyrel_residual_V!`.
 """
-function level_residual!(lvl, par::Parameters; a1, a2, a3, gamma, dt, P0, fscale)
+function level_residual!(lvl, par::Parameters; a1, a2, a3, gamma, dt, P0, fscale,
+                         xBC::Symbol = :periodic)
     dyrel_residual_P!(lvl.cache, lvl.fluid, lvl.grid, par, P0, dt; fscale)
     dyrel_residual_V!(lvl.cache, lvl.phase, lvl.fluid, lvl.grid, par;
-                      dr = false, a1, a2, a3, gamma, dt, fscale)
+                      dr = false, a1, a2, a3, gamma, dt, fscale, xBC)
     return nothing
 end
 
@@ -60,11 +61,12 @@ function smooth!(lvl, par::Parameters{T}; nsweeps::Int, ninner::Int, fscale,
                  a1, a2, a3, gamma, dt, P0,
                  top_cnv::Integer, bot_cnv::Integer,
                  mfs_mean::Real, Ddom::Real,
-                 adaptive::Bool = false) where {T}
+                 xBC::Symbol = :periodic, sds::Integer = -1,
+                 adaptive::Bool = false, update_P::Bool = true) where {T}
     cache = lvl.cache;  fluid = lvl.fluid;  phase = lvl.phase;  grid = lvl.grid
-    h = grid.h;  fs = T(fscale)
-    dyrel_apply_velocity_bcs!(fluid; top_cnv, bot_cnv, mfs_mean, Ddom)
-    dyrel_apply_pressure_bcs!(fluid)
+    fs = T(fscale)
+    dyrel_apply_velocity_bcs!(fluid; top_cnv, bot_cnv, xBC, sds, mfs_mean, Ddom)
+    dyrel_apply_pressure_bcs!(fluid; xBC)
 
     rel_drop = T(par.rel_drop_PT)
     ncheck   = max(2, par.n_tune_PT ÷ 8)   # adaptive-mode early-stop poll cadence
@@ -80,14 +82,16 @@ function smooth!(lvl, par::Parameters{T}; nsweeps::Int, ninner::Int, fscale,
                 copyto!(cache.R_W_old, cache.R_W)
                 copyto!(cache.R_U_old, cache.R_U)
             end
-            dyrel_residual_P!(cache, fluid, grid, par, P0, dt; fscale = fs)   # P_num fused in
-            dyrel_residual_V!(cache, phase, fluid, grid, par;
-                              dr = true, a1, a2, a3, gamma, dt, fscale = fs)  # stress inline
+            @timeit_debug TO "residual_P" dyrel_residual_P!(cache, fluid, grid, par, P0, dt; fscale = fs)   # P_num fused in
+            @timeit_debug TO "residual_V" dyrel_residual_V!(cache, phase, fluid, grid, par;
+                              dr = true, a1, a2, a3, gamma, dt, fscale = fs, xBC)  # stress inline
+            @timeit_debug TO "update velocity + BCs" begin
             dyrel_update_velocity!(cache, fluid)
-            dyrel_apply_velocity_bcs!(fluid; top_cnv, bot_cnv, mfs_mean, Ddom)
+            dyrel_apply_velocity_bcs!(fluid; top_cnv, bot_cnv, xBC, sds, mfs_mean, Ddom)
+            end
             adaptive || continue                      # fixed-count smoothing: no reductions
             if itPT % ncheck == 0
-                errVel = dyrel_velocity_residual_norm(cache)
+                errVel = @timeit_debug TO "poll norm" dyrel_velocity_residual_norm(cache)
                 if errVel0 == zero(T)
                     errVel0 = errVel + eps(T)         # first poll = baseline (no break)
                 elseif errVel / errVel0 < rel_drop
@@ -95,18 +99,24 @@ function smooth!(lvl, par::Parameters{T}; nsweeps::Int, ninner::Int, fscale,
                 end
             end
             if itPT % par.n_tune_PT == 0              # expensive retune: rarely
+                @timeit_debug TO "retune (Rayleigh + Gershgorin)" begin
                 λmin = dyrel_rayleigh_λmin(cache)
                 cache.c[] = 2 * sqrt(λmin) * par.c_fact_PT
-                gershgorin!(cache, fluid, h; a1, gamma, dt, g0 = par.g0)
+                gershgorin!(cache, fluid, grid.h; a1, gamma, dt, g0 = par.g0, xBC)
+                _check_dyrel_preconditioner(cache)
                 update_dτ_α_β!(cache, par.CFL_PT)
+                end
             end
         end
 
+        update_P || continue
         # Powell-Hestenes AL multiplier update (ONCE per sweep, after the
         # velocity sub-iteration): same update as src/dyrel/solve.jl.
+        @timeit_debug TO "PH multiplier update" begin
         dyrel_residual_P!(cache, fluid, grid, par, P0, dt; fscale = fs)
         @views @. fluid.P[2:end-1, 2:end-1] += par.pres_relax_PT * cache.γ_eff * cache.R_P
-        dyrel_apply_pressure_bcs!(fluid)
+        dyrel_apply_pressure_bcs!(fluid; xBC)
+        end
     end
     return nothing
 end

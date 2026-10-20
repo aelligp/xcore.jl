@@ -12,13 +12,13 @@ using SparseArrays
 # the cached maps (`_scatter!`). The UMFPACK numeric-refactor (`lu!`) reuses the
 # symbolic factorization stored in `lu_F`.
 #
-# Lives on `FluidState.solver`; automatically invalidated if `(Nz, Nx, bnchm)`
+# Lives on `FluidState.solver`; automatically invalidated if `(Nz, Nx, bnchm, xBC)`
 # differs from the cached signature.
 # ----------------------------------------------------------------------------
 
 mutable struct FluidmechCache{T<:AbstractFloat}
     initialized::Bool
-    sig_Nz::Int;  sig_Nx::Int;  sig_bnchm::Bool
+    sig_Nz::Int;  sig_Nx::Int;  sig_bnchm::Bool;  sig_xBC::Symbol
 
     # cached block matrices (built once, scattered into thereafter)
     KV::SparseMatrixCSC{T,Int}
@@ -57,7 +57,7 @@ end
 
 function FluidmechCache(::Type{T}) where {T<:AbstractFloat}
     FluidmechCache{T}(
-        false, 0, 0, false,
+        false, 0, 0, false, :unset,
         spzeros(T, 0, 0), spzeros(T, 0, 0), spzeros(T, 0, 0), spzeros(T, 0, 0),
         Int[], Int[], Int[], Int[],
         false, spzeros(T, 0, 0), spzeros(T, 0, 0),

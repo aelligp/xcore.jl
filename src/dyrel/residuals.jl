@@ -102,10 +102,12 @@ end
                                                   @Const(rhoUo), @Const(rhoUoo),
                                                   @Const(advn_mx), @Const(D_U), @Const(bext_U),
                                                   invh, g0, third, half, a1, a2, a3, gamma, inv_dt, dt, fscale,
-                                                  dr::Bool)
+                                                  dr::Bool, periodic::Bool)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
         Nx  = size(eta, 2)
+        # Wall-normal velocity is Dirichlet on solid side boundaries.
+        wall = !periodic && (ix == 1 || ix == Nx + 1)
         ixL = ix == 1      ? Nx : ix - 1       # periodic-x cell columns
         ixR = ix == Nx + 1 ? 1  : ix
         Uv       = U[iz + 1, ix]
@@ -124,7 +126,7 @@ end
                                      (W[iz, ix + 1]     - W[iz,     ix]) * invh) * half
         d_txz_dz = (txz_t - txz_b) * invh
         dP_dx    = (P[iz + 1, ix + 1] - P[iz + 1, ix]) * invh
-        inertia  = (a1 + gamma) * rhou[iz, ix] * Uv * inv_dt
+        inertia  = (a1 + (periodic ? gamma : zero(gamma))) * rhou[iz, ix] * Uv * inv_dt
         ddx_rho  = (rho[iz, ixR] - rho[iz, ixL]) * invh
         sailor   = ddx_rho * g0 * dt * Uv
         lagged   = (a2 * rhoUo[iz, ix] + a3 * rhoUoo[iz, ix]) * inv_dt
@@ -134,7 +136,9 @@ end
         # the W kernel; no buoyancy on U.
         r = d_txx_dx + d_txz_dz - dP_dx - inertia - sailor +
             fscale * (lagged - adv) + bext_U[iz, ix]
-        if dr
+        if wall
+            R_U[iz, ix] = zero(eltype(R_U))
+        elseif dr
             dPnum_dx = (P_num[iz, ixR] - P_num[iz, ixL]) * invh
             R_U[iz, ix] = (r - dPnum_dx) / D_U[iz, ix]
         else
@@ -145,7 +149,9 @@ end
 
 # ---------------------------------------------------------------------------
 # Continuity residual: compressible mass-flux divergence ∇·(ρv) with the MFS
-# source. `comp` is the artificial-compressibility relaxation (→0 as dt→∞).
+# source. `comp` is the pseudo-transient relaxation used by the multigrid
+# smoother, where P0 tracks the previous V-cycle iterate so it vanishes at
+# convergence; the single-grid solver passes dt = Inf to switch it off (MATH.md §2).
 # ---------------------------------------------------------------------------
 
 @kernel function compute_dyrel_residual_P_kernel!(R_P, P_num, @Const(W), @Const(U),
@@ -200,7 +206,8 @@ error equation the multigrid coarse levels solve.
 function dyrel_residual_V!(cache::DyrelCache{T}, phase::PhaseState{T},
                            fluid::FluidState{T}, grid::Grid{T}, par::Parameters{T};
                            dr::Bool, a1::Real, a2::Real, a3::Real,
-                           gamma::Real, dt::Real, fscale::Real = 1) where {T<:AbstractFloat}
+                           gamma::Real, dt::Real, fscale::Real = 1,
+                           xBC::Symbol = :periodic) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(cache.R_W)
     invh   = T(inv(grid.h));  g0 = T(par.g0)
     inv_dt = isfinite(dt) ? T(inv(dt)) : zero(T)
@@ -214,7 +221,8 @@ function dyrel_residual_V!(cache::DyrelCache{T}, phase::PhaseState{T},
     compute_dyrel_residual_U_kernel!(backend)(
         cache.R_U, fluid.U, fluid.W, fluid.eta, fluid.etaco, fluid.P, cache.P_num,
         fluid.rho, fluid.rhou, fluid.rhoUo, fluid.rhoUoo, cache.advn_mx, cache.D_U, cache.bext_U,
-        invh, g0, third, half, T(a1), T(a2), T(a3), T(gamma), inv_dt, dtT, fs, dr; ndrange = size(cache.R_U))
+        invh, g0, third, half, T(a1), T(a2), T(a3), T(gamma), inv_dt, dtT, fs, dr,
+        xBC === :periodic; ndrange = size(cache.R_U))
     # No synchronize: KA keeps same-backend launches ordered; sync happens at
     # the next host read (the reductions / convergence checks in solve.jl).
     return nothing

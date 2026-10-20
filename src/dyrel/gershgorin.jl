@@ -29,7 +29,8 @@ using KernelAbstractions
 # (a1+γ) factor matches fluidmech.jl's U-momentum inertial term).
 @kernel function compute_dyrel_gershgorin_U_kernel!(D_U, λmax_U, @Const(η), @Const(etaco),
                                               @Const(γ_eff), @Const(rhou), @Const(rho),
-                                              invh2, invh, cn, cc, cs, iner_coef, g0dt)
+                                              invh2, invh, cn, cc, cs, iner_coef, g0dt,
+                                              periodic::Bool)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
         # The U-face at (iz, ix) sits between cell columns (ix-1, iz) and (ix, iz)
@@ -37,6 +38,7 @@ using KernelAbstractions
         # repeat-boundary cell (we trust the caller to fill ghost columns of
         # u_h or to mask the boundary entries downstream).
         Nz, Nx = size(η)
+        wall = !periodic && (ix == 1 || ix == Nx + 1)
         # Cell-centred η on the left/right of this U-face (periodic in x)
         ixL = ix == 1     ? Nx : ix - 1
         ixR = ix == Nx+1  ? 1  : ix
@@ -59,12 +61,21 @@ using KernelAbstractions
         # div-penalty term, not viscous stress, and is injected at γ_eff scale
         # via P_num (MATH.md §5). Here η_E/η_W are cell-centred (normal), η_N/η_S
         # are corner (shear).
+        # Penalty diagonal. R_P is 1/ρ-scaled and differences the MASS flux, so
+        # ∂R_P[c]/∂U_f = ∓ρu_f/(h·ρ_c) and the penalty entry carries ρu_f/ρ_c — not
+        # the bare γ a constant-density formulation would give. The diagonal gets
+        # the exact factor here because D is the Jacobi preconditioner and the
+        # Schur diagonal s_P (hence γ_eff) is assembled from it. The off-diagonal
+        # penalty terms below keep the bare γ: each needs the density of a
+        # DIFFERENT face, and the ratio stays within ~1e-3 of unity for the
+        # near-uniform two-phase mixture, well inside the CFL margin on λmax.
+        γ_diag = rhou[iz, ix] * (γ_E / rho[iz, ixR] + γ_W / rho[iz, ixL])
         # Cxx = self-coupling on U-velocity through τxx and τxy
         # Cxy = cross-coupling onto neighbouring W-velocities via off-diagonal stress
         Cxx = cs * (η_N + η_S) * invh2 +
               (γ_E + cn * η_E) * invh2 +
               (γ_W + cn * η_W) * invh2 +
-              (cs * (η_N + η_S) * invh + (γ_E + γ_W + cn * (η_E + η_W)) * invh) * invh
+              (cs * (η_N + η_S) * invh + cn * (η_E + η_W) * invh) * invh + γ_diag * invh2
         Cxy = (abs(γ_E - cc * η_E + cs * η_N) + abs(γ_E - cc * η_E + cs * η_S) +
                abs(γ_W - cc * η_W + cs * η_N) + abs(γ_W - cc * η_W + cs * η_S)) * invh2
         # BD2 inertial diagonal — positive, regularises the operator (raises D,
@@ -78,10 +89,12 @@ using KernelAbstractions
         # gradient. Mirrors JustRelax's `_apply_free_surface_diagonal!`.
         σ = (rho[iz, ixR] - rho[iz, ixL]) * invh * g0dt
         # Diagonal entry (Jacobi preconditioner) + inertia + sailor
-        D = (cs * (η_N + η_S) * invh + (γ_E + γ_W + cn * (η_E + η_W)) * invh) * invh +
+        D = (cs * (η_N + η_S) * invh + cn * (η_E + η_W) * invh) * invh + γ_diag * invh2 +
             δ + max(σ, zero(σ))
-        D_U[iz, ix]    = D
-        λmax_U[iz, ix] = (Cxx + Cxy + δ + abs(σ)) / D
+        # Dirichlet wall face: unit diagonal keeps D positive and λmax = 1, so
+        # the face contributes nothing to the pseudo-time step estimate.
+        D_U[iz, ix]    = wall ? one(D) : D
+        λmax_U[iz, ix] = wall ? one(D) : (Cxx + Cxy + δ + abs(σ)) / D
     end
 end
 
@@ -109,15 +122,18 @@ end
         # xcore convention τ = η(ε − ⅓∇·v I): normal η_N/η_S → cn = 2/3, cross
         # → cc = 1/3, shear η_E/η_W → cs = 1/2 (half of JustRelax's 2η coeffs;
         # matches fluidmech.jl:210 / dyrel stress). γ_eff keeps coefficient 1.
+        # Penalty diagonal carries ρw_f/ρ_c — see the U kernel for the derivation
+        # and for why only the diagonal takes the exact factor.
+        γ_diag = rhow[iz, ix] * (γ_N / rho[izN, ix] + γ_S / rho[izS, ix])
         Cyy = cs * (η_E + η_W) * invh2 +
               (γ_N + cn * η_N) * invh2 +
               (γ_S + cn * η_S) * invh2 +
-              ((γ_N + γ_S + cn * (η_N + η_S)) * invh + cs * (η_E + η_W) * invh) * invh
+              (cn * (η_N + η_S) * invh + cs * (η_E + η_W) * invh) * invh + γ_diag * invh2
         Cyx = (abs(γ_N + cs * η_E - cc * η_N) + abs(γ_N - cc * η_N + cs * η_W) +
                abs(γ_S + cs * η_E - cc * η_S) + abs(γ_S - cc * η_S + cs * η_W)) * invh2
         δ = iner_coef * rhow[iz, ix]       # BD2 inertial diagonal
         σ = (rho[izS, ix] - rho[izN, ix]) * invh * g0dt   # drunken sailor (see U kernel)
-        D = ((γ_N + γ_S + cn * (η_N + η_S)) * invh + cs * (η_E + η_W) * invh) * invh +
+        D = (cn * (η_N + η_S) * invh + cs * (η_E + η_W) * invh) * invh + γ_diag * invh2 +
             δ + max(σ, zero(σ))
         D_W[iz, ix]    = D
         λmax_W[iz, ix] = (Cyy + Cyx + δ + abs(σ)) / D
@@ -135,7 +151,8 @@ diagonals for both velocity directions, including the BD2 inertial diagonal
 with it.
 """
 function gershgorin!(cache::DyrelCache{T}, fluid::FluidState{T}, h::Real;
-                     a1::Real, gamma::Real, dt::Real, g0::Real) where {T<:AbstractFloat}
+                     a1::Real, gamma::Real, dt::Real, g0::Real,
+                     xBC::Symbol = :periodic) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(fluid.eta)
     invh    = T(inv(h))
     invh2   = invh * invh
@@ -145,14 +162,15 @@ function gershgorin!(cache::DyrelCache{T}, fluid::FluidState{T}, h::Real;
     cc      = T(1//3)
     cs      = T(1//2)
     inv_dt  = isfinite(dt) ? T(inv(dt)) : zero(T)
-    iner_U  = (T(a1) + T(gamma)) * inv_dt
+    iner_U  = (T(a1) + (xBC === :periodic ? T(gamma) : zero(T))) * inv_dt
     iner_W  = T(a1) * inv_dt
     g0dt    = T(g0) * T(dt)
 
     compute_dyrel_gershgorin_U_kernel!(backend)(cache.D_U, cache.λmax_U,
                                                     fluid.eta, fluid.etaco, cache.γ_eff,
                                                     fluid.rhou, fluid.rho,
-                                                    invh2, invh, cn, cc, cs, iner_U, g0dt;
+                                                    invh2, invh, cn, cc, cs, iner_U, g0dt,
+                                                    xBC === :periodic;
                                                     ndrange = size(cache.D_U))
     compute_dyrel_gershgorin_W_kernel!(backend)(cache.D_W, cache.λmax_W,
                                                     fluid.eta, fluid.etaco, cache.γ_eff,
@@ -178,11 +196,23 @@ end
 # ---------------------------------------------------------------------------
 
 @kernel function compute_schur_diag_kernel!(s_P, @Const(D_W), @Const(D_U),
-                                            @Const(rhow), @Const(rhou), @Const(rho), invh2)
+                                            @Const(rhow), @Const(rhou), @Const(rho), invh2,
+                                            periodic::Bool)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
-        sfac = rhou[iz, ix]     / D_U[iz, ix]     + rhou[iz, ix + 1] / D_U[iz, ix + 1] +
-               rhow[iz, ix]     / D_W[iz, ix]     + rhow[iz + 1, ix] / D_W[iz + 1, ix]
+        Z = zero(eltype(s_P))
+        # Only faces that can respond to a pressure change contribute to the Schur
+        # diagonal. A Dirichlet face has no such response: the wall-normal U at a
+        # solid side wall, and W on the top and bottom rows (closed, drained, or
+        # eliminated by the outflow balance) are all prescribed by
+        # `dyrel_apply_velocity_bcs!` after every update. Counting them inflates
+        # s_P in the boundary cells and so deflates the penalty γ_eff = γfact/s_P
+        # exactly there.
+        uL = periodic || ix != 1            ? rhou[iz, ix]     / D_U[iz, ix]     : Z
+        uR = periodic || ix != size(s_P, 2) ? rhou[iz, ix + 1] / D_U[iz, ix + 1] : Z
+        wT = iz != 1                        ? rhow[iz, ix]     / D_W[iz, ix]     : Z
+        wB = iz != size(s_P, 1)             ? rhow[iz + 1, ix] / D_W[iz + 1, ix] : Z
+        sfac = uL + uR + wT + wB
         s_P[iz, ix] = sfac * invh2 / rho[iz, ix]
     end
 end
@@ -195,11 +225,12 @@ Gershgorin momentum diagonals `D_W`/`D_U` and face densities. Call after
 `gershgorin!` (setup + each retune), since it depends on `D_W`/`D_U`.
 """
 function compute_schur_diag!(cache::DyrelCache{T}, fluid::FluidState{T},
-                             h::Real) where {T<:AbstractFloat}
+                             h::Real; xBC::Symbol = :periodic) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(cache.s_P)
     invh2 = T(inv(h)^2)
     compute_schur_diag_kernel!(backend)(cache.s_P, cache.D_W, cache.D_U,
-                                                  fluid.rhow, fluid.rhou, fluid.rho, invh2;
+                                                  fluid.rhow, fluid.rhou, fluid.rho, invh2,
+                                                  xBC === :periodic;
                                                   ndrange = size(cache.s_P))
     # No synchronize: KA keeps same-backend launches ordered; sync happens at
     # the next host read (the reductions / convergence checks in solve.jl).
