@@ -28,7 +28,7 @@ using KernelAbstractions
 # `iner_coef` = (a1 + γ)/dt scales the BD2 inertial diagonal a1·ρu/dt (the
 # (a1+γ) factor matches fluidmech.jl's U-momentum inertial term).
 @kernel function compute_dyrel_gershgorin_U_kernel!(D_U, λmax_U, @Const(η), @Const(etaco),
-                                              @Const(γ_eff), @Const(rhou), @Const(rho),
+                                              @Const(γ_eff), @Const(rhou), @Const(rhow), @Const(rho),
                                               invh2, invh, cn, cc, cs, iner_coef, g0dt,
                                               periodic::Bool)
     iz, ix = @index(Global, NTuple)
@@ -61,23 +61,25 @@ using KernelAbstractions
         # div-penalty term, not viscous stress, and is injected at γ_eff scale
         # via P_num (MATH.md §5). Here η_E/η_W are cell-centred (normal), η_N/η_S
         # are corner (shear).
-        # Penalty diagonal. R_P is 1/ρ-scaled and differences the MASS flux, so
-        # ∂R_P[c]/∂U_f = ∓ρu_f/(h·ρ_c) and the penalty entry carries ρu_f/ρ_c — not
-        # the bare γ a constant-density formulation would give. The diagonal gets
-        # the exact factor here because D is the Jacobi preconditioner and the
-        # Schur diagonal s_P (hence γ_eff) is assembled from it. The off-diagonal
-        # penalty terms below keep the bare γ: each needs the density of a
-        # DIFFERENT face, and the ratio stays within ~1e-3 of unity for the
-        # near-uniform two-phase mixture, well inside the CFL margin on λmax.
-        γ_diag = rhou[iz, ix] * (γ_E / rho[iz, ixR] + γ_W / rho[iz, ixL])
-        # Cxx = self-coupling on U-velocity through τxx and τxy
-        # Cxy = cross-coupling onto neighbouring W-velocities via off-diagonal stress
+        # Penalty entries. R_P is 1/ρ-scaled and differences the MASS flux, so
+        # ∂R_P[c]/∂v_g = ∓ρ_g/(h·ρ_c) for any face g of cell c: the penalty
+        # coupling from cell c to face g is γ_c·ρ_g/ρ_c, not the bare γ_c a
+        # constant-density formulation would give. Every entry below carries that
+        # factor, so the row sum stays an upper bound under density contrasts.
+        gρ_E = γ_E / rho[iz, ixR];  gρ_W = γ_W / rho[iz, ixL]
+        γ_diag = rhou[iz, ix] * (gρ_E + gρ_W)
+        # Cxx = self-coupling on U-velocity through τxx and τxy; the U faces across
+        # cells E and W are ixR+1 and ixL.
+        # Cxy = cross-coupling onto the W faces of cells E and W; the face at row
+        # iz+1 shares corner η_N, the face at row iz shares η_S.
         Cxx = cs * (η_N + η_S) * invh2 +
-              (γ_E + cn * η_E) * invh2 +
-              (γ_W + cn * η_W) * invh2 +
+              (gρ_E * rhou[iz, ixR + 1] + cn * η_E) * invh2 +
+              (gρ_W * rhou[iz, ixL]     + cn * η_W) * invh2 +
               (cs * (η_N + η_S) * invh + cn * (η_E + η_W) * invh) * invh + γ_diag * invh2
-        Cxy = (abs(γ_E - cc * η_E + cs * η_N) + abs(γ_E - cc * η_E + cs * η_S) +
-               abs(γ_W - cc * η_W + cs * η_N) + abs(γ_W - cc * η_W + cs * η_S)) * invh2
+        Cxy = (abs(gρ_E * rhow[iz + 1, ixR] - cc * η_E + cs * η_N) +
+               abs(gρ_E * rhow[iz,     ixR] - cc * η_E + cs * η_S) +
+               abs(gρ_W * rhow[iz + 1, ixL] - cc * η_W + cs * η_N) +
+               abs(gρ_W * rhow[iz,     ixL] - cc * η_W + cs * η_S)) * invh2
         # BD2 inertial diagonal — positive, regularises the operator (raises D,
         # lowers λmax → larger dτ).
         δ = iner_coef * rhou[iz, ix]
@@ -101,7 +103,7 @@ end
 # z-face stencils (W direction) — iz=1..Nz+1, ix=1..Nx
 # `iner_coef` = a1/dt scales the BD2 inertial diagonal a1·ρw/dt.
 @kernel function compute_dyrel_gershgorin_W_kernel!(D_W, λmax_W, @Const(η), @Const(etaco),
-                                              @Const(γ_eff), @Const(rhow), @Const(rho),
+                                              @Const(γ_eff), @Const(rhow), @Const(rhou), @Const(rho),
                                               invh2, invh, cn, cc, cs, iner_coef, g0dt)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
@@ -122,15 +124,19 @@ end
         # xcore convention τ = η(ε − ⅓∇·v I): normal η_N/η_S → cn = 2/3, cross
         # → cc = 1/3, shear η_E/η_W → cs = 1/2 (half of JustRelax's 2η coeffs;
         # matches fluidmech.jl:210 / dyrel stress). γ_eff keeps coefficient 1.
-        # Penalty diagonal carries ρw_f/ρ_c — see the U kernel for the derivation
-        # and for why only the diagonal takes the exact factor.
-        γ_diag = rhow[iz, ix] * (γ_N / rho[izN, ix] + γ_S / rho[izS, ix])
+        # Penalty couplings carry γ_c·ρ_g/ρ_c — see the U kernel. The W faces
+        # across cells S and N are izS+1 and izN; of each cell's U faces, the one
+        # at x-face ix+1 shares corner η_E and the one at ix shares η_W.
+        gρ_N = γ_N / rho[izN, ix];  gρ_S = γ_S / rho[izS, ix]
+        γ_diag = rhow[iz, ix] * (gρ_N + gρ_S)
         Cyy = cs * (η_E + η_W) * invh2 +
-              (γ_N + cn * η_N) * invh2 +
-              (γ_S + cn * η_S) * invh2 +
+              (gρ_N * rhow[izN,     ix] + cn * η_N) * invh2 +
+              (gρ_S * rhow[izS + 1, ix] + cn * η_S) * invh2 +
               (cn * (η_N + η_S) * invh + cs * (η_E + η_W) * invh) * invh + γ_diag * invh2
-        Cyx = (abs(γ_N + cs * η_E - cc * η_N) + abs(γ_N - cc * η_N + cs * η_W) +
-               abs(γ_S + cs * η_E - cc * η_S) + abs(γ_S - cc * η_S + cs * η_W)) * invh2
+        Cyx = (abs(gρ_N * rhou[izN, ix + 1] + cs * η_E - cc * η_N) +
+               abs(gρ_N * rhou[izN, ix]     - cc * η_N + cs * η_W) +
+               abs(gρ_S * rhou[izS, ix + 1] + cs * η_E - cc * η_S) +
+               abs(gρ_S * rhou[izS, ix]     - cc * η_S + cs * η_W)) * invh2
         δ = iner_coef * rhow[iz, ix]       # BD2 inertial diagonal
         σ = (rho[izS, ix] - rho[izN, ix]) * invh * g0dt   # drunken sailor (see U kernel)
         D = (cn * (η_N + η_S) * invh + cs * (η_E + η_W) * invh) * invh + γ_diag * invh2 +
@@ -168,13 +174,13 @@ function gershgorin!(cache::DyrelCache{T}, fluid::FluidState{T}, h::Real;
 
     compute_dyrel_gershgorin_U_kernel!(backend)(cache.D_U, cache.λmax_U,
                                                     fluid.eta, fluid.etaco, cache.γ_eff,
-                                                    fluid.rhou, fluid.rho,
+                                                    fluid.rhou, fluid.rhow, fluid.rho,
                                                     invh2, invh, cn, cc, cs, iner_U, g0dt,
                                                     xBC === :periodic;
                                                     ndrange = size(cache.D_U))
     compute_dyrel_gershgorin_W_kernel!(backend)(cache.D_W, cache.λmax_W,
                                                     fluid.eta, fluid.etaco, cache.γ_eff,
-                                                    fluid.rhow, fluid.rho,
+                                                    fluid.rhow, fluid.rhou, fluid.rho,
                                                     invh2, invh, cn, cc, cs, iner_W, g0dt;
                                                     ndrange = size(cache.D_W))
     # No synchronize: KA keeps same-backend launches ordered; sync happens at

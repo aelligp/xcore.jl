@@ -186,6 +186,92 @@ end
     end
 end
 
+@testset "Gershgorin bound covers the penalized operator under density contrast" begin
+    # λmax·D must be at least the absolute row sum of the penalized velocity
+    # operator, assembled column by column from the dr = true residual. The
+    # penalty couples faces through the 1/ρ-scaled mass flux, so a ±30 % density
+    # field exposes any entry that drops the face/cell density ratio.
+    T = Float64
+    for (xBC, sds) in ((:periodic, -1), (:closed, 1))
+        par = Parameters(T; D = 1.0, N = 8, L = 1.0, g0 = 1.0, gamma = 0.3, alpha = 0.0)
+        grid = Grid(par); Nz, Nx, h = grid.Nz, grid.Nx, grid.h
+        fluid = FluidState(T, CPU(), Nz, Nx); phase = PhaseState(T, CPU(), Nz, Nx)
+        fluid.eta .= [1 + 0.5 * sinpi(2 * i / Nx) * cospi(j / Nz) for j in 1:Nz, i in 1:Nx]
+        XC.compute_corner_eta!(fluid.etaco, fluid.eta; xBC, zBC = :closed)
+        fluid.rho .= [1 + 0.3 * sinpi(2 * (i + 0.3) / Nx) * sinpi(3 * (j + 0.2) / Nz) for j in 1:Nz, i in 1:Nx]
+        XC.update_interpolations!(phase, fluid, grid, par; xBC)
+        dyrel = DyrelCache(T, CPU(), grid)
+        kw = (; a1 = 1, a2 = 0, a3 = 0, gamma = par.gamma, dt = 1.0e3)
+        XC.compute_AL_penalty!(dyrel, fluid, h; γfact = 1.0e3, a1 = kw.a1, gamma = kw.gamma,
+                               dt = kw.dt, g0 = par.g0, xBC)
+        function applied()
+            XC.dyrel_apply_velocity_bcs!(fluid; top_cnv = -1, bot_cnv = -1, xBC, sds, h,
+                                         mfs_mean = 0.0, Ddom = 1.0)
+            XC.dyrel_residual_P!(dyrel, fluid, grid, par, fluid.P, Inf)
+            XC.dyrel_residual_V!(dyrel, phase, fluid, grid, par; dr = true, xBC, kw...)
+            return vcat(vec(dyrel.R_W .* dyrel.D_W), vec(dyrel.R_U .* dyrel.D_U))
+        end
+        ucols = xBC === :periodic ? (1:Nx) : (2:Nx)
+        cols = vcat([CartesianIndex(iz, ix + 1) => fluid.W for iz in 2:Nz for ix in 1:Nx],
+                    [CartesianIndex(iz + 1, ix) => fluid.U for iz in 1:Nz for ix in ucols])
+        fill!(fluid.W, 0); fill!(fluid.U, 0)
+        r0 = applied()
+        rowsum = zero(r0)
+        for (I, A) in cols
+            A[I] = 1;  rowsum .+= abs.(applied() .- r0);  A[I] = 0
+        end
+        bound = vcat(vec(dyrel.λmax_W .* dyrel.D_W), vec(dyrel.λmax_U .* dyrel.D_U))
+        LW, LU = LinearIndices(dyrel.R_W), LinearIndices(dyrel.R_U)
+        rows = vcat([LW[iz, ix] for iz in 2:Nz for ix in 1:Nx],
+                    [length(LW) + LU[iz, ix] for iz in 1:Nz for ix in ucols])
+        @test maximum(rowsum[rows] ./ bound[rows]) ≤ 1 + 1.0e-12
+    end
+end
+
+@testset "matrix-free solvers across a sharp density contrast" begin
+    # A heavy circular inclusion with a sharp interface, buoyant through Drho.
+    # The penalty couples faces through the 1/ρ-scaled mass flux, so the DR step
+    # is stable only if λmax accounts for the density jump at the interface.
+    T = Float64
+    function inclusion(ratio)
+        fluid, phase, dyrel, grid, par, scales = _dyrel_setup(T; Npts = 64, maxit_PH = 100)
+        Nz, Nx = grid.Nz, grid.Nx
+        fluid.rho .= [hypot((i - 0.5) / Nx - 0.5, (j - 0.5) / Nz - 0.5) < 0.2 ? ratio : 1.0
+                      for j in 1:Nz, i in 1:Nx]
+        XC.update_interpolations!(phase, fluid, grid, par; xBC = :periodic)
+        # a2 = 1 with ρ_old = ρ keeps the BD2 mass source zero
+        fluid.rhoo .= fluid.rho;  fluid.rhooo .= fluid.rho
+        return fluid, phase, dyrel, grid, par, scales
+    end
+    kw(dt) = (; dt, a1 = 1, a2 = 1, a3 = 0, top_cnv = -1, bot_cnv = -1)
+    rel(a, b) = norm(a .- b) / norm(b)
+    function solve(solver, ratio, dt)
+        fluid, phase, dyrel, grid, par, scales = inclusion(ratio)
+        if solver === :direct
+            fluidmech!(fluid, grid, par; phase, sds = -1, xBC = :periodic, zBC = :closed, kw(dt)...)
+            return (; fluid, converged = true)
+        elseif solver === :dyrel
+            r = fluidmech_dyrel!(fluid, phase, dyrel, grid, par, scales; kw(dt)...)
+            return (; fluid, r.converged)
+        end
+        hier = XC.GMG.build_hierarchy(fluid, phase, grid, par)
+        r = solver === :gmg ?
+            XC.GMG.fluidmech_gmg!(fluid, phase, hier, grid, par, scales; kw(dt)...) :
+            XC.GMG.fluidmech_dyrel_vmg!(fluid, phase, hier, grid, par, scales;
+                                        γfact = 5, cc = true, kw(dt)...)
+        return (; fluid, r.converged)
+    end
+    for (ratio, dt, solvers) in ((10.0, 1.0, (:dyrel, :gmg, :vmg)), (100.0, 1.0e-3, (:dyrel, :vmg)))
+        ref = solve(:direct, ratio, dt).fluid
+        for s in solvers
+            out = solve(s, ratio, dt)
+            @test out.converged
+            @test rel(out.fluid.W[:, 2:end-1], ref.W[:, 2:end-1]) < 1.0e-5
+            @test rel(out.fluid.U[2:end-1, :], ref.U[2:end-1, :]) < 1.0e-5
+        end
+    end
+end
+
 @testset "DYREL matches the direct nonperiodic operator" begin
     # The direct assembly is the reference contract.  `gamma` is deliberately
     # large, so using the periodic-only horizontal inertia at a side wall is
