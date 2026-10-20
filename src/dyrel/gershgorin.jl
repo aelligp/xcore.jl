@@ -28,8 +28,8 @@ using KernelAbstractions
 # `iner_coef` = (a1 + γ)/dt scales the BD2 inertial diagonal a1·ρu/dt (the
 # (a1+γ) factor matches fluidmech.jl's U-momentum inertial term).
 @kernel function compute_dyrel_gershgorin_U_kernel!(D_U, λmax_U, @Const(η), @Const(etaco),
-                                              @Const(γ_eff), @Const(rhou), invh2, invh,
-                                              cn, cc, cs, iner_coef)
+                                              @Const(γ_eff), @Const(rhou), @Const(rho),
+                                              invh2, invh, cn, cc, cs, iner_coef, g0dt)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
         # The U-face at (iz, ix) sits between cell columns (ix-1, iz) and (ix, iz)
@@ -65,24 +65,31 @@ using KernelAbstractions
               (γ_E + cn * η_E) * invh2 +
               (γ_W + cn * η_W) * invh2 +
               (cs * (η_N + η_S) * invh + (γ_E + γ_W + cn * (η_E + η_W)) * invh) * invh
-        Cxy = ((γ_E - cc * η_E + cs * η_N) + (γ_E - cc * η_E + cs * η_S)) * invh2 +
-              ((γ_W - cc * η_W + cs * η_N) + (γ_W - cc * η_W + cs * η_S)) * invh2
+        Cxy = (abs(γ_E - cc * η_E + cs * η_N) + abs(γ_E - cc * η_E + cs * η_S) +
+               abs(γ_W - cc * η_W + cs * η_N) + abs(γ_W - cc * η_W + cs * η_S)) * invh2
         # BD2 inertial diagonal — positive, regularises the operator (raises D,
-        # lowers λmax → larger dτ). Drunken-sailor is left out of the bound
-        # (small ± stabilization that could otherwise make D non-positive).
+        # lowers λmax → larger dτ).
         δ = iner_coef * rhou[iz, ix]
-        # Diagonal entry (Jacobi preconditioner) + inertia
-        D = (cs * (η_N + η_S) * invh + (γ_E + γ_W + cn * (η_E + η_W)) * invh) * invh + δ
+        # Drunken-sailor diagonal σ = ∂ₓρ·g₀·dt, the same term the residual
+        # kernel applies to U and fluidmech.jl assembles onto the matrix
+        # diagonal. It enters the row sum as |σ| so λmax stays a true upper
+        # bound at either sign, and D only by its positive part so the
+        # preconditioner cannot be driven non-positive by an inverted density
+        # gradient. Mirrors JustRelax's `_apply_free_surface_diagonal!`.
+        σ = (rho[iz, ixR] - rho[iz, ixL]) * invh * g0dt
+        # Diagonal entry (Jacobi preconditioner) + inertia + sailor
+        D = (cs * (η_N + η_S) * invh + (γ_E + γ_W + cn * (η_E + η_W)) * invh) * invh +
+            δ + max(σ, zero(σ))
         D_U[iz, ix]    = D
-        λmax_U[iz, ix] = (Cxx + Cxy + δ) / D
+        λmax_U[iz, ix] = (Cxx + Cxy + δ + abs(σ)) / D
     end
 end
 
 # z-face stencils (W direction) — iz=1..Nz+1, ix=1..Nx
 # `iner_coef` = a1/dt scales the BD2 inertial diagonal a1·ρw/dt.
 @kernel function compute_dyrel_gershgorin_W_kernel!(D_W, λmax_W, @Const(η), @Const(etaco),
-                                              @Const(γ_eff), @Const(rhow), invh2, invh,
-                                              cn, cc, cs, iner_coef)
+                                              @Const(γ_eff), @Const(rhow), @Const(rho),
+                                              invh2, invh, cn, cc, cs, iner_coef, g0dt)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
         Nz, Nx = size(η)
@@ -106,26 +113,29 @@ end
               (γ_N + cn * η_N) * invh2 +
               (γ_S + cn * η_S) * invh2 +
               ((γ_N + γ_S + cn * (η_N + η_S)) * invh + cs * (η_E + η_W) * invh) * invh
-        Cyx = ((γ_N + cs * η_E - cc * η_N) + (γ_N - cc * η_N + cs * η_W)) * invh2 +
-              ((γ_S + cs * η_E - cc * η_S) + (γ_S - cc * η_S + cs * η_W)) * invh2
+        Cyx = (abs(γ_N + cs * η_E - cc * η_N) + abs(γ_N - cc * η_N + cs * η_W) +
+               abs(γ_S + cs * η_E - cc * η_S) + abs(γ_S - cc * η_S + cs * η_W)) * invh2
         δ = iner_coef * rhow[iz, ix]       # BD2 inertial diagonal
-        D = ((γ_N + γ_S + cn * (η_N + η_S)) * invh + cs * (η_E + η_W) * invh) * invh + δ
+        σ = (rho[izS, ix] - rho[izN, ix]) * invh * g0dt   # drunken sailor (see U kernel)
+        D = ((γ_N + γ_S + cn * (η_N + η_S)) * invh + cs * (η_E + η_W) * invh) * invh +
+            δ + max(σ, zero(σ))
         D_W[iz, ix]    = D
-        λmax_W[iz, ix] = (Cyy + Cyx + δ) / D
+        λmax_W[iz, ix] = (Cyy + Cyx + δ + abs(σ)) / D
     end
 end
 
 """
-    gershgorin!(cache, fluid, h; a1, gamma, dt) -> nothing
+    gershgorin!(cache, fluid, h; a1, gamma, dt, g0) -> nothing
 
 Recompute the Gershgorin row-sum eigenvalue bound and Jacobi preconditioner
 diagonals for both velocity directions, including the BD2 inertial diagonal
-(`a1·ρw/dt` for W, `(a1+γ)·ρu/dt` for U). Called once per `fluidmech_dyrel!`
-invocation and every `par.n_tune_PT` DR iterations. Pass `dt = Inf` for the
-steady-state limit (inertia drops out).
+(`a1·ρw/dt` for W, `(a1+γ)·ρu/dt` for U) and the drunken-sailor diagonal
+`∂ρ·g0·dt`. Called once per `fluidmech_dyrel!` invocation and every
+`par.n_tune_PT` DR iterations. `dt` must be finite — the sailor term scales
+with it.
 """
 function gershgorin!(cache::DyrelCache{T}, fluid::FluidState{T}, h::Real;
-                     a1::Real, gamma::Real, dt::Real) where {T<:AbstractFloat}
+                     a1::Real, gamma::Real, dt::Real, g0::Real) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(fluid.eta)
     invh    = T(inv(h))
     invh2   = invh * invh
@@ -137,14 +147,17 @@ function gershgorin!(cache::DyrelCache{T}, fluid::FluidState{T}, h::Real;
     inv_dt  = isfinite(dt) ? T(inv(dt)) : zero(T)
     iner_U  = (T(a1) + T(gamma)) * inv_dt
     iner_W  = T(a1) * inv_dt
+    g0dt    = T(g0) * T(dt)
 
     compute_dyrel_gershgorin_U_kernel!(backend)(cache.D_U, cache.λmax_U,
                                                     fluid.eta, fluid.etaco, cache.γ_eff,
-                                                    fluid.rhou, invh2, invh, cn, cc, cs, iner_U;
+                                                    fluid.rhou, fluid.rho,
+                                                    invh2, invh, cn, cc, cs, iner_U, g0dt;
                                                     ndrange = size(cache.D_U))
     compute_dyrel_gershgorin_W_kernel!(backend)(cache.D_W, cache.λmax_W,
                                                     fluid.eta, fluid.etaco, cache.γ_eff,
-                                                    fluid.rhow, invh2, invh, cn, cc, cs, iner_W;
+                                                    fluid.rhow, fluid.rho,
+                                                    invh2, invh, cn, cc, cs, iner_W, g0dt;
                                                     ndrange = size(cache.D_W))
     # No synchronize: KA keeps same-backend launches ordered; sync happens at
     # the next host read (the reductions / convergence checks in solve.jl).

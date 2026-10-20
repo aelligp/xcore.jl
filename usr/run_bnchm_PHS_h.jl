@@ -27,12 +27,13 @@ function run_bnchm_phs_h(N::Int; D = 10.0, L = 10.0,
                           ADVN = :weno5, TINT = :bd2im,
                           atol = 1e-12, maxit = 100, alpha = 0.9)
     par = Parameters(Float64;
-        runID = "bnchm_PHS_h",
+        runID = "bnchm_PHS_h_dyrel",
         D = D, N = N, L = L,
         d0 = 1e-2, etam0 = 1e1,
         x0 = 0.01, dxr = 0.0, dxg = 1.0,           # Gaussian-blob initial
         Da = 0.0,                                    # no reaction
         Xi = 0.0,                                    # no noise
+        solver = :dyrel,           # :direct (sparse-LU)
         CFL = 10.0, alpha = alpha, gamma = 0.0,
         atol = atol, rtol = atol / 1e6, maxit = maxit,
         dtmax = dt,

@@ -22,7 +22,7 @@ using Printf
 
 """
     fluidmech_dyrel!(fluid, phase, dyrel, grid, par, scales;
-                     dt = Inf, P0 = nothing, a1=1, a2=1, a3=0, gamma=par.gamma,
+                     dt, P0 = nothing, a1=1, a2=1, a3=0, gamma=par.gamma,
                      xBC=:periodic, zBC=:closed, top_cnv = 1, bot_cnv = 1,
                      verbose = false) -> (; converged, total_iter, PH_iters)
 
@@ -39,13 +39,13 @@ stabilization, and the compressible continuity `∇·(ρv) = MFS`. The outer
 Picard loop (in `run!`) updates the frozen/lagged terms by re-calling this.
 
 Buoyancy enters via `fluid.Drho`; BCs: periodic-x, closed-z for W, free/no-slip
-for U (`top_cnv`/`bot_cnv` = ±1). Use a large finite `dt` (not `Inf`) so the
-dt-scaled drunken-sailor term stays finite.
+for U (`top_cnv`/`bot_cnv` = ±1). `dt` must be finite: the drunken-sailor term
+`∂ρ·g0·dt` scales with it, in both the residual and the Gershgorin bound.
 """
 function fluidmech_dyrel!(fluid::FluidState{T}, phase::PhaseState{T},
                           dyrel::DyrelCache{T},
                           grid::Grid{T}, par::Parameters{T}, scales::Scales{T};
-                          dt::Real = Inf, P0 = nothing,
+                          dt::Real, P0 = nothing,
                           a1::Real = 1, a2::Real = 1, a3::Real = 0,
                           b1::Real = 1, b2::Real = 0, b3::Real = 0,
                           gamma::Real = par.gamma,
@@ -54,6 +54,8 @@ function fluidmech_dyrel!(fluid::FluidState{T}, phase::PhaseState{T},
                           top_cnv::Integer = 1, bot_cnv::Integer = 1,
                           open_cnv::Bool = false,
                           verbose::Bool = false) where {T<:AbstractFloat}
+    isfinite(dt) || throw(ArgumentError(
+        "fluidmech_dyrel!: dt must be finite (got $dt); the drunken-sailor term ∂ρ·g0·dt scales with dt"))
     cache  = dyrel
     h      = grid.h
     # Reference pressure P0 for the artificial-compressibility term
@@ -100,7 +102,7 @@ function fluidmech_dyrel!(fluid::FluidState{T}, phase::PhaseState{T},
     # Operator-derived augmented-Lagrangian penalty γ_eff = γfact / s_P_phys
     # (per-cell, from the penalty-free Schur diagonal) — a single dimensionless
     # γfact converges all Re/scales (see init.jl). Leaves cache.D_W/D_U = D_full.
-    compute_AL_penalty!(cache, fluid, h; γfact = par.γfact_PT, a1, gamma, dt)
+    compute_AL_penalty!(cache, fluid, h; γfact = par.γfact_PT, a1, gamma, dt, g0 = par.g0)
     cache.c[] = zero(T)                      # undamped start (α=1); refined by Rayleigh
     update_dτ_α_β!(cache, par.CFL_PT)
     cache.initialized = true
@@ -133,6 +135,12 @@ function fluidmech_dyrel!(fluid::FluidState{T}, phase::PhaseState{T},
         normW, normU, normP = dyrel_residual_norms(cache, fluid.rho)
         if itPH == 1
             errW0 = normW + eps(T);  errU0 = normU + eps(T);  errP0 = normP + eps(T)
+        elseif itPH == 2
+            # Re-baseline the pressure scale on the second iterate. At entry P is
+            # the previous Picard sweep's field, so normP measures a stale
+            # pressure and normalising by it hides the multiplier iteration's
+            # actual progress. Matches JustRelax's `itPH == 2` errPt0 reset.
+            errP0 = normP + eps(T)
         end
         err = max(min(normW / errW0, normW),
                   min(normU / errU0, normU),
@@ -190,7 +198,7 @@ function fluidmech_dyrel!(fluid::FluidState{T}, phase::PhaseState{T},
 
                 λmin = dyrel_rayleigh_λmin(cache)
                 cache.c[] = 2 * sqrt(λmin) * par.c_fact_PT
-                gershgorin!(cache, fluid, h; a1, gamma, dt)   # D_full retune (γ_eff fixed)
+                gershgorin!(cache, fluid, h; a1, gamma, dt, g0 = par.g0)  # D_full retune (γ_eff fixed)
                 update_dτ_α_β!(cache, par.CFL_PT)
             end
         end
@@ -200,6 +208,11 @@ function fluidmech_dyrel!(fluid::FluidState{T}, phase::PhaseState{T},
         # cells: P += ω·γ_eff·R_P, with the SAME per-cell γ_eff = γfact/s_P_phys
         # injected into the momentum residual (P_num) and the comp term (η_b).
         # ω = par.pres_relax_PT is the under-relaxation (1 = Newton-Uzawa step).
+        # R_P is refreshed first: the inner loop's last velocity update landed
+        # after its last continuity evaluation, so the cached R_P is one step
+        # stale. Matches JustRelax's `compute_∇V_strain_rate_RP!` immediately
+        # before `stokes.P += γ_eff·RP`.
+        dyrel_residual_P!(cache, fluid, grid, par, P0arr, dt)
         @views @. fluid.P[2:end-1, 2:end-1] += par.pres_relax_PT * cache.γ_eff * cache.R_P
         # pin the pressure gauge (remove the free constant mode) then refresh ghosts
         bnchm || dyrel_apply_pressure_gauge!(fluid, P0arr, cache.γ_eff)

@@ -97,7 +97,7 @@ function smooth!(lvl, par::Parameters{T}; nsweeps::Int, ninner::Int, fscale,
             if itPT % par.n_tune_PT == 0              # expensive retune: rarely
                 λmin = dyrel_rayleigh_λmin(cache)
                 cache.c[] = 2 * sqrt(λmin) * par.c_fact_PT
-                gershgorin!(cache, fluid, h; a1, gamma, dt)
+                gershgorin!(cache, fluid, h; a1, gamma, dt, g0 = par.g0)
                 update_dτ_α_β!(cache, par.CFL_PT)
             end
         end

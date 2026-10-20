@@ -23,7 +23,7 @@ for atol in ATOL
     println("\n=== bnchm_cnsv  atol = $(atol) ===")
 
     par = Parameters(Float64;
-        runID   = "bnchm_cnsv",
+        runID   = "bnchm_cnsv_N256_direct",
         outdir  = joinpath(@__DIR__, "..", "out"),
         save_op = false,                          # PNGs not needed for the benchmark
         nop     = 10,
@@ -31,7 +31,7 @@ for atol in ATOL
 
         # domain
         D  = 10.0,
-        N  = 100,
+        N  = 256,
         L  = 10.0,                               # square box
 
         # timing
@@ -52,6 +52,7 @@ for atol in ATOL
         Xi   = 0.5,
 
         # numerics — the atol/rtol are the per-run knob
+        solver= :direct,           # :direct (sparse-LU) | :dyrel (pseudo-transient)
         CFL   = 0.5,
         maxit = 100,
         alpha = 0.9,

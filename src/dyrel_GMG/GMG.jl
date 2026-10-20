@@ -1,15 +1,14 @@
-# Geometric-multigrid (GMG) Stokes solver for xcore — a SELF-CONTAINED parallel
-# copy of the single-grid DYREL solver (`src/dyrel/`) wrapped in a submodule so
-# it can be developed without touching / breaking the working `src/dyrel/` path.
+# Geometric-multigrid (GMG) Stokes solver for xcore: a V-cycle wrapped around the
+# single-grid DYREL solver in `src/dyrel/`. The DR kernels there ARE the per-level
+# smoother (`smoother.jl::smooth!`) — they are imported, not copied, so the two
+# solvers cannot drift apart. This submodule only adds what multigrid needs:
+# transfer operators, the level hierarchy, the smoother driver, and the V-cycle.
 #
-# The copied DR kernels (cache/gershgorin/stress/advection/residuals/velocity/
-# bcs/reductions) provide the per-level SMOOTHER (`smoother.jl::smooth!`); the new
-# files (transfer/hierarchy/vcycle) add the multigrid V-cycle on top. See
-# `DESIGN_multigrid.md` for the full design.
-#
-# Names here (e.g. `DyrelCache`, the kernels) intentionally shadow the parent's —
-# living in `module GMG` keeps them distinct (`GMG.DyrelCache` vs
-# `xcore.DyrelCache`), so both solvers coexist.
+# The smoother solves `A·v = b` for an arbitrary `b`, encoded by two knobs on the
+# shared residual kernels: `fscale` (1 = physical forcing, 0 = homogeneous error
+# equation) and `cache.bext_*` (injected restricted residual, zero on the fine
+# level). At `fscale = 1, bext = 0` the smoother reduces exactly to the
+# single-grid iteration. See `DESIGN_multigrid.md`.
 
 module GMG
 
@@ -18,23 +17,20 @@ using LinearAlgebra
 using Statistics
 using Printf
 
-# Shared state types + helpers from the parent xcore module (these are NOT
-# duplicated — the GMG solver operates on the same FluidState/PhaseState).
+# State types + the single-grid DYREL solver kernels from the parent module.
+# Nothing below is duplicated: both solvers run the same operator.
 using ..xcore: Grid, Parameters, Scales, FluidState, PhaseState,
-               xcore_zeros, adapt_backend, advect_centered!, compute_corner_eta!
+               xcore_zeros, adapt_backend, advect_centered!, compute_corner_eta!,
+               DyrelCache, compute_AL_penalty!, gershgorin!,
+               update_dτ_α_β!, dyrel_momentum_advection!,
+               dyrel_residual_V!, dyrel_residual_P!, dyrel_update_velocity!,
+               dyrel_apply_velocity_bcs!, dyrel_apply_pressure_bcs!,
+               dyrel_apply_pressure_gauge!,
+               dyrel_residual_norms, dyrel_velocity_residual_norm,
+               dyrel_rayleigh_λmin,
+               compute_dyrel_residual_W_kernel!, compute_dyrel_residual_U_kernel!,
+               compute_dyrel_residual_P_kernel!
 
-# --- copied single-grid DR kernels = the per-level smoother -------------------
-include("cache.jl")
-include("init.jl")
-include("gershgorin.jl")
-include("stress.jl")
-include("advection.jl")
-include("residuals.jl")
-include("velocity.jl")
-include("bcs.jl")
-include("reductions.jl")
-
-# --- geometric-multigrid layer (the WORKING GPU-friendly solver) --------------
 include("transfer.jl")     # restrict/prolong kernels (p/w/u)
 include("hierarchy.jl")    # MGLevel / MGHierarchy + coefficient coarsening
 include("smoother.jl")     # smooth!(level; nsweeps) — truncated DR sub-solve + AL pressure update

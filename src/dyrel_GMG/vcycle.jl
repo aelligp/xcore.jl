@@ -1,7 +1,7 @@
-# V-cycle recursion + outer driver for GMG. Mirrors the MATLAB `multigrid_solve`:
-# pre-smooth → restrict residual → recurse (coarse error solve) → prolong +
-# mean-remove + damped-apply correction → post-smooth. The DR `smooth!` is the
-# per-level relaxation; correction-scheme (linear, frozen-coefficient) MG.
+# V-cycle recursion + outer driver for GMG: pre-smooth → restrict residual →
+# recurse (coarse error solve) → prolong + mean-remove + damped-apply correction
+# → post-smooth. The DR `smooth!` is the per-level relaxation; correction-scheme
+# (linear, frozen-coefficient) MG.
 
 # zero a coarse level's solution (correction scheme starts the coarse error at 0)
 function _zero_solution!(lvl)
@@ -106,10 +106,9 @@ function vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters{T};
     @views prolong_p!(eP, cl.fluid.P[2:end - 1, 2:end - 1])
     # null-space gauge: pressure always; periodic-x ⇒ velocity too
     _remove_mean!(eP);  _remove_mean!(eW);  _remove_mean!(eU)
-    # apply damped correction  v ← v + γ_mg·e.  PLUS, not the MATLAB minus:
-    # xcore's residual is R = b − A·v, so the coarse solve returns e ≈ A⁻¹·R (the
-    # error estimate) and A·(v+e) ≈ b. (MATLAB uses the opposite residual sign
-    # A·v − b, hence its `u -= γ·upd`.) Wrong sign ⇒ geometric blow-up.
+    # apply damped correction  v ← v + γ_mg·e. The sign follows xcore's residual
+    # convention R = b − A·v: the coarse solve returns e ≈ A⁻¹·R (the error
+    # estimate), so A·(v+e) ≈ b. Wrong sign ⇒ geometric blow-up.
     γ = hier.γ_mg
     @views @. lvl.fluid.W[:, 2:end - 1]        += γ * eW
     @views @. lvl.fluid.U[2:end - 1, :]        += γ * eU
@@ -145,16 +144,10 @@ function fluidmech_gmg!(fluid::FluidState{T}, phase::PhaseState{T},
     # term comp=(P−P0)/(η_b·dt) is active in the smoother — essential for the AL
     # iteration to converge geometrically (matches src/dyrel/solve.jl:67). At large
     # dt comp→0 at the fixed point, so it does not bias ∇·ρv=MFS.
+    isfinite(dt) || throw(ArgumentError(
+        "fluidmech_gmg!: dt must be finite (got $dt); the drunken-sailor term ∂ρ·g0·dt scales with dt"))
     P0arr = P0 === nothing ? copy(fluid.P) : P0
     fcache = hier.levels[1].cache
-    # pressure-gauge target: keep the interior-mean of P pinned to the previous
-    # step's mean so the (P−P0)/(η_b·dt) compressibility anchor and the gauge
-    # don't fight. Removes the free constant pressure mode (it is only weakly
-    # anchored by comp and otherwise drifts across V-cycles, stalling the
-    # continuity residual — same fix as src/dyrel/solve.jl).
-    P0int = @view P0arr[2:end-1, 2:end-1]
-    Pgauge_target = T(sum(P0int) / length(P0int))
-
     # mass-flux source (fine grid; mirrors single-grid solve)
     if !bnchm
         inv_dt = isfinite(dt) ? T(inv(dt)) : zero(T)

@@ -155,9 +155,10 @@ function refresh_coefficients!(hier::MGHierarchy{T}, par::Parameters{T};
     γf(l) = l == nlev ? T(par.γfact_PT) : T(par.mg_gfact)
     # finest level: coefficients are live; build the operator-derived penalty
     # (γ_eff = γfact/s_P_phys, leaves D_W/D_U = D_full) exactly as the
-    # single-grid solver, then refresh s_P from D_full.
-    compute_AL_penalty!(h1.cache, h1.fluid, h1.grid.h; γfact = γf(1), a1, gamma, dt)
-    compute_schur_diag!(h1.cache, h1.fluid, h1.grid.h)
+    # single-grid solver. `compute_AL_penalty!` leaves `cache.s_P` holding the
+    # PENALTY-FREE Schur diagonal it derived γ_eff from; recomputing it here from
+    # the penalised D_full would silently replace it with a different quantity.
+    compute_AL_penalty!(h1.cache, h1.fluid, h1.grid.h; γfact = γf(1), a1, gamma, dt, g0 = par.g0)
     _set_smoother_damping!(h1.cache, par.mg_cfact)
     update_dτ_α_β!(h1.cache, par.CFL_PT)
 
@@ -170,8 +171,7 @@ function refresh_coefficients!(hier::MGHierarchy{T}, par::Parameters{T};
         # etaco recomputed from coarse η (consistent with the fine construction)
         compute_corner_eta!(f.etaco, f.eta; xBC = :periodic, zBC = :closed)
         compute_AL_penalty!(hier.levels[l].cache, f, hier.levels[l].grid.h;
-                            γfact = γf(l), a1, gamma, dt)
-        compute_schur_diag!(hier.levels[l].cache, f, hier.levels[l].grid.h)
+                            γfact = γf(l), a1, gamma, dt, g0 = par.g0)
         _set_smoother_damping!(hier.levels[l].cache, par.mg_cfact)
         update_dτ_α_β!(hier.levels[l].cache, par.CFL_PT)
     end

@@ -23,7 +23,7 @@
 # (the earlier scalar-η_b vs per-cell-s_P mismatch caused divergence).
 
 """
-    compute_AL_penalty!(cache, fluid, h; γfact, a1, gamma, dt) -> nothing
+    compute_AL_penalty!(cache, fluid, h; γfact, a1, gamma, dt, g0) -> nothing
 
 Build the per-cell augmented-Lagrangian penalty `cache.γ_eff = γfact / s_P_phys`
 (and set `cache.η_b = cache.γ_eff`), then leave `cache.D_W/D_U` holding the
@@ -32,14 +32,15 @@ velocity Jacobi preconditioner and λmax. Reuses `gershgorin!` and
 `compute_schur_diag!` verbatim. Call once per `fluidmech_dyrel!` entry.
 
 `γfact` is the dimensionless over-penalisation factor (`par.γfact_PT`); `a1`,
-`gamma`, `dt` are the BD2 / horizontal-inertia / time-step coefficients passed to
-`gershgorin!`.
+`gamma`, `dt`, `g0` are the BD2 / horizontal-inertia / time-step / gravity
+coefficients passed to `gershgorin!`.
 """
 function compute_AL_penalty!(cache::DyrelCache{T}, fluid::FluidState{T}, h::Real;
-                             γfact::Real, a1::Real, gamma::Real, dt::Real) where {T<:AbstractFloat}
+                             γfact::Real, a1::Real, gamma::Real, dt::Real,
+                             g0::Real) where {T<:AbstractFloat}
     # 1. penalty-free momentum diagonal D_phys (viscous + inertia, γ_eff = 0)
     fill!(cache.γ_eff, zero(T))
-    gershgorin!(cache, fluid, h; a1, gamma, dt)
+    gershgorin!(cache, fluid, h; a1, gamma, dt, g0)
     # 2. physical Schur diagonal from D_phys
     compute_schur_diag!(cache, fluid, h)
     # 3. operator-derived per-cell penalty γ_eff = γfact / s_P_phys; η_b matched
@@ -47,6 +48,6 @@ function compute_AL_penalty!(cache::DyrelCache{T}, fluid::FluidState{T}, h::Real
     @. cache.γ_eff = γ / cache.s_P
     @. cache.η_b   = cache.γ_eff
     # 4. recompute the diagonal WITH the penalty (D_full) for velocity precond/λmax
-    gershgorin!(cache, fluid, h; a1, gamma, dt)
+    gershgorin!(cache, fluid, h; a1, gamma, dt, g0)
     return nothing
 end

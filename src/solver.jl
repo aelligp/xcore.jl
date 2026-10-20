@@ -52,9 +52,24 @@ function solve_fluidmech!(::DirectSolver, fluid, phase, grid, par, scales;
     return nothing
 end
 
+# The matrix-free solvers hardcode the boundary conditions their kernels were
+# written for: periodic in x (`sds = -1`), closed in z. `fluidmech!` assembles
+# other combinations, so accepting them here would silently solve a different
+# problem — check instead of assuming.
+function _check_matrixfree_bcs(what::AbstractString, sds, xBC, zBC)
+    sds == -1 || throw(ArgumentError(
+        "$what: only sds = -1 (periodic side boundaries) is implemented, got sds = $sds; use solver = :direct"))
+    xBC === :periodic || throw(ArgumentError(
+        "$what: only xBC = :periodic is implemented, got $xBC; use solver = :direct"))
+    zBC === :closed || throw(ArgumentError(
+        "$what: only zBC = :closed is implemented, got $zBC; use solver = :direct"))
+    return nothing
+end
+
 function solve_fluidmech!(s::DyrelSolver, fluid, phase, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3,
                           sds, top_cnv, bot_cnv, open_cnv, xBC, zBC, verbose = false)
+    _check_matrixfree_bcs("solver = :dyrel", sds, xBC, zBC)
     st = fluidmech_dyrel!(fluid, phase, s.cache, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
                           xBC, zBC, top_cnv, bot_cnv, open_cnv, verbose = verbose)
@@ -67,6 +82,12 @@ end
 function solve_fluidmech!(s::GMGSolver, fluid, phase, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3,
                           sds, top_cnv, bot_cnv, open_cnv, xBC, zBC, verbose = false)
+    _check_matrixfree_bcs("solver = :gmg", sds, xBC, zBC)
+    # The V-cycle's coarse levels solve the homogeneous error equation with a
+    # closed bottom (no drain, so no net mass source is re-injected per level).
+    # An open bottom would need its own homogeneous coarse-level form.
+    open_cnv && throw(ArgumentError(
+        "solver = :gmg does not implement open_cnv = true; use solver = :dyrel or :direct"))
     st = GMG.fluidmech_gmg!(fluid, phase, s.hier, grid, par, scales;
                             dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
                             xBC, zBC, top_cnv, bot_cnv, verbose = verbose)

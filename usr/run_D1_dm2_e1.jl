@@ -1,16 +1,21 @@
 using xcore
-using KernelAbstractions: CPU
+# Backend selection: xcore_backend() = CPU. For GPU, load the GPU package first
+# (its xcore extension activates) and pick the matching symbol:
+#   using CUDA;  be = xcore_backend(:cuda)    # Float64 OK
+#   using Metal; be = xcore_backend(:metal)   # Float32 only (no native F64)
+be = xcore_backend()
 
 # Port of usr/run_D1_dm2_e1.m
 # D = 1e1 m  |  d0 = 1e-2 m  |  etam0 = 1e1 Pa·s
-# Runs ~2 dimensionless time units with 200×300 grid.
+# Runs ~2 dimensionless time units. N=128 ⇒ 128×192 grid (must be a multiple
+# of 32 for the :gmg solver — N a multiple of 64 keeps Nx=1.5N also ÷32).
 
 # ---------------------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------------------
 
 par = Parameters(Float64;
-    runID   = "D1_dm2_e1_N150",
+    runID   = "D1_dm2_e1_N512_gmg",
     outdir  = joinpath(@__DIR__, "..", "out"),
     save_op = true,
     nop     = 10,          # save figures every nop steps
@@ -19,7 +24,7 @@ par = Parameters(Float64;
 
     # domain
     D  = 1e1,
-    N  = 150,
+    N  = 256,
     L  = 1e1 * 1.5,         # 1.5 × D
 
     # timing
@@ -33,15 +38,21 @@ par = Parameters(Float64;
     Da    = 0.01,
     Xi    = 0.5,
 
-    # numerics
-    CFL   = 0.5,
-    rtol  = 1e-4,
-    atol  = 1e-9,
-    maxit = 15,
-    alpha = 0.9,
-    gamma = 1e-3,
-    TINT  = :bd2im,
-    ADVN  = :weno5,
+    solver= :gmg,           # :direct (sparse-LU) | :dyrel (pseudo-transient) | :gmg (geometric MG)
+    atol = 1e-6,                # Picard convergence tolerance (nonlinear residual)
+    # maxit_PH       = 100,                # outer Powell-Hestenes iterations
+    # maxit_PT       = 50000,            # inner Dynamic-Relaxation iterations per PH step
+    # total_iterMax_PT = 50000,          # global DR-iteration cap per fluidmech_dyrel! call (JustRelax `total_iterMax`); accept & let the outer Picard loop continue
+
+    # --- geometric-multigrid (:gmg) controls — the dyrel sweep is the per-level
+    # smoother; only the coarsest level is solved to tolerance. ---
+    # mg_minlvl      = 16,                 # coarsen until min(Nz,Nx) would drop below this ⇒ coarsest stays ~16–31 cells/dim. 16² is the floor on purpose: the coarse grid must still RESOLVE the nonlinear rheology (power-law / T-dependent η) so the coarse correction sees the right operator (future development). Level count scales with N. GMG efficiency needs grids that coarsen cleanly to ~16 ⇒ resolution must be a multiple of 32 (asserted in build_hierarchy); awkward N (200=8·25) can't and is rejected.
+    # mg_npre        = 2,                  # pre-smooth PH steps per level (V-cycle down)
+    # mg_npost       = 2,                  # post-smooth PH steps per level (V-cycle up)
+    # mg_ncoarse     = 20,                 # max coarsest-level PH steps (solve-to-tolerance budget)
+    # mg_coarse_rtol   = 1e-4,            # coarsest-level relative residual drop (solve-to-tolerance)
+    # mg_inner       = 32,                 # inner DR sweeps per smoothing PH step. WORK-OPTIMAL: there is a stability FLOOR (~32 on the buoyancy gate; below it the coarse correction amplifies ⇒ V-cycle DIVERGES) and above it more inner ⇒ fewer cycles, so total work (cycles·inner) is minimised just above the floor. Coarse-correction damping (γ_mg<1) does NOT lower the floor (it hurts). Much cheaper than a full sub-solve (≈2000).
+    # mg_gamma         = 1,               # coarse-grid-correction damping γ_mg
 )
 
 # ---------------------------------------------------------------------------
@@ -52,9 +63,9 @@ grid   = Grid(par)
 scales = compute_scales(par, grid)
 print_scales(scales, par)
 
-fluid  = FluidState(Float64, CPU(), grid.Nz, grid.Nx)
-phase  = PhaseState(Float64, CPU(), grid.Nz, grid.Nx)
-ns     = NoiseState(Float64, grid, scales)
+fluid  = FluidState(Float64, be, grid.Nz, grid.Nx)
+phase  = PhaseState(Float64, be, grid.Nz, grid.Nx)
+ns     = NoiseState(Float64, be, grid, scales)
 hst    = History(Float64)
 
 time0, dt0, step0 = initialize!(phase, fluid, ns, hst, grid, par, scales)

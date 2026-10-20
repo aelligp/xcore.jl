@@ -38,8 +38,8 @@ using KernelAbstractions
                                                   @Const(P), @Const(P_num), @Const(Drho),
                                                   @Const(rho), @Const(rhow),
                                                   @Const(rhoWo), @Const(rhoWoo),
-                                                  @Const(advn_mz), @Const(D_W),
-                                                  invh, g0, third, half, a1, a2, a3, inv_dt, dt,
+                                                  @Const(advn_mz), @Const(D_W), @Const(bext_W),
+                                                  invh, g0, third, half, a1, a2, a3, inv_dt, dt, fscale,
                                                   dr::Bool)
     iz_f, ix = @index(Global, NTuple)
     @inbounds begin
@@ -74,7 +74,12 @@ using KernelAbstractions
             # R = −(KV·W + GG·P − rr): viscous (+∇·τ) and pressure (−∂P) keep
             # their sign; forcing/diagonal terms (buoyancy, inertia, sailor,
             # lagged, advection) carry the opposite sign to match fluidmech!.
-            r = d_tzz_dz + d_txz_dx - dP_dz + body - inertia - sailor + lagged - adv
+            # The operator-diagonal terms (inertia, sailor) are always present;
+            # the pure forcing (body + lagged − adv) is scaled by `fscale`, and
+            # `bext_W` adds an externally injected RHS. `fscale = 1`, `bext = 0`
+            # is the physical problem.
+            r = d_tzz_dz + d_txz_dx - dP_dz - inertia - sailor +
+                fscale * (body + lagged - adv) + bext_W[iz_f, ix]
             if dr
                 dPnum_dz = (P_num[iz_f, ix] - P_num[iz_f - 1, ix]) * invh
                 R_W[iz_f, ix] = (r - dPnum_dz) / D_W[iz_f, ix]
@@ -95,8 +100,8 @@ end
                                                   @Const(P), @Const(P_num),
                                                   @Const(rho), @Const(rhou),
                                                   @Const(rhoUo), @Const(rhoUoo),
-                                                  @Const(advn_mx), @Const(D_U),
-                                                  invh, g0, third, half, a1, a2, a3, gamma, inv_dt, dt,
+                                                  @Const(advn_mx), @Const(D_U), @Const(bext_U),
+                                                  invh, g0, third, half, a1, a2, a3, gamma, inv_dt, dt, fscale,
                                                   dr::Bool)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
@@ -125,8 +130,10 @@ end
         lagged   = (a2 * rhoUo[iz, ix] + a3 * rhoUoo[iz, ix]) * inv_dt
         adv      = advn_mx[iz, ix]
         # forcing/diagonal terms carry opposite sign to the +∇·τ−∂P core
-        # (R = −(KV·U + GG·P − rr); matches fluidmech!)
-        r = d_txx_dx + d_txz_dz - dP_dx - inertia - sailor + lagged - adv
+        # (R = −(KV·U + GG·P − rr); matches fluidmech!). `fscale`/`bext_U` as in
+        # the W kernel; no buoyancy on U.
+        r = d_txx_dx + d_txz_dz - dP_dx - inertia - sailor +
+            fscale * (lagged - adv) + bext_U[iz, ix]
         if dr
             dPnum_dx = (P_num[iz, ixR] - P_num[iz, ixL]) * invh
             R_U[iz, ix] = (r - dPnum_dx) / D_U[iz, ix]
@@ -145,7 +152,8 @@ end
                                                   @Const(P), @Const(P0),
                                                   @Const(MFS), @Const(rho),
                                                   @Const(rhow), @Const(rhou),
-                                                  @Const(η_b), @Const(γ_eff), invh, inv_dt)
+                                                  @Const(η_b), @Const(bext_P), @Const(γ_eff),
+                                                  invh, inv_dt, fscale)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
         # ∇·(ρv): mass-flux through the four faces of cell (iz,ix)
@@ -160,7 +168,10 @@ end
         # ρ factor). Without this the penalty feedback is ρ× too strong and the
         # explicit DR step (dτ from λmax) diverges. Constraint ∇·(ρv)=MFS is
         # unchanged (1/ρ > 0 just rescales the pressure multiplier).
-        rp = (MFS[iz, ix] - div_ρv - comp) / rho[iz, ix]
+        # `fscale` zeroes the MFS source for a homogeneous error equation;
+        # `bext_P` injects an external RHS (already 1/ρ-scaled). div_ρv and comp
+        # are operator terms (∝ current v, P) and are always present.
+        rp = (fscale * MFS[iz, ix] - div_ρv - comp) / rho[iz, ix] + bext_P[iz, ix]
         R_P[iz, ix]   = rp
         # Fused Schur penalty P_num = γ_eff·R_P (was a separate broadcast each DR
         # iter) — saves one kernel launch per inner iteration on GPU. P_num is
@@ -180,25 +191,30 @@ Compute the W/U momentum residuals into `cache.R_W`, `cache.R_U`. `dr=false`
 gives the un-preconditioned Powell-Hestenes form (convergence check); `dr=true`
 gives the Jacobi-preconditioned DR form with the Schur penalty `cache.P_num`.
 `coeffs = (a1, a2, a3, gamma, dt)` are the BD2 time-integration coefficients.
+
+`fscale` scales the physical forcing (buoyancy, BD2 history, advection):
+`fscale = 1` with `cache.bext_W/U = 0` is the physical momentum problem;
+`fscale = 0` with a restricted residual in `cache.bext_W/U` is the homogeneous
+error equation the multigrid coarse levels solve.
 """
 function dyrel_residual_V!(cache::DyrelCache{T}, phase::PhaseState{T},
                            fluid::FluidState{T}, grid::Grid{T}, par::Parameters{T};
                            dr::Bool, a1::Real, a2::Real, a3::Real,
-                           gamma::Real, dt::Real) where {T<:AbstractFloat}
+                           gamma::Real, dt::Real, fscale::Real = 1) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(cache.R_W)
     invh   = T(inv(grid.h));  g0 = T(par.g0)
     inv_dt = isfinite(dt) ? T(inv(dt)) : zero(T)
-    dtT    = T(dt);  third = T(1//3);  half = T(1//2)
+    dtT    = T(dt);  fs = T(fscale);  third = T(1//3);  half = T(1//2)
     # Stress is recomputed inline in the residual kernels (no phase.txx/tzz/txz
     # round-trip, no separate stress kernel) — they take W, U, eta, etaco.
     compute_dyrel_residual_W_kernel!(backend)(
         cache.R_W, fluid.W, fluid.U, fluid.eta, fluid.etaco, fluid.P, cache.P_num, fluid.Drho,
-        fluid.rho, fluid.rhow, fluid.rhoWo, fluid.rhoWoo, cache.advn_mz, cache.D_W,
-        invh, g0, third, half, T(a1), T(a2), T(a3), inv_dt, dtT, dr; ndrange = size(cache.R_W))
+        fluid.rho, fluid.rhow, fluid.rhoWo, fluid.rhoWoo, cache.advn_mz, cache.D_W, cache.bext_W,
+        invh, g0, third, half, T(a1), T(a2), T(a3), inv_dt, dtT, fs, dr; ndrange = size(cache.R_W))
     compute_dyrel_residual_U_kernel!(backend)(
         cache.R_U, fluid.U, fluid.W, fluid.eta, fluid.etaco, fluid.P, cache.P_num,
-        fluid.rho, fluid.rhou, fluid.rhoUo, fluid.rhoUoo, cache.advn_mx, cache.D_U,
-        invh, g0, third, half, T(a1), T(a2), T(a3), T(gamma), inv_dt, dtT, dr; ndrange = size(cache.R_U))
+        fluid.rho, fluid.rhou, fluid.rhoUo, fluid.rhoUoo, cache.advn_mx, cache.D_U, cache.bext_U,
+        invh, g0, third, half, T(a1), T(a2), T(a3), T(gamma), inv_dt, dtT, fs, dr; ndrange = size(cache.R_U))
     # No synchronize: KA keeps same-backend launches ordered; sync happens at
     # the next host read (the reductions / convergence checks in solve.jl).
     return nothing
@@ -209,17 +225,20 @@ end
 
 Compute the compressible continuity residual `cache.R_P = MFS − ∇·(ρv) −
 (P−P0)/(η_b·dt)`. Pass `dt = Inf` to drop the artificial-compressibility term
-(steady-state limit). `P0` is the previous-step pressure.
+(steady-state limit). `P0` is the previous-step pressure. `fscale` scales the
+`MFS` source and `cache.bext_P` adds an injected RHS, as in `dyrel_residual_V!`.
 """
 function dyrel_residual_P!(cache::DyrelCache{T}, fluid::FluidState{T},
                            grid::Grid{T}, par::Parameters{T},
-                           P0::AbstractMatrix{T}, dt::Real) where {T<:AbstractFloat}
+                           P0::AbstractMatrix{T}, dt::Real;
+                           fscale::Real = 1) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(cache.R_P)
     invh   = T(inv(grid.h))
     inv_dt = isfinite(dt) ? T(inv(dt)) : zero(T)
     compute_dyrel_residual_P_kernel!(backend)(
         cache.R_P, cache.P_num, fluid.W, fluid.U, fluid.P, P0, fluid.MFS, fluid.rho,
-        fluid.rhow, fluid.rhou, cache.η_b, cache.γ_eff, invh, inv_dt; ndrange = size(cache.R_P))
+        fluid.rhow, fluid.rhou, cache.η_b, cache.bext_P, cache.γ_eff, invh, inv_dt, T(fscale);
+        ndrange = size(cache.R_P))
     # No synchronize: KA keeps same-backend launches ordered; sync happens at
     # the next host read (the reductions / convergence checks in solve.jl).
     return nothing

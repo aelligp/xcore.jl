@@ -57,6 +57,13 @@ mutable struct DyrelCache{T<:AbstractFloat, A<:AbstractMatrix{T}}
     advn_mz::A
     advn_mx::A
 
+    # ---- external RHS injected by the multigrid V-cycle --------------------
+    # Shapes match R_W/R_U/R_P. Zero on a single-grid solve and on the GMG fine
+    # level (together with `fscale = 1` that reproduces the physical problem);
+    # on coarse levels they carry the restricted residual so the smoother solves
+    # the homogeneous error equation A·e = bext.
+    bext_W::A;  bext_U::A;  bext_P::A
+
     # ---- Global scalars (boxed in Refs to keep struct fully-typed) ---------
     c::Base.RefValue{T}              # damping; updated by Rayleigh quotient
     last_PH_iters::Base.RefValue{Int}  # diagnostic counter
@@ -86,6 +93,7 @@ function DyrelCache(::Type{T}, backend, Nz::Integer, Nx::Integer) where {T<:Abst
         z(Nz, nxf), z(Nz, nxf), z(Nz, nxf), z(Nz, nxf),
         z(Nz, Nx),  z(Nz, Nx),  z(Nz, Nx),                              # R_P, P_num, s_P
         z(max(Nz - 1, 1), Nx),  z(Nz, nxf),                             # advn_mz, advn_mx
+        z(nzf, Nx), z(Nz, nxf), z(Nz, Nx),                              # bext_W, bext_U, bext_P
         Ref(zero(T)),  Ref(0),  Ref(0),                                 # c, counters
     )
 end
