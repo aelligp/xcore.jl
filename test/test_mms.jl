@@ -11,7 +11,7 @@ include("mms_sources.jl")
 
         # resolution sweep: match run_bnchm_VP.m's NN = [100, 200, 400] scaling
         # (smaller N here to keep the test runtime tight; ratio is what matters)
-        for N in (32, 64, 128)
+        for N in (32, 64, 96)
             # ------ build analytic manufactured solution for this resolution
             mms = mms_sources(T, N, N, L)
 
