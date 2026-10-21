@@ -1,5 +1,5 @@
 using Statistics
-using xcore: History, record_history!, PhaseState, FluidState, NoiseState,
+using xcore: History, record_history!, time_average, PhaseState, FluidState, NoiseState,
              Parameters, Grid, compute_scales, initialize!
 using KernelAbstractions: CPU
 
@@ -84,4 +84,14 @@ end
     end
     @test issorted(hst.time)
     @test length(hst.time) == 5
+end
+
+@testset "time_average uses the history.m trailing window" begin
+    # entry n averages v[n0:n]; for v = 1:N that mean is (n0 + n)/2
+    v  = collect(1.0:1000.0)
+    ta = time_average(v)
+    @test length(ta) == length(v)
+    @test ta[1] == 1.0
+    @test ta[200] == (156 + 200) / 2        # n0 = round(156.1)
+    @test ta[1000] == (753 + 1000) / 2      # n0 = round(752.9), just below 0.75 n + 7.5
 end

@@ -223,3 +223,19 @@ function record_history!(hst::History{T},
 
     return nothing
 end
+
+"""
+    time_average(v::AbstractVector) -> Vector
+
+Running time average of a history series `v` (e.g. `hst.x_mean`), as recorded
+in `HST.*_tavg` by `src/history.m`: entry `n` is the mean of `v[n0:n]` with
+`n0 = round((1/n^10 + 1/(30 + 0.75(n - 30))^10)^(-1/10))`, a smooth minimum of
+`n` and `7.5 + 0.75n`, i.e. the trailing quarter of the record once `n ≳ 30`.
+"""
+function time_average(v::AbstractVector)
+    Base.require_one_based_indexing(v)
+    return map(eachindex(v)) do n
+        n0 = round(Int, (1 / float(n)^10 + 1 / (30 + (n - 30) * 0.75)^10)^(-1 / 10), RoundNearestTiesAway)
+        mean(@view v[n0:n])
+    end
+end

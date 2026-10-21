@@ -2,15 +2,14 @@ using xcore
 using KernelAbstractions: CPU
 using Printf
 
-# Mass-conservation stress test for the MULTIGRID pressure-projection solver
-# (par.solver = :mg) on a REAL setup: the D1_dm2_e1 physics (compressible
+# Mass-conservation stress test for the matrix-free solvers on a REAL setup: the D1_dm2_e1 physics (compressible
 # two-phase Navier-Stokes, Re>1), reduced to N=64 + a few steps for a quick
 # turnaround. Reports the fractional conservation error EB per step (should stay
 # at solver-floor levels, like the direct/dyrel solvers).
 #
 # Run:  julia --project=. usr/run_mg_conservation_test.jl
 
-solver = get(ENV, "XCORE_SOLVER", "gmg") |> Symbol     # :gmg | :direct | :dyrel
+solver = get(ENV, "XCORE_SOLVER", "gmg") |> Symbol     # :gmg | :vmg | :direct | :dyrel
 N      = parse(Int, get(ENV, "XCORE_N", "64"))
 nsteps = parse(Int, get(ENV, "XCORE_NSTEPS", "5"))
 
@@ -41,7 +40,6 @@ par = Parameters(Float64;
     # numerics
     CFL   = 0.9,
     γfact_PT = 20,              # JustRelax-standard (Schur-diagonal makes 1e3 unnecessary)
-    pres_relax_PT = parse(Float64, get(ENV, "XCORE_OMEGA", "0.3")),  # SIMPLE under-relaxation of the MG pressure projection
     rtol  = 1e-4,
     atol  = 1e-9,
     maxit = 150,

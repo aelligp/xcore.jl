@@ -4,7 +4,7 @@
 # wide-stencil advection.
 #
 # Each component's momentum ρ_d·v_d is advected as a cell field on the control
-# volumes (CVs) centered on its faces, with `advect!`'s flux-form schemes. Along
+# volumes (CVs) centered on its faces, with the flux-form schemes of `advect!` (`_fluxes`). Along
 # its own axis d:
 #   * bounded (always z): the CVs are the interior faces 2..N_d, advected by v_d
 #     interpolated to cell centers; boundary faces get zero.
@@ -19,76 +19,6 @@
 # directly from the state, applying the ghost rule of each axis on the fly
 # (periodic wrap, otherwise repeat of the edge value); the TVD scheme reads one
 # face further out, with the same rule.
-
-@inline _pos(u, half) = (u + abs(u)) * half
-@inline _neg(u, half) = (u - abs(u)) * half
-
-# One-dimensional face fluxes (q_hi, q_lo) along an axis: `F(m)` is the advected
-# field m cells from the current one; `vl`, `vh` the velocities of the low/high
-# faces, `vll`, `vhh` those one face further out (TVD only).
-@inline function _fluxes(::Val{:centr}, F, vl, vh, vll, vhh, half)
-    fc = F(0)
-    return vh * (fc + F(1)) * half, vl * (fc + F(-1)) * half
-end
-@inline function _fluxes(::Val{:upwd1}, F, vl, vh, vll, vhh, half)
-    fc = F(0);  fm = F(-1);  fp = F(1)
-    return _pos(vh, half) * fc + _neg(vh, half) * fp, _pos(vl, half) * fm + _neg(vl, half) * fc
-end
-@inline function _fluxes(::Val{:quick}, F, vl, vh, vll, vhh, half)
-    T = typeof(half);  sixth = T(1//6)
-    fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
-    fppos = sixth * (2 * fp + 5 * fc - fm)
-    fpneg = sixth * (2 * fc + 5 * fp - fpp)
-    fmpos = sixth * (2 * fc + 5 * fm - fmm)
-    fmneg = sixth * (2 * fm + 5 * fc - fp)
-    return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
-           _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
-end
-@inline function _fluxes(::Val{:fromm}, F, vl, vh, vll, vhh, half)
-    T = typeof(half);  quarter = T(0.25)
-    fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
-    fppos = fc + quarter * (fp - fm)
-    fpneg = fp + quarter * (fc - fpp)
-    fmpos = fm + quarter * (fc - fmm)
-    fmneg = fc + quarter * (fm - fp)
-    return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
-           _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
-end
-@inline function _fluxes(::Val{:weno3}, F, vl, vh, vll, vhh, half)
-    T = typeof(half);  ε = T(1e-6)
-    fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
-    fppos = _weno3_poly(fm, fc, fp, ε)
-    fpneg = _weno3_poly(fpp, fp, fc, ε)
-    fmpos = _weno3_poly(fmm, fm, fc, ε)
-    fmneg = _weno3_poly(fp, fc, fm, ε)
-    return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
-           _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
-end
-@inline function _fluxes(::Val{:weno5}, F, vl, vh, vll, vhh, half)
-    ε = eps(typeof(half))
-    fmmm = F(-3);  fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2);  fppp = F(3)
-    fppos = _weno5_poly(fmm, fm, fc, fp, fpp, ε)
-    fpneg = _weno5_poly(fppp, fpp, fp, fc, fm, ε)
-    fmpos = _weno5_poly(fmmm, fmm, fm, fc, fp, ε)
-    fmneg = _weno5_poly(fpp, fp, fc, fm, fmm, ε)
-    return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
-           _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
-end
-@inline function _fluxes(::Val{:tvdim}, F, vl, vh, vll, vhh, half)
-    fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
-    lpos = _pos(vl, half);  lneg = _neg(vl, half)
-    hpos = _pos(vh, half);  hneg = _neg(vh, half)
-    fppos = _tvd_flux(fm, fc, fp, lpos, hpos)
-    fpneg = _tvd_flux(fpp, fp, fc, _neg(vhh, half), hneg)
-    fmpos = _tvd_flux(fmm, fm, fc, _pos(vll, half), lpos)
-    fmneg = _tvd_flux(fp, fc, fm, hneg, lneg)
-    return hpos * fppos + hneg * fpneg, lpos * fmpos + lneg * fmneg
-end
-
-# ghost rule of a CV row with n cells: periodic wrap, otherwise edge repeat
-@inline _ghost(i, n, periodic) = periodic ? mod1(i, n) : clamp(i, 1, n)
-# CV-face index outside 1..n+1 (one face further out, TVD only)
-@inline _ghost_face(i, n, periodic) = i < 1 ? (periodic ? n : 1) : (i > n + 1 ? (periodic ? 2 : n + 1) : i)
 
 # momentum ρ_d·v_d at CV index c (ghost rule applied); `own` = periodic own axis
 Base.@propagate_inbounds @inline function _cv_momentum(v, ρd, c::CartesianIndex{D}, d, own, n,
@@ -163,7 +93,7 @@ velocity and face densities, scheme `par.ADVN` ∈ (`:centr`, `:upwd1`, `:quick`
 """
 function momentum_advection!(cache::StokesCache{D, T}, fluid, grid, par, op::StokesOp{D}) where {D, T}
     scheme = par.ADVN
-    scheme in (:centr, :upwd1, :quick, :fromm, :weno3, :weno5, :tvdim) ||
+    scheme in ADVN_SCHEMES ||
         throw(ArgumentError("momentum_advection!: unsupported scheme = :$scheme"))
     return _momentum_advection!(cache, fluid, grid, op, Val(scheme))
 end

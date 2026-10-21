@@ -62,7 +62,7 @@ function update_segregation_speed!(phase::PhaseState{T}, grid::Grid{T},
     @views begin
         x_w_ext = phase.x_w[:, icx]      # (Nz+1, Nx+2)
         m_w_ext = phase.m_w[:, icx]
-        phase.wm .= -x_w_ext ./ max.(m_w_ext, eps(T)) .* phase.wx
+        phase.wm .= -x_w_ext ./ m_w_ext .* phase.wx
     end
     return nothing
 end
@@ -98,8 +98,8 @@ function update_phase_velocities!(phase::PhaseState{T}, fluid::FluidState{T},
 
     @inbounds @. phase.Wx = fluid.W + phase.wx + (ns.xisw + ns.xixw) + ns.xiew
     @inbounds @. phase.Ux = fluid.U +            (ns.xisu + ns.xixu) + ns.xieu
-    @inbounds @. phase.Wm = fluid.W + phase.wm - x_w_ext / max(m_w_ext, eps(T)) * (ns.xisw + ns.xixw) + ns.xiew
-    @inbounds @. phase.Um = fluid.U +            - x_u_ext / max(m_u_ext, eps(T)) * (ns.xisu + ns.xixu) + ns.xieu
+    @inbounds @. phase.Wm = fluid.W + phase.wm - x_w_ext / m_w_ext * (ns.xisw + ns.xixw) + ns.xiew
+    @inbounds @. phase.Um = fluid.U +            - x_u_ext / m_u_ext * (ns.xisu + ns.xixu) + ns.xieu
 
     return nothing
 end

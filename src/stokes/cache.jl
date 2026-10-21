@@ -27,12 +27,11 @@ solve on one grid:
 
 * `γ_eff`, `η_b` — per-cell augmented-Lagrangian penalty and the coefficient of
   the pseudo-transient continuity term (multigrid smoother only).
-* per component: Gershgorin diagonal `Dv`, `λmax`, pseudo-time step `dτ`,
-  damping `α`/`β`, pseudo-rate `dvdτ`, last increment `dv_step`, residual `Rv`
+* per component: Gershgorin diagonal `Dv`, `λmax`, pseudo-rate `dvdτ`, residual `Rv`
   and its snapshot `Rv_old`, frozen momentum advection `advn` (zero on Dirichlet
   faces), and the injected multigrid right-hand side `bext`.
-* continuity residual `R_P`, Schur penalty `P_num = γ_eff·R_P`, Schur diagonal
-  `s_P`, injected `bext_P`, previous-iterate viscosity `eta_prev`.
+* continuity residual `R_P`, Schur penalty `P_num = γ_eff·R_P`, injected
+  `bext_P`.
 * `P0` (ghosted pressure shape): the reference pressure of a solve (gauge level,
   pseudo-transient term); zero on multigrid coarse levels.
 * `dP`: the interior pressure change of the last multiplier update or V-cycle.
@@ -44,20 +43,14 @@ mutable struct StokesCache{D, T<:AbstractFloat, A<:AbstractArray{T, D}}
     const η_b::A
     const Dv::NTuple{D, A}
     const λmax::NTuple{D, A}
-    const dτ::NTuple{D, A}
-    const α::NTuple{D, A}
-    const β::NTuple{D, A}
     const dvdτ::NTuple{D, A}
-    const dv_step::NTuple{D, A}
     const Rv::NTuple{D, A}
     const Rv_old::NTuple{D, A}
     const advn::NTuple{D, A}
     const bext::NTuple{D, A}
     const R_P::A
     const P_num::A
-    const s_P::A
     const bext_P::A
-    const eta_prev::A
     const P0::A
     const dP::A
     const anderson::AndersonPH{T, A}
@@ -77,8 +70,8 @@ function StokesCache(::Type{T}, backend, N::NTuple{D, Int}) where {T<:AbstractFl
     fv() = ntuple(d -> z(face(d)), Val(D))
     A = typeof(z(N))
     return StokesCache{D, T, A}(z(N), z(N),
-                                fv(), fv(), fv(), fv(), fv(), fv(), fv(), fv(), fv(), fv(), fv(),
-                                z(N), z(N), z(N), z(N), z(N), z(N .+ 2), z(N),
+                                fv(), fv(), fv(), fv(), fv(), fv(), fv(),
+                                z(N), z(N), z(N), z(N .+ 2), z(N),
                                 AndersonPH{T, A}(), zero(T), zero(T))
 end
 StokesCache(::Type{T}, backend, grid::Union{Grid, Grid3D}) where {T<:AbstractFloat} =

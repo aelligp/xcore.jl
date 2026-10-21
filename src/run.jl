@@ -1,14 +1,8 @@
 using Printf
 using Dates
-# Top-level time-loop orchestrator. Mirrors src/main.m's outer structure:
-# pick time-stepping coefficients, snapshot the previous solution, run a
-# fixed number of nonlinear Picard iterations, then march on.
-#
-# Differences from main.m for now:
-#  - no iterative-convergence test on resnorm; we just do `n_iter` Picard sweeps
-#  - no history / diagnose / output hooks — caller passes a `callback`
-#  - noise (xi*) is still pending — only segregation is wired into Wx, Wm
-#  - boundary crystallisation (Gx) is zero (Da-driven bndshape pending)
+# Top-level time loop, following src/main.m: pick time-stepping coefficients,
+# snapshot the previous solution, iterate Picard sweeps to convergence, record
+# history and output, then march on.
 
 """
     compute_bndtaperw!(phase, grid, par, scales) -> nothing
@@ -90,15 +84,14 @@ end
     initialize!(phase, fluid, ns, hst, grid, par, scales;
                 xBC=:periodic, zBC=:closed) -> (time, dt, step)
 
-Set up an initial state on a fresh `(phase, fluid, ns, hst)` quartet, then
-record the t=0 entry into `hst` so the conservation baseline `HST.sumB[1]` is
-the true initial total mass (matches `src/init.m:264-267`'s
-`store; history; output;` block at t=0).
+Set up an initial state on a fresh `(phase, fluid, ns, hst)` quartet (`src/init.m`).
+`hst` stays empty: the first history record, and the conservation baseline
+`hst.sumB[1]`, is the state after step 1, as in the MATLAB code.
 
 If `par.restart != 0`, load from the corresponding checkpoint
 (`par.restart < 0` ⇒ most recent `_cont.jld2`; `par.restart > 0` ⇒
 `_<restart>.jld2`) and return `(time, dt, step)` to resume the time loop
-mid-run. Otherwise the fresh-init path returns `(0, scales.dt0, 0)`.
+mid-run. Otherwise the fresh-init path returns `(0, scales.dt0/10, 0)`.
 """
 function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                      hst::History{T},
@@ -115,7 +108,8 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
         # checkpointed because they're cheap and might evolve with code changes)
         compute_bndtaperw!(phase, grid, par, scales)
         compute_bndshape!(phase, grid, scales)
-        return (T(meta.time), T(meta.dt), Int(meta.step))
+        # the checkpoint holds the saved step's start time (init.m:250)
+        return (T(meta.time + meta.dt), T(meta.dt), Int(meta.step))
     end
 
     # boundary taper for segregation speed (closed top/bot by default)
@@ -132,7 +126,10 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
     # once, then the per-cell assignment runs as a kernel on whatever backend
     # `phase.x` lives on. `gp` is analytic in the cell position.
     backend = KernelAbstractions.get_backend(phase.x)
+    # smoothed with the Gaussian Gkrp = exp(-bnd_w²/2·|k|²) (init.m:103,114)
     rp_h = randn(MersenneTwister(par.seed), T, Nz, Nx)
+    Gkrp = _make_gaussian_filter(T, Nz, Nx, grid.h, scales.bnd_w / sqrt(T(2)))
+    rp_h .= real.(ifft(Gkrp .* fft(rp_h)))
     rp_h .= (rp_h .- sum(rp_h) / length(rp_h)) ./ std(rp_h)
     rp = adapt_backend(backend, rp_h)
     _init_x_kernel!(backend)(phase.x, rp, phase.bndshape,
@@ -143,18 +140,22 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
     phase.m .= one(T) .- phase.x
 
     # seed eta to the melt viscosity so the Picard blend in update_viscosity!
-    # has something sensible to relax against
+    # has something sensible to relax against, and the Re ramp factors to their
+    # scale values (init.m:182-189)
     fill!(fluid.eta,   par.etam0)
     fill!(fluid.etaco, par.etam0)
     fill!(phase.etas,  par.etam0)
+    fill!(phase.fReL,  scales.fReL0)
+    fill!(phase.fRel,  scales.fRel0)
 
-    update!(phase, fluid, grid, par, scales; xBC, zBC)
-    # seed phase densities X = rho·x, M = rho·m once (init.m:198-199). From
-    # here on `X`, `M` are owned by phsevo! — update! only refreshes rho/chi/mu.
+    # seed phase densities X = rho·x, M = rho·m from the initial bulk density,
+    # then update (init.m:198-201). From here on `X`, `M` are owned by phsevo! —
+    # update! only refreshes rho/chi/mu. Velocities, segregation speeds and noise
+    # potentials start at zero, as in init.m.
+    update_volume_fractions!(phase, fluid, par)
     @. phase.X = fluid.rho * phase.x
     @. phase.M = fluid.rho * phase.m
-    noise!(ns, phase, grid, par, scales, scales.dt0; first_iter=true)
-    update_phase_velocities!(phase, fluid, ns, grid, par; xBC, zBC)
+    update!(phase, fluid, grid, par, scales; xBC, zBC)
 
     # seed history buffers with the current state — first BD2 step uses BE
     # coefficients so this is consistent.
@@ -163,14 +164,10 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
     fluid.rhoo .= fluid.rho;  fluid.rhooo .= fluid.rho
     store_noise!(ns)
 
-    # t=0 record so `hst.sumB[1]` is the true initial baseline used by
-    # `EB/EM/EX` (mirrors src/init.m:264-267 `store; history; output;`).
-    # Use BE coefficients — no history exists yet, so dsumBdto/dsumBdtoo are
-    # zero and DB[1] becomes zero by design.
-    record_history!(hst, T(0), T(scales.dt0), phase, fluid, ns, grid,
-                    T(1), T(1), T(0), T(1), T(0), T(0))
-
-    return (T(0), T(scales.dt0), 0)
+    # No history record at t = 0: init.m records one, but step 1 overwrites it
+    # (history.m: stp = max(1, step/nrh)), so the first record and the mass
+    # baseline of EB/EM/EX are the state after step 1.
+    return (T(0), T(scales.dt0) / 10, 0)   # dt = dt0/10 (init.m:75)
 end
 
 """
@@ -203,15 +200,15 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
               grid::Grid{T}, par::Parameters{T}, scales::Scales{T};
               nsteps::Integer = par.Nt,
               time::Real = 0,
-              dt::Real = scales.dt0,
+              dt::Real = scales.dt0 / 10,
               step::Integer = 0,
-              ADVN::Symbol = :weno5,
+              ADVN::Symbol = par.ADVN,
               xBC::Symbol = :periodic,
               zBC::Symbol = :closed,
               sds::Integer = -1,
+              open_cnv::Bool = par.open_cnv,
               top_cnv::Integer = 1,
-              bot_cnv::Integer = 1,
-              open_cnv::Bool = false,
+              bot_cnv::Integer = open_cnv ? -1 : 1,   # open bottom is free slip (init.m:148)
               verbose::Bool = true) where {T<:AbstractFloat}
 
     nsteps0 = ceil(Int, (par.t0end * scales.t0) / scales.dt0)
@@ -227,7 +224,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
     step = Int(step)
     res  = StepResidual(grid, fluid)
 
-    # Stokes/Navier-Stokes solver strategy (:direct | :dyrel | :gmg | :mg).
+    # Stokes/Navier-Stokes solver strategy (:direct | :dyrel | :gmg | :vmg).
     # Persistent state (caches, MG hierarchy) allocated once, reused across all
     # Picard sweeps and time steps. Dispatch via `solve_fluidmech!` below.
     solver = make_solver(par, fluid, phase, grid; xBC)
@@ -245,6 +242,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
         (a1, a2, a3, b1, b2, b3) = time_coefs(T, par.TINT, step)
         store_previous!(fluid, phase)
         store_noise!(ns)
+        dto = dt
 
         resnorm  = T(1)
         resnorm0 = T(1)
@@ -266,9 +264,9 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                   iter < par.maxit || iter < 3
 
                 iter += 1
-                snapshot!(res, phase, fluid)
+                snapshot!(res, fluid)
 
-                t_phs += @elapsed phsevo!(phase, fluid, grid, par, scales;
+                t_phs += @elapsed nupd_X = phsevo!(phase, fluid, grid, par, scales;
                         ADVN, xBC, zBC,
                         a1, a2, a3, b1, b2, b3, dt)
                 t_fm  += @elapsed lin_ok = solve_fluidmech!(solver, fluid, phase, grid, par, scales;
@@ -282,9 +280,11 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                     noise!(ns, phase, grid, par, scales, dt; first_iter = (iter ≤ 1))
                     update_phase_velocities!(phase, fluid, ns, grid, par; xBC, zBC)
                     update!(phase, fluid, grid, par, scales; xBC, zBC)
+                    # every sweep adapts dt to the current iterate (update.m:159-164)
+                    dt = update_dt(phase, fluid, grid, par, dto)
                 end
 
-                resnorm, rm, rp = compute_resnorm(res, phase, fluid, dt)
+                resnorm, rm, rp = compute_resnorm(res, fluid, dt, nupd_X)
                 # The reference is the FIRST sweep's residual and stays fixed.
                 # Re-baselining it whenever the residual rises pins the reported
                 # ratio at 1 and makes a growing residual indistinguishable from
@@ -306,7 +306,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
             "resnorm = $resnorm (atol = $(par.atol)), rel = $(resnorm / resnorm0) " *
             "(rtol = $(par.rtol)), last fluidmech solve converged = $lin_ok")
 
-        time += dt
+        # diagnostics, history and output carry the step's start time (main.m:41-50)
         verbose && print_step!(step, time, dt, phase, fluid, ns, scales;
                                elapsed, t_phs, t_fm, t_upd, iter)
 
@@ -324,8 +324,7 @@ function run!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{T},
                         outdir = par.outdir, runID = par.runID,
                         frame, dt, step)
         end
-
-        dt = update_dt(phase, fluid, grid, par, dt)
+        time += dt
     end
     return time, dt
 end

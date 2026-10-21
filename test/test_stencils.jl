@@ -33,24 +33,3 @@
         @test log2(errs_z[2] / errs_z[3]) > 1.9
     end
 end
-
-@testset "fill_ghosts! periodic+closed" begin
-    f = Float64[
-        1 2 3 4 ;
-        5 6 7 8 ;
-        9 10 11 12 ;
-        13 14 15 16 ;
-    ]                                                       # 4x4 interior
-    halo = 1
-    fh = zeros(Float64, 4 + 2halo, 4 + 2halo)
-    embed_interior!(fh, f, halo)
-    fill_ghosts!(fh, halo; zBC = :closed, xBC = :periodic)
-
-    # periodic in x: leftmost ghost column equals rightmost interior column
-    @test fh[2:5, 1]   == fh[2:5, 5]                        # column 1 ← column 5 (interior end)
-    @test fh[2:5, end] == fh[2:5, 2]                        # column end ← column 2 (interior start)
-
-    # closed in z: top/bot ghost rows repeat the first/last interior row
-    @test fh[1, 2:5]   == fh[2, 2:5]
-    @test fh[end, 2:5] == fh[end-1, 2:5]
-end

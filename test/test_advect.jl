@@ -4,7 +4,6 @@
     for T in (Float64, Float32)
         L = T(2π); k = T(1)
         U0 = T(0.7);  W0 = T(-0.3)
-        halo = 1
         errs = T[]
         for N in (32, 64, 128)
             h  = L / N
@@ -16,15 +15,12 @@
             ZZ = repeat(reshape(zc, N, 1), 1, N)
 
             f_int  = cos.(k .* XX) .* cos.(k .* ZZ)
-            f_halo = zeros(T, N + 2halo, N + 2halo)
-            embed_interior!(f_halo, f_int, halo)
-            fill_ghosts!(f_halo, halo; zBC = :periodic, xBC = :periodic)
 
             u = fill(U0, N, N + 1)                          # constant U on x-faces
             w = fill(W0, N + 1, N)                          # constant W on z-faces
 
             adv = zeros(T, N, N)
-            advect!(adv, f_halo, u, w, h, :centr)
+            advect!(adv, f_int, u, w, h, :centr; xBC = :periodic, zBC = :periodic)
 
             exact = .-U0 .* k .* sin.(k .* XX) .* cos.(k .* ZZ) .+
                      W0 .* k .* cos.(k .* XX) .* (.-sin.(k .* ZZ))
@@ -40,7 +36,6 @@ end
     for T in (Float64, Float32)
         L = T(2π); k = T(1)
         U0 = T(0.7);  W0 = T(-0.3)
-        halo = 3
         errs = T[]
         for N in (32, 64, 128)
             h  = L / N
@@ -50,15 +45,12 @@ end
             ZZ = repeat(reshape(zc, N, 1), 1, N)
 
             f_int  = cos.(k .* XX) .* cos.(k .* ZZ)
-            f_halo = zeros(T, N + 2halo, N + 2halo)
-            embed_interior!(f_halo, f_int, halo)
-            fill_ghosts!(f_halo, halo; zBC = :periodic, xBC = :periodic)
 
             u = fill(U0, N, N + 1)
             w = fill(W0, N + 1, N)
 
             adv = zeros(T, N, N)
-            advect!(adv, f_halo, u, w, h, :weno5)
+            advect!(adv, f_int, u, w, h, :weno5; xBC = :periodic, zBC = :periodic)
 
             exact = .-U0 .* k .* sin.(k .* XX) .* cos.(k .* ZZ) .+
                      W0 .* k .* cos.(k .* XX) .* (.-sin.(k .* ZZ))

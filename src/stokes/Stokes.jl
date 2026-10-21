@@ -19,7 +19,8 @@ using LinearAlgebra: pinv
 using ..xcore: TO, Grid, Grid3D, Parameters, Scales, FluidState, FluidState3D,
                xcore_zeros, coarsen_grid3d,
                update_kinematics!, update_viscosity!,
-               scheme_halo, _weno3_poly, _weno5_poly, _tvd_flux
+               ADVN_SCHEMES, _fluxes, _ghost, _ghost_face,
+               _val, _unit, _ones, _setidx, _hz_axes, _hz_vaxes, _tfoldl
 
 include("layout.jl")
 include("cache.jl")

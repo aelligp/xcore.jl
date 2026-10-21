@@ -32,7 +32,7 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
     # --- domain ---
     D::T                = T(10)
     N::Int              = 100
-    L::T                = T(10)            # set equal to h for 1-D mode; defaults to D
+    L::T                = D                # chamber width; set equal to h for 1-D mode
 
     # --- timing ---
     Nt::Int             = Int(1e6)
@@ -61,8 +61,8 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
     CC::Matrix{T}       = T[2.09 0.09; 0.37 1.45]
 
     # --- physical control / noise ---
-    L0::T               = T(0.1)            # default D/100 with D=10
-    l0::T               = T(0.1)            # default d0*10 with d0=0.01
+    L0::T               = D / 100          # eddy correlation length
+    l0::T               = d0 * 10          # phase-fluctuation correlation length
     Da::T               = T(0.01)
     Xi::T               = T(0.5)
     Ptop::T             = T(1e5)
@@ -84,7 +84,7 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
     etacntr::T          = T(1e8)
 
     # --- Stokes solver selection + DYREL (pseudo-transient) controls ---
-    solver::Symbol      = :direct           # :direct (sparse-LU) | :dyrel (pseudo-transient) | :gmg (geometric multigrid, dyrel sweep as smoother) | :vmg (DYREL PH + velocity V-cycles + Cahouet–Chabard) | :mg (WIP scalar-Poisson projection)
+    solver::Symbol      = :direct           # :direct (sparse-LU) | :dyrel (pseudo-transient) | :gmg (geometric multigrid, dyrel sweep as smoother) | :vmg (DYREL PH + velocity V-cycles + Cahouet–Chabard)
     maxit_PH::Int       = 100                # outer Powell-Hestenes iterations
     maxit_PT::Int       = 50_000            # inner Dynamic-Relaxation iterations per PH step
     total_iterMax_PT::Int = 50_000          # global DR-iteration cap per fluidmech_dyrel! call
@@ -93,7 +93,7 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
     c_fact_PT::T        = T(0.5)            # damping scaling factor (Eq. 19, [1/2, 1])
     γfact_PT::T         = T(50)             # dimensionless augmented-Lagrangian factor; γ_eff = γfact/s_P_phys. STARTING value for :dyrel, which re-derives it from the Powell-Hestenes contraction it measures (`fluidmech_dyrel!`); :gmg uses it as given via mg_gfact.
     rel_drop_PT::T      = T(1e-2)           # inner-DR target: reduce the velocity residual by this factor WITHIN each PH sweep
-    atol_PH::T          = atol              # per-fluidmech (linear) solve tolerance — AUTO-TRACKS the nonlinear `atol` by default. The outer Picard loop only needs each fluidmech solve as accurate as `atol`; the old fixed 1e-6 made the solver OVER-SOLVE when atol was looser (e.g. atol=1e-3 ⇒ ~1000× wasted work) — catastrophic for :gmg/:mg (each extra V-cycle is expensive) and the cause of dyrel's Picard wobble (linear looser than nonlinear target ⇒ can't reach atol). At matched atol_PH=atol, :gmg is ~21× faster than :dyrel on bnchm_cnsv (128², atol=1e-3). Override explicitly to decouple.
+    atol_PH::T          = atol              # per-fluidmech (linear) solve tolerance; defaults to the nonlinear `atol`. Looser than `atol` and the Picard loop cannot reach `atol`; much tighter and every sweep over-solves. Override explicitly to decouple.
     forcing_PH::T       = T(0.1)            # inexact-solve forcing for the matrix-free solvers inside run!: each fluidmech solve may stop once its error has dropped by this factor (:dyrel from entry, where that error is the current Picard iterate's nonlinear residual; :gmg from its first V-cycle). A solve driven far below it is wasted — the buoyancy setting its right-hand side moves on the next sweep. Such a sweep does not count as converged, so the Picard loop still ends on a solve that reached `atol_PH`. It changes the Picard path, so the result agrees with :direct to the Picard tolerance rather than sweep for sweep. 0 runs every solve to `atol_PH`.
     pres_relax_PT::T    = T(1.0)            # augmented-Lagrangian multiplier under-relaxation ω in P += ω·γ_eff·R_P (ω=1 = Newton-Uzawa step; <1 under-relaxes for robustness).
     anderson_PH::Int    = 0                 # :dyrel Anderson-acceleration depth m for the Powell-Hestenes multiplier update: each sweep mixes the last m pressure iterates and updates by least squares instead of taking the plain step P += ω·γ_eff·R_P. 0 = plain update. The history restarts at every solve and whenever the penalty retune changes γ_eff.
@@ -107,11 +107,11 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
     mg_npost::Int       = 2                  # post-smooth PH steps per level (V-cycle up)
     mg_ncoarse::Int     = 20                 # max coarsest-level PH steps (solve-to-tolerance budget)
     mg_coarse_rho::T    = T(0.5)             # target Powell-Hestenes contraction the coarsest level tunes its penalty γfact to reach (`coarse_solve!`); ≤ 0 leaves γfact at `γfact_PT`. The coarse solve stops retuning once it contracts this fast, so a smaller target buys a stronger penalty — worth it while the coarsest grid is inertia-dominated, where the V-cycle keeps improving past the point the coarse solve itself does. A retune that worsens the measured contraction is undone: the rate law assumes the Schur diagonal is what limits λ, which a strong viscosity contrast breaks.
-    mg_coarse_rtol::T   = T(1e-4)            # coarsest-level relative residual drop (solve-to-tolerance, `coarse_solve!`). Measured: tightening past 1e-4 changes nothing at 256²/512² even in the inertia-dominated regime, and the coarse solve is a negligible fraction of runtime, so one flat default suffices for both regimes.
-    mg_inner::Int       = 32                 # DR iterations per smoothing PH step — an EXACT count (no polling/reductions inside the smoother). The old ~32 stability floor came from the smoother running UNDAMPED (Rayleigh c never computed within a short sweep); with the fixed per-level damping `mg_cfact` much smaller counts are stable — tune down for cheaper V-cycles.
-    mg_cfact::T         = T(1)               # per-level smoother damping scale: c_level = mg_cfact·√(mean λmax), the critical damping of the upper half-spectrum (λ ≳ λmax/4) the level must smooth (coarser levels handle the rest). 0 reproduces the old undamped smoother.
-    mg_gfact::T         = γfact_PT           # SMOOTHING-level AL over-penalization (coarsest always keeps γfact_PT). MEASURED (harness, step-1 state, N=128/256): REDUCING it below γfact_PT makes the V-cycle WORSE — ρ_cycle 0.55→1.8→3.7 for 50→2→1 at N=128 full depth — because the per-sweep multiplier update γ_eff·R_P is the only high-frequency PRESSURE smoothing the level has; weakening it starves intermediate levels (they neither smooth nor solve P) and the cycle amplifies. The "small γ inside MG" theory (grad-div spectrum compression) is falsified for this scheme; keep the penalty strong on all levels. Knob retained for experiments.
-    mg_gamma::T         = T(1.0)             # coarse-grid-correction damping γ_mg. γ_mg=1 = full (undamped) correction = textbook MG. HISTORY: with a FROZEN entry-P0 comp term, γ_mg=1 DIVERGED (ρ_cycle≈1.6 → 1e16) because the over-penalised, biased per-cycle system over-corrected; the workaround was γ_mg=0.5. The PSEUDO-TRANSIENT P0 tracking (`fluidmech_gmg!` advances P0 each V-cycle) makes each cycle solve a well-posed per-increment system, which STABILISES the full correction: measured at N=256 production, γ_mg=1.0 ⇒ a FLAT 6 V-cycles/solve (textbook), vs 0.5 ⇒ ~19–64 (the constant-0.87 factor mode). γ_mg=1.2 over-shoots/diverges, so 1.0 is the optimum. (Restoring γ_mg=1 is THE efficiency win that lets :gmg beat :direct at large N — O(N²·6) vs O(N³).)
+    mg_coarse_rtol::T   = T(1e-4)            # coarsest-level relative residual drop (solve-to-tolerance, `coarse_solve!`). Tightening past 1e-4 does not change the V-cycle count at 256²/512², in either the viscous or the inertia-dominated regime.
+    mg_inner::Int       = 32                 # DR iterations per smoothing PH step — an EXACT count (no polling/reductions inside the smoother). With the per-level damping `mg_cfact` > 0, smaller counts are stable and give cheaper V-cycles.
+    mg_cfact::T         = T(1)               # per-level smoother damping scale: c_level = mg_cfact·√(mean λmax), the critical damping of the upper half-spectrum (λ ≳ λmax/4) the level must smooth (coarser levels handle the rest). 0 leaves the smoother undamped.
+    mg_gfact::T         = γfact_PT           # SMOOTHING-level AL over-penalization (coarsest always keeps γfact_PT). Keep it at γfact_PT: the per-sweep multiplier update γ_eff·R_P is the only high-frequency pressure smoothing a level has, so a weaker penalty makes the V-cycle diverge (ρ_cycle 0.55 → 1.8 → 3.7 for 50 → 2 → 1 at N=128).
+    mg_gamma::T         = T(1.0)             # coarse-grid-correction damping γ_mg. γ_mg=1 is the full (undamped) correction. It is stable only because `fluidmech_gmg!` advances P0 every V-cycle, so each cycle solves a well-posed increment system; it then gives ~6 V-cycles per solve independent of N. γ_mg=0.5 needs ~19–64, and γ_mg=1.2 diverges.
 
 
     # --- modes ---

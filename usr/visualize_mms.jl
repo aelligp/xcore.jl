@@ -3,24 +3,19 @@ Visualize the MMS benchmark result.
 
 Run from the repo root:
 
-    julia --project=julia examples/visualize_mms.jl
+    julia --project=. usr/visualize_mms.jl
 
-Requires CairoMakie (for PNG output) or GLMakie (for interactive). Install with:
-
-    julia --project=julia -e 'using Pkg; Pkg.add("CairoMakie")'
-
-Writes PNGs into `xcore/out/visualize/`.
+Writes PNGs into `out/visualize/`.
 =#
 
 using xcore
 using KernelAbstractions: CPU
-using CairoMakie                                         # activates XCoreMakieExt
 using LinearAlgebra
 
 # pull the MMS source generator (test-only helper, not part of the package)
 include(joinpath(@__DIR__, "..", "test", "mms_sources.jl"))
 
-const OUT = joinpath(@__DIR__, "..", "..", "out", "visualize")
+const OUT = joinpath(@__DIR__, "..", "out", "visualize")
 mkpath(OUT)
 
 T = Float64

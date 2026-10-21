@@ -1,44 +1,24 @@
 using KernelAbstractions
 
 """
-    xcore_backend(which::Symbol = :cpu) -> KernelAbstractions.Backend
-
-Single entry point for backend selection, avoiding any `using CUDA` / `using
-Metal` / `using AMDGPU` / `using KernelAbstractions` name juggling in run scripts:
-
-    be = xcore_backend()         # CPU
-    be = xcore_backend(:metal)   # Metal  — requires `using Metal` in the script
-                                 #          (weak-dep ext/xcoreMetalExt.jl, F32 only!)
-    be = xcore_backend(:cuda)    # CUDA   — requires `using CUDA` in the script
-                                 #          (weak-dep ext/xcoreCUDAExt.jl)
-    be = xcore_backend(:amdgpu)  # AMDGPU — requires `using AMDGPU` in the script
-                                 #          (weak-dep ext/xcoreAMDGPUExt.jl)
-
-Every GPU backend is a weak dependency: a machine opts in by adding the GPU
-package to its environment and loading it, so the package itself stays portable
-across Apple/NVIDIA/AMD. Each path checks `functional()` so a broken driver
-fails loudly here rather than at the first kernel launch.
-"""
-xcore_backend(which::Symbol = :cpu) = _backend_impl(Val(which))
-
-_backend_impl(::Val{:cpu}) = CPU()
-
-_backend_impl(::Val{S}) where {S} =
-    error("xcore_backend(:$S) is not available. Add `using Metal` (:metal), " *
-          "`using CUDA` (:cuda), or `using AMDGPU` (:amdgpu) to your script — and " *
-          "the matching package to your environment. Available without extras: :cpu.")
-
-"""
     xcore_zeros(backend, T, dims...) -> array
 
 Backend-aware zero allocation. Thin wrapper around `KernelAbstractions.zeros`
 so call sites in the package don't need to import KA directly.
 
-Pick `backend = CPU()` for host arrays; pass a GPU backend (e.g. `CUDABackend()`
-loaded via a weak-dep extension) for device arrays.
+Pick `backend = CPU()` for host arrays; pass a GPU backend (e.g. `CUDABackend()`)
+for device arrays. Throws if the backend reports itself non-functional (broken
+or missing driver), or if `T` is double precision and the backend lacks Float64
+support (e.g. `MetalBackend()`; use `Float32` there).
 """
-xcore_zeros(backend, ::Type{T}, dims::Integer...) where {T} =
-    KernelAbstractions.zeros(backend, T, dims...)
+function xcore_zeros(backend, ::Type{T}, dims::Integer...) where {T}
+    KernelAbstractions.functional(backend) === false &&
+        error("Backend $backend is loaded but not functional; check its driver " *
+              "(e.g. `Metal.versioninfo()` or `CUDA.versioninfo()`).")
+    T <: Union{Float64, ComplexF64} && !KernelAbstractions.supports_float64(backend) &&
+        error("Backend $backend does not support Float64; use Float32 instead.")
+    return KernelAbstractions.zeros(backend, T, dims...)
+end
 
 """
     adapt_backend(backend, A::AbstractArray) -> array

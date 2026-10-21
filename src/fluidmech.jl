@@ -322,7 +322,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         w_mz = (W[1:end-1, 2:end-1] .+ W[2:end, 2:end-1]) ./ T(2)
         size(cache.advn_mz) == size(f_mz) || (cache.advn_mz = similar(f_mz))
         advn_mz = cache.advn_mz
-        advect_centered!(advn_mz, f_mz, u_mz, w_mz, h, par.ADVN; xBC, zBC)
+        advect!(advn_mz, f_mz, u_mz, w_mz, h, par.ADVN; xBC, zBC)
         rr = Drho[2:end-1, :] .* g0 .+ (a2 .* rhoWo[2:end-1, :] .+ a3 .* rhoWoo[2:end-1, :]) ./ T(dt) .- advn_mz
         if bnchm
             rr .+= bnchm_data.src_W[2:end-1, 2:end-1]
@@ -429,7 +429,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         end
         size(cache.advn_mx) == size(f_mx) || (cache.advn_mx = similar(f_mx))
         advn_mx = cache.advn_mx
-        advect_centered!(advn_mx, f_mx, u_mx, w_mx, h, par.ADVN; xBC, zBC)
+        advect!(advn_mx, f_mx, u_mx, w_mx, h, par.ADVN; xBC, zBC)
         if periodic
             col_avg = (advn_mx[:, 1] .+ advn_mx[:, end]) ./ T(2)
             advn_mx[:, 1]   .= col_avg

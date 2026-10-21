@@ -91,35 +91,24 @@ end
 
 # Schur-complement diagonal s_P[c] = (1/(h²ρ_c)) Σ_faces ρ_f/D_f. Dirichlet faces
 # (z-boundary W, walls of a bounded axis) cannot respond to a pressure change
-# and are left out; counting them would deflate the penalty γfact/s_P exactly
-# in the boundary cells.
-@kernel function _schur_diag_kernel!(s_P, @Const(Dv), @Const(ρf), @Const(rho), periodic, invh2)
+# and are left out; counting them would deflate the penalty γ_eff = γfact/s_P
+# exactly in the boundary cells.
+@kernel function _penalty_kernel!(γ_eff, @Const(Dv), @Const(ρf), @Const(rho), periodic, invh2, γ)
     c = @index(Global, Cartesian)
     @inbounds begin
-        D = length(c);  Z = zero(eltype(s_P))
+        D = length(c);  Z = zero(eltype(γ_eff))
         sfac = _tfoldl(Z, _hz_axes(Val(D))) do s, k
             ek = _unit(c, k)
             fixed = k == 1 || !periodic[k]
             @inbounds begin
                 lo = fixed && c[k] == 1            ? Z : ρf[k][c] / Dv[k][c]
-                hi = fixed && c[k] == size(s_P, k) ? Z : ρf[k][c + ek] / Dv[k][c + ek]
+                hi = fixed && c[k] == size(γ_eff, k) ? Z : ρf[k][c + ek] / Dv[k][c + ek]
             end
             s + lo + hi
         end
-        s_P[c] = sfac * invh2 / rho[c]
+        s_P = sfac * invh2 / rho[c]
+        γ_eff[c] = γ / s_P
     end
-end
-
-"""
-    schur_diagonal!(cache, fluid, grid, op) -> nothing
-
-Fill `cache.s_P` from the current diagonals `cache.Dv` and the face densities.
-"""
-function schur_diagonal!(cache::StokesCache{D, T}, fluid, grid, op::StokesOp{D}) where {D, T}
-    backend = KernelAbstractions.get_backend(cache.s_P)
-    _schur_diag_kernel!(backend)(cache.s_P, cache.Dv, face_density(fluid), fluid.rho,
-                                 op.periodic, T(inv(grid.h)^2); ndrange = size(cache.s_P))
-    return nothing
 end
 
 """
@@ -128,7 +117,7 @@ end
 Operator-derived augmented-Lagrangian penalty `γ_eff = γfact/s_P_phys`, with
 `s_P_phys` the Schur diagonal of the penalty-free momentum diagonal, and
 `η_b = γ_eff·max(1, 1/(ρ·dt))`. Leaves `cache.Dv`/`cache.λmax` holding the
-penalized diagonal and `cache.s_P` the penalty-free Schur diagonal.
+penalized diagonal.
 
 `γfact` is dimensionless: `1/s_P` is a viscosity carrying the viscous and
 inertial scaling of the operator. The same γ_eff is the momentum penalty
@@ -141,40 +130,12 @@ function penalty!(cache::StokesCache{D, T}, fluid, grid, op::StokesOp{D};
                   γfact::Real) where {D, T}
     fill!(cache.γ_eff, zero(T))
     gershgorin!(cache, fluid, grid, op)
-    schur_diagonal!(cache, fluid, grid, op)
-    γ = T(γfact)
-    @. cache.γ_eff = γ / cache.s_P
+    _penalty_kernel!(KernelAbstractions.get_backend(cache.γ_eff))(
+        cache.γ_eff, cache.Dv, face_density(fluid), fluid.rho, op.periodic,
+        T(inv(grid.h)^2), T(γfact); ndrange = size(cache.γ_eff))
     dtT = op.dt
     @. cache.η_b = cache.γ_eff * max(one(T), inv(fluid.rho * dtT))
     gershgorin!(cache, fluid, grid, op)
-    return nothing
-end
-
-@kernel function _dτ_α_β_kernel!(dτ, α, β, @Const(λmax), c, CFL)
-    J = @index(Global, Cartesian)
-    @inbounds begin
-        dτJ = 2 * CFL / sqrt(λmax[J])
-        dτ[J] = dτJ
-        cdτ = c * dτJ
-        idn = inv(2 + cdτ)
-        β[J] = 2 * dτJ * idn
-        α[J] = (2 - cdτ) * idn
-    end
-end
-
-"""
-    update_dτ_α_β!(cache, CFL) -> nothing
-
-Pseudo-time step `dτ = 2·CFL/√λmax` and damping coefficients
-`β = 2dτ/(2 + c·dτ)`, `α = (2 − c·dτ)/(2 + c·dτ)` from the current `cache.λmax`
-and global damping `cache.c`.
-"""
-function update_dτ_α_β!(cache::StokesCache{D, T}, CFL::Real) where {D, T}
-    backend = KernelAbstractions.get_backend(cache.R_P)
-    for d in 1:D
-        _dτ_α_β_kernel!(backend)(cache.dτ[d], cache.α[d], cache.β[d], cache.λmax[d],
-                                 cache.c, T(CFL); ndrange = size(cache.λmax[d]))
-    end
     return nothing
 end
 

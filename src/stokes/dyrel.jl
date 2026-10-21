@@ -142,7 +142,6 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
     penalty!(cache, fluid, grid, op; γfact)
     check_preconditioner(cache)
     # `cache.c` carries the damping learned by the previous solve (0 = undamped).
-    update_dτ_α_β!(cache, par.CFL_PT)
     foreach(A -> fill!(A, zero(T)), cache.dvdτ)
     apply_velocity_bcs!(fluid, grid, op; mfs_mean, Ddom, open_cnv)
     bnchm || pressure_gauge!(fluid, P0arr)
@@ -220,7 +219,6 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
                 @timeit_debug TO "PH penalty retune" begin
                 penalty!(cache, fluid, grid, op; γfact)
                 check_preconditioner(cache)
-                update_dτ_α_β!(cache, par.CFL_PT)
                 end
                 _anderson_reset!(cache.anderson)    # history from a different map
                 verbose && @printf("  [PH %02d] rho=%.3f over %d sweeps -> gfact=%.4g\n",
@@ -245,7 +243,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
             @timeit_debug TO "residual_P" residual_continuity!(cache, fluid, grid, P0arr, Inf)
             @timeit_debug TO "residual_V" residual_momentum!(cache, fluid, grid, op; dr = true)
             @timeit_debug TO "update velocity + BCs" begin
-            update_velocity!(cache, fluid)
+            update_velocity!(cache, fluid, par.CFL_PT)
             apply_velocity_bcs!(fluid, grid, op; mfs_mean, Ddom, open_cnv)
             end
             if itPT % par.n_tune_PT == 0
@@ -264,14 +262,13 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
                 if par.rheology_in_PT
                     update_kinematics!(phase, fluid, grid)
                     update_viscosity!(phase, fluid, grid, par, scales; xBC, zBC,
-                                      relaxation = par.visc_relax_PT, eta_prev = cache.eta_prev)
+                                      relaxation = par.visc_relax_PT)
                 end
                 @timeit_debug TO "retune (Rayleigh + Gershgorin)" begin
-                λmin = rayleigh_λmin(cache)
+                λmin = rayleigh_λmin(cache, par.CFL_PT)
                 cache.c = 2 * sqrt(λmin) * par.c_fact_PT
                 gershgorin!(cache, fluid, grid, op)
                 check_preconditioner(cache)
-                update_dτ_α_β!(cache, par.CFL_PT)
                 end
             end
         end

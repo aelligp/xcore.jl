@@ -163,7 +163,7 @@ end
 
 Restrict η and ρ down the hierarchy (cell means), rebuild each coarse level's
 face densities and edge viscosities from them, and set every level's penalty,
-diagonals, smoother damping and dτ/α/β. The finest level's coefficients are
+diagonals and smoother damping. The finest level's coefficients are
 live. Smoothing levels use `par.mg_gfact`; the coarsest level keeps the penalty
 factor its own solve learned (`par.γfact_PT` at first). `γfact` overrides all.
 """
@@ -185,7 +185,6 @@ function refresh_coefficients!(hier::MGHierarchy{T}, par::Parameters, op::Stokes
         penalty!(lvl.cache, lvl.fluid, lvl.grid, op; γfact = γf(l))
         check_preconditioner(lvl.cache)
         _set_smoother_damping!(lvl.cache, par.mg_cfact)
-        update_dτ_α_β!(lvl.cache, par.CFL_PT)
     end
     return nothing
 end

@@ -8,15 +8,19 @@
 _dot_diff(a, b, c) = sum(_bc((ai, bi, ci) -> ai * (bi - ci), a, b, c))
 
 """
-    rayleigh_λmin(cache) -> λmin
+    rayleigh_λmin(cache, CFL) -> λmin
 
 Rayleigh-quotient estimate of the smallest eigenvalue of the preconditioned
-velocity operator from the last increment `dv_step` and the residual change
-`Rv − Rv_old`: `|Σ Δv·ΔR| / Σ Δv²` (0 when there is no increment).
+velocity operator from the last increment Δv = β·dτ·dvdτ and the residual change
+`Rv − Rv_old`: `|Σ Δv·ΔR| / Σ Δv²` (0 when there is no increment). Call it
+after `update_velocity!` and before `cache.c` or `cache.λmax` change, so Δv is
+the increment that update applied.
 """
-function rayleigh_λmin(cache::StokesCache{D, T}) where {D, T}
-    num = abs(foldl(+, ntuple(d -> _dot_diff(cache.dv_step[d], cache.Rv[d], cache.Rv_old[d]), Val(D))))
-    den = foldl(+, ntuple(d -> sum(abs2, cache.dv_step[d]), Val(D)))
+function rayleigh_λmin(cache::StokesCache{D, T}, CFL::Real) where {D, T}
+    c = cache.c;  cfl = T(CFL)
+    dv(d) = _bc((λ, r) -> _dr_coefficients(λ, c, cfl)[2] * r, cache.λmax[d], cache.dvdτ[d])
+    num = abs(foldl(+, ntuple(d -> _dot_diff(dv(d), cache.Rv[d], cache.Rv_old[d]), Val(D))))
+    den = foldl(+, ntuple(d -> sum(abs2, dv(d)), Val(D)))
     return den > zero(T) ? T(num / den) : zero(T)
 end
 

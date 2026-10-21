@@ -13,14 +13,12 @@ _gm(A) = exp(sum(log, max.(vec(Float64.(A)), 1e-300)) / length(A))
     StepResidual
 
 Scratch workspace for tracking Picard-iteration convergence.  Allocate once
-per run via `StepResidual(grid)`, then call `update_residual!` at the start of
+per run via `StepResidual(grid, fluid)`, then call `snapshot!` at the start of
 each iteration to snapshot the primary unknowns, and `compute_resnorm` after
 each iteration to measure the change.
 """
-mutable struct StepResidual{T, M<:AbstractMatrix{T}}
-    Wo::M;  Uo::M;  Po::M
-    Xo::M;  MFSo::M
-    resnorm0::Float64
+struct StepResidual{T, M<:AbstractMatrix{T}}
+    Wo::M;  Uo::M;  Po::M;  MFSo::M
 end
 
 # Backend-aware: buffers live on the same backend as `fluid` so `snapshot!`'s
@@ -30,57 +28,42 @@ function StepResidual(grid::Grid{T}, fluid::FluidState{T}) where {T<:AbstractFlo
     Nz, Nx = grid.Nz, grid.Nx
     z(s...) = xcore_zeros(backend, T, s...)
     StepResidual(
-        z(Nz+1, Nx+2), z(Nz+2, Nx+1), z(Nz+2, Nx+2),
-        z(Nz,   Nx),   z(Nz,   Nx),
-        1.0,
-    )
-end
-
-# Back-compat: CPU buffers when no fluid state is given.
-function StepResidual(grid::Grid{T}) where {T<:AbstractFloat}
-    Nz, Nx = grid.Nz, grid.Nx
-    z(s...) = zeros(T, s...)
-    StepResidual(
-        z(Nz+1, Nx+2), z(Nz+2, Nx+1), z(Nz+2, Nx+2),
-        z(Nz,   Nx),   z(Nz,   Nx),
-        1.0,
+        z(Nz+1, Nx+2), z(Nz+2, Nx+1), z(Nz+2, Nx+2), z(Nz, Nx),
     )
 end
 
 """
-    snapshot!(res, phase, fluid) -> nothing
+    snapshot!(res, fluid) -> nothing
 
-Capture current W / U / P / X / MFS into `res.*o` buffers.  Call at the
+Capture current W / U / P / MFS into `res.*o` buffers.  Call at the
 *start* of each Picard iteration, before the sweeps modify the fields.
 """
-function snapshot!(res::StepResidual, phase::PhaseState, fluid::FluidState)
+function snapshot!(res::StepResidual, fluid::FluidState)
     res.Wo   .= fluid.W
     res.Uo   .= fluid.U
     res.Po   .= fluid.P
-    res.Xo   .= phase.X
     res.MFSo .= fluid.MFS
     return nothing
 end
 
 """
-    compute_resnorm(res, phase, fluid, dt) -> (resnorm, res_mass, res_mmnt)
+    compute_resnorm(res, fluid, dt, norm_upd_X) -> (resnorm, res_mass, res_mmnt)
 
 Relative Picard residual: norm of the change in each primary field divided by
-the norm of the field itself (mirrors `src/report.m`).
+the norm of the field itself (mirrors `src/report.m`). The `X` term uses
+`norm_upd_X`, the unclamped update returned by [`phsevo!`](@ref).
 """
-function compute_resnorm(res::StepResidual, phase::PhaseState,
-                          fluid::FluidState, dt::Real)
+function compute_resnorm(res::StepResidual, fluid::FluidState, dt::Real, norm_upd_X::Real)
     ep = eps(Float64)
+    # ‖a − b‖₂ as one on-device reduction, without a temporary a .- b
+    normdiff(a, b) = sqrt(sum(abs2, Broadcast.instantiate(Broadcast.broadcasted(-, a, b))))
     nrho = Float64(norm(fluid.rho))
-    res_mass = norm(phase.X   .- res.Xo)   / (nrho            + ep) +
-               norm(fluid.MFS .- res.MFSo) / (nrho / dt       + ep)
-    res_mmnt = norm(fluid.W   .- res.Wo)   / (norm(fluid.W)   + ep) +
-               norm(fluid.U   .- res.Uo)   / (norm(fluid.U)   + ep) +
-               norm(fluid.P   .- res.Po)   / (norm(fluid.P)   + ep)
+    res_mass = norm_upd_X                    / (nrho            + ep) +
+               normdiff(fluid.MFS, res.MFSo) / (nrho / dt       + ep)
+    res_mmnt = normdiff(fluid.W,   res.Wo)   / (norm(fluid.W)   + ep) +
+               normdiff(fluid.U,   res.Uo)   / (norm(fluid.U)   + ep) +
+               normdiff(fluid.P,   res.Po)   / (norm(fluid.P)   + ep)
     resnorm = res_mass + res_mmnt
-    if res.resnorm0 < resnorm
-        res.resnorm0 = resnorm + 1e-32
-    end
     return resnorm, res_mass, res_mmnt
 end
 

@@ -22,4 +22,11 @@
     @test p.L === 15.0f0
     @test p.maxit === 15
     @test p.etam0 === 10.0f0
+
+    # length scales follow D and d0 unless set (par_default.m: L = D, L0 = D/100, l0 = 10 d0)
+    q = Parameters(Float64; D = 20, d0 = 0.02)
+    @test q.L == 20.0
+    @test q.L0 ≈ 0.2
+    @test q.l0 ≈ 0.2
+    @test Parameters(Float64; D = 20, L = 5).L == 5.0
 end

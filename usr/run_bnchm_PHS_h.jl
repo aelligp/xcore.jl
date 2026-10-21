@@ -59,20 +59,20 @@ function run_bnchm_phs_h(N::Int; D = 10.0, L = 10.0,
 
     Nsteps = round(Int, nshft_base * D / N_base / dt)
 
-    res = StepResidual(grid)
+    res = StepResidual(grid, fluid)
 
     for step in 1:Nsteps
         a1, a2, a3, b1, b2, b3 = time_coefs(Float64, par.TINT, step)
         store_previous!(fluid, phase)
         resnorm0 = 1.0
         for iter in 1:par.maxit
-            snapshot!(res, phase, fluid)
-            phsevo!(phase, fluid, grid, par, scales;
+            snapshot!(res, fluid)
+            nupd_X = phsevo!(phase, fluid, grid, par, scales;
                     ADVN = par.ADVN, xBC = :periodic, zBC = :closed,
                     a1, a2, a3, b1, b2, b3, dt)
             update_volume_fractions!(phase, fluid, par)
             force_constant_advection!(phase, fluid)
-            resnorm, _, _ = compute_resnorm(res, phase, fluid, dt)
+            resnorm, _, _ = compute_resnorm(res, fluid, dt, nupd_X)
             iter == 1 && (resnorm0 = resnorm + eps(Float64))
             if iter ≥ 3 &&
                (resnorm ≤ par.atol || resnorm / resnorm0 ≤ par.rtol)

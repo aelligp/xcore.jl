@@ -1,9 +1,9 @@
-using xcore
-# Backend selection: xcore_backend() = CPU. For GPU, load the GPU package first
-# (its xcore extension activates) and pick the matching symbol:
-#   using CUDA;  be = xcore_backend(:cuda)    # Float64 OK
-#   using Metal; be = xcore_backend(:metal)   # Float32 only (no native F64)
-be = xcore_backend()
+using xcore, KernelAbstractions
+using CairoMakie   # save_op figures
+# Backend: CPU(). For GPU, pass the GPU package's backend instead:
+#   using CUDA;  be = CUDABackend()    # Float64 OK
+#   using Metal; be = MetalBackend()   # Float32 only: also replace every Float64 below
+be = CPU()
 
 # Port of usr/run_D1_dm2_e1.m
 # D = 1e1 m  |  d0 = 1e-2 m  |  etam0 = 1e1 Pa·s

@@ -236,9 +236,7 @@ end
         e1 = exz[iz,     ix    ];  e2 = exz[iz + 1, ix    ]
         e3 = exz[iz,     ix + 1];  e4 = exz[iz + 1, ix + 1]
         exz_sq = (e1 * e1 + e2 * e2 + e3 * e3 + e4 * e4) / 4
-        eII[iz, ix] = sqrt(eps_t +
-                           (exx[iz, ix]^2 + ezz[iz, ix]^2) / 2 +
-                            exz_sq)
+        eII[iz, ix] = sqrt((exx[iz, ix]^2 + ezz[iz, ix]^2) / 2 + exz_sq) + eps_t
         # cell-centre velocity magnitude (4-point average from staggered nodes)
         wc = (W[iz,     ix + 1] + W[iz + 1, ix + 1]) / 2
         uc = (U[iz + 1, ix    ] + U[iz + 1, ix + 1]) / 2
@@ -252,9 +250,9 @@ end
     iz, ix = @index(Global, NTuple)
     @inbounds begin
         w1 = wx[iz,     ix + 1];  w2 = wx[iz + 1, ix + 1]
-        vx[iz, ix] = sqrt(((w1 + w2) / 2)^2 + eps_t)
+        vx[iz, ix] = sqrt(((w1 + w2) / 2)^2) + eps_t
         m1 = wm[iz,     ix + 1];  m2 = wm[iz + 1, ix + 1]
-        vm[iz, ix] = sqrt(((m1 + m2) / 2)^2 + eps_t)
+        vm[iz, ix] = sqrt(((m1 + m2) / 2)^2) + eps_t
     end
 end
 
@@ -289,67 +287,50 @@ end
 # diffusivities + viscosity blend  (update.m lines 106–134)
 # ----------------------------------------------------------------------------
 
-@kernel function compute_viscblend_kernel!(etai_out, etae, ke, kx, ReL_arr, fReL_arr,
-                                    @Const(etamix), @Const(eII), @Const(rho), @Const(V),
-                                    L0)
+# The ramp factor fReL is the one left by the previous update (update.m:108-111
+# use it before update.m:147 refreshes it); `update!` refreshes it last.
+@kernel function compute_viscblend_kernel!(etae, ke, @Const(fReL), @Const(eII), @Const(rho), L0)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
-        eII_c = eII[iz, ix]
-        rho_c = rho[iz, ix]
-        # eddy diffusivity & viscosity
-        ke_c = eII_c * L0 * L0
-        # ReL evaluated at the current iteration
-        ReL_c = V[iz, ix] * L0 / (etamix[iz, ix] / rho_c)
-        fReL_c = one(L0) - exp(-ReL_c)
-        etae_c = fReL_c * ke_c * rho_c
-        # effective viscosity with eddy regularisation; cap + Picard blend are
-        # applied host-side after a global min(etai) reduction (update.m:118-126)
-        etai_out[iz, ix] = etamix[iz, ix] + etae_c
-        etae[iz, ix] = etae_c
+        ke_c = eII[iz, ix] * L0 * L0
+        etae[iz, ix] = fReL[iz, ix] * ke_c * rho[iz, ix]
         ke[iz, ix]   = ke_c
-        kx[iz, ix]   = ke_c                # ks=0 placeholder until segregation lands
-        ReL_arr[iz, ix] = ReL_c
-        fReL_arr[iz, ix] = fReL_c
     end
 end
 
 """
     update_viscosity!(phase, fluid, grid, par, scales; xBC=:periodic, zBC=:closed,
-                      relaxation = 1//2, eta_prev = nothing) -> nothing
+                      relaxation = 1//2) -> nothing
 
 Blend `etamix + etae` into `eta` by the linear continuation
-`eta = relaxation*etai + (1 - relaxation)*eta_old`. Computes `ke`, `kx`, `ReL`,
-`ReD`, `fReL` along the way.
+`eta = relaxation*etai + (1 - relaxation)*eta_old`, with `etae = fReL·ke·rho`
+from the ramp factor of the previous update. Computes `ke` and `ReD` along the
+way.
 
 `relaxation` must match how often the caller applies it: once per Picard sweep
 wants a large step (`1//2`, the `update.m` blend), whereas a refresh inside the
 DYREL iteration is applied many times per solve and needs a proportionally
-smaller one. `eta_prev` supplies scratch for the previous iterate so a repeated
-in-solve refresh does not allocate.
+smaller one.
 """
 function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
                            grid::Grid{T}, par::Parameters{T},
                            scales::Scales{T};
                            xBC::Symbol = :periodic,
                            zBC::Symbol = :closed,
-                           relaxation::Real = T(1//2),
-                           eta_prev::Union{Nothing,AbstractMatrix{T}} = nothing) where {T<:AbstractFloat}
+                           relaxation::Real = T(1//2)) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.etamix)
-    # copy current eta as the "previous" iterate, write uncapped etai into fluid.eta
-    eta_prev = eta_prev === nothing ? copy(fluid.eta) : copyto!(eta_prev, fluid.eta)
-    compute_viscblend_kernel!(backend)(fluid.eta, phase.etae, phase.ke, phase.kx,
-                                          phase.ReL, phase.fReL,
-                                          phase.etamix, phase.eII, fluid.rho, phase.V,
-                                          scales.L0;
-                                          ndrange = size(fluid.eta))
+    compute_viscblend_kernel!(backend)(phase.etae, phase.ke, phase.fReL, phase.eII, fluid.rho,
+                                       scales.L0; ndrange = size(fluid.eta))
     KernelAbstractions.synchronize(backend)
 
-    # global contrast cap: etamax = min(etai) * etacntr, then harmonic-blend (update.m:118-120)
-    emax = minimum(fluid.eta) * T(par.etacntr)
-    @. fluid.eta = T(1) / (T(1) / emax + T(1) / fluid.eta)
-    # linear continuation against the previous iterate (update.m:126)
+    # etai = etamix + etae; contrast cap etamax = min(etai)·etacntr by harmonic
+    # blend (update.m:118-120), then linear continuation against the previous
+    # iterate (update.m:126)
+    etai = Broadcast.instantiate(Broadcast.broadcasted(+, phase.etamix, phase.etae))
+    emax = minimum(etai) * T(par.etacntr)
     blend_w = T(relaxation)
-    @. fluid.eta = blend_w * fluid.eta + (T(1) - blend_w) * eta_prev
+    @. fluid.eta = blend_w * (T(1) / (T(1) / emax + T(1) / (phase.etamix + phase.etae))) +
+                   (T(1) - blend_w) * fluid.eta
     # ReD uses the capped+blended eta
     @. phase.ReD = phase.V * scales.D0 / (fluid.eta / fluid.rho)
 
@@ -361,62 +342,50 @@ function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
     return nothing
 end
 
-@kernel function compute_segvisc_kernel!(Rel, fRel, ks, etat, etasi_out, kx, Rc,
-                                          @Const(vx), @Const(V), @Const(etamix),
-                                          @Const(rho), @Const(ke), @Const(fReL),
-                                          l0, eps_t)
+# fReL and fRel are the ramp factors of the previous update, as for etae.
+@kernel function compute_segvisc_kernel!(ks, etat, kx, Rc,
+                                          @Const(vx), @Const(V), @Const(rho), @Const(ke),
+                                          @Const(fReL), @Const(fRel), l0)
     iz, ix = @index(Global, NTuple)
     @inbounds begin
-        vx_c     = vx[iz, ix]
-        rho_c    = rho[iz, ix]
-        etamix_c = etamix[iz, ix]
-        # particle Reynolds number on the eddy length scale + ramp factor
-        Rel_c  = vx_c * l0 * rho_c / etamix_c
-        fRel_c = one(l0) - exp(-Rel_c)
+        vx_c = vx[iz, ix]
         # particle diffusivity from segregation speed; combined diffusivity
-        ks_c   = vx_c * l0
-        # turbulent drag viscosity contribution
-        etat_c = fRel_c * ks_c * rho_c
-        # uncapped etasi = etamix + etat; cap + Picard blend done host-side
-        etasi_out[iz, ix] = etamix_c + etat_c
-        Rel[iz,  ix] = Rel_c
-        fRel[iz, ix] = fRel_c
+        ks_c = vx_c * l0
         ks[iz,   ix] = ks_c
-        etat[iz, ix] = etat_c
+        # turbulent drag viscosity contribution
+        etat[iz, ix] = fRel[iz, ix] * ks_c * rho[iz, ix]
         kx[iz,   ix] = ks_c + fReL[iz, ix] * ke[iz, ix]
-        Rc[iz,   ix] = V[iz, ix] / max(vx_c, eps_t)
+        Rc[iz,   ix] = V[iz, ix] / vx_c
     end
 end
 
 """
     update_segregation_viscosity!(phase, fluid, par, scales; zBC=:closed) -> nothing
 
-Compute the segregation-side rheology: particle Reynolds `Rel`, ramp factor
-`fRel`, particle diffusivity `ks` and combined `kx = ks + fReL·ke`, turbulent
-drag viscosity `etat`, blended segregation viscosity `etas` (Picard 50/50),
-and the z-face geometric mean `etasw` used by the segregation speed.
+Compute the segregation-side rheology from the ramp factors of the previous
+update: particle diffusivity `ks` and combined `kx = ks + fReL·ke`, turbulent
+drag viscosity `etat = fRel·ks·rho`, blended segregation viscosity `etas`
+(Picard 50/50), the z-face geometric mean `etasw` used by the segregation
+speed, `Red` and `Rc`.
 """
 function update_segregation_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
                                        par::Parameters{T}, scales::Scales{T};
                                        zBC::Symbol = :closed) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.etas)
-    etas_prev = copy(phase.etas)
-    # kernel writes uncapped etasi into phase.etas
-    compute_segvisc_kernel!(backend)(phase.Rel, phase.fRel, phase.ks,
-                                               phase.etat, phase.etas,
-                                               phase.kx, phase.Rc,
-                                               phase.vx, phase.V, phase.etamix,
-                                               fluid.rho, phase.ke, phase.fReL,
-                                               scales.l0, eps(T);
-                                               ndrange = size(phase.etas))
+    compute_segvisc_kernel!(backend)(phase.ks, phase.etat, phase.kx, phase.Rc,
+                                     phase.vx, phase.V, fluid.rho, phase.ke,
+                                     phase.fReL, phase.fRel, scales.l0;
+                                     ndrange = size(phase.etas))
     KernelAbstractions.synchronize(backend)
 
-    # global contrast cap: etamax = min(etasi) * etacntr (update.m:122-123)
-    emax = minimum(phase.etas) * T(par.etacntr)
-    @. phase.etas = T(1) / (T(1) / emax + T(1) / phase.etas)
-    # Picard relaxation against previous etas (update.m:127)
+    # etasi = etamix + etat; contrast cap etamax = min(etasi)·etacntr
+    # (update.m:122-123), then Picard relaxation against the previous etas
+    # (update.m:127)
+    etasi = Broadcast.instantiate(Broadcast.broadcasted(+, phase.etamix, phase.etat))
+    emax = minimum(etasi) * T(par.etacntr)
     blend_w = T(0.5)
-    @. phase.etas = blend_w * phase.etas + (T(1) - blend_w) * etas_prev
+    @. phase.etas = blend_w * (T(1) / (T(1) / emax + T(1) / (phase.etamix + phase.etat))) +
+                    (T(1) - blend_w) * phase.etas
     # Red uses the capped+blended etas
     @. phase.Red = phase.vx * par.d0 / (phase.etas / fluid.rho)
 
@@ -463,7 +432,7 @@ end
         t1 = txz[iz,     ix    ];  t2 = txz[iz + 1, ix    ]
         t3 = txz[iz,     ix + 1];  t4 = txz[iz + 1, ix + 1]
         txz_sq = (t1 * t1 + t2 * t2 + t3 * t3 + t4 * t4) / 4
-        tII[iz, ix] = sqrt(eps_t + (txx_c * txx_c + tzz_c * tzz_c) / 2 + txz_sq)
+        tII[iz, ix] = sqrt((txx_c * txx_c + tzz_c * tzz_c) / 2 + txz_sq) + eps_t
         Ra[iz, ix]  = V[iz, ix] * D0 / kx[iz, ix]
     end
 end
@@ -495,7 +464,7 @@ function update_stresses!(phase::PhaseState{T}, fluid::FluidState{T},
 end
 
 # ----------------------------------------------------------------------------
-# time-step update (CFL on convective speed; particle speeds skipped for now)
+# time-step update (diffusive limit and CFL on the phase velocities)
 # ----------------------------------------------------------------------------
 
 """
@@ -505,17 +474,16 @@ CFL-limited time step from the current `kx` and the **phase** velocities
 `(Wx, Wm, Ux, Um)`. Matches `update.m` line 162 exactly:
 `dta = h/2 / max(abs([Um(:); Wm(:); Ux(:); Wx(:)]))`.
 
-Using bulk `(W, U)` here would underestimate the advective speed of `X`/`M`
-whenever segregation (`wx`, `wm`) or noise (`ξ`) is non-negligible — the
-result was CFL violations at sharp crystallization fronts, manifesting as
-isolated cells whose `X` overshoots below the eps clamp.
+The phase velocities, not the bulk `(W, U)`, are what advect `X`/`M`; they
+include segregation (`wx`, `wm`) and noise (`ξ`).
 """
 function update_dt(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
                    par::Parameters{T}, dt_prev::Real) where {T<:AbstractFloat}
     h = grid.h
     dtk = (h / T(2))^2 / maximum(phase.kx)
-    vmax = max(maximum(abs, phase.Wx), maximum(abs, phase.Wm),
-               maximum(abs, phase.Ux), maximum(abs, phase.Um)) + eps(T)
+    vabs(v) = abs(v + eps(T))
+    vmax = max(maximum(vabs, phase.Wx), maximum(vabs, phase.Wm),
+               maximum(vabs, phase.Ux), maximum(vabs, phase.Um))
     dta = (h / T(2)) / vmax
     return min(T(1.5) * T(dt_prev), min(dtk, par.CFL * dta), par.dtmax)
 end
@@ -529,17 +497,17 @@ end
 
 Run the full constitutive pipeline:
 
-  1. `update_volume_fractions!` — `rho`, `chi`, `mu`, `X`, `M`, `hasx`, `hasm`
-  2. `update_interpolations!`   — face/edge averages of densities and fractions
-  3. `update_pressure!`         — `Pl`, `Pt`
-  4. `update_rheology!`         — `etamix` from permission weights
-  5. `update_kinematics!`       — `Div_V`, strain rates, `eII`, `V`
-  6. `update_viscosity!`        — eddy regularisation, blended `eta`, `etaco`
-  7. `update_stresses!`         — deviatoric stresses, `tII`, `Ra`
+  1. `update_volume_fractions!`       — `rho`, `chi`, `mu`, `hasx`, `hasm`
+  2. `update_interpolations!`         — face/edge averages of densities and fractions
+  3. `update_pressure!`               — `Pl`, `Pt`
+  4. `update_rheology!`               — `etamix` from permission weights
+  5. `update_kinematics!`             — `Div_V`, strain rates, `eII`, `V`, `vx`, `vm`
+  6. `update_viscosity!`              — eddy regularisation, blended `eta`, `etaco`, `ReD`
+  7. `update_segregation_viscosity!`  — `ks`, `kx`, `etat`, blended `etas`, `etasw`, `Red`, `Rc`
+  8. `update_stresses!`               — deviatoric stresses, `tII`, `Ra`
+  9. `ReL`, `Rel` and the ramp factors `fReL`, `fRel` used by the next update
 
-Segregation/noise terms are skipped (they need `phsevo!`/`noise!` to be
-implemented). `update_dt` is exposed separately and called from the outer
-time loop.
+`update_dt` is called separately by `run!`, after `update!` in every sweep.
 """
 function update!(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
                  par::Parameters{T}, scales::Scales{T};
@@ -553,5 +521,12 @@ function update!(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
     update_viscosity!(phase, fluid, grid, par, scales; xBC, zBC)
     update_segregation_viscosity!(phase, fluid, par, scales; zBC)
     update_stresses!(phase, fluid, grid, scales)
+    # Reynolds numbers on the eddy and particle scales and their ramp factors,
+    # used by the next update (update.m:136-137, 147-148)
+    L0 = T(scales.L0);  l0 = T(scales.l0)
+    @. phase.ReL = phase.V  * L0 / (phase.etamix / fluid.rho)
+    @. phase.Rel = phase.vx * l0 / (phase.etamix / fluid.rho)
+    @. phase.fReL = 1 - exp(-phase.ReL)
+    @. phase.fRel = 1 - exp(-phase.Rel)
     return nothing
 end

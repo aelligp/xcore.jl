@@ -28,7 +28,6 @@ include("scales.jl")
 
 include("backend.jl")
 include("kernels/stencils.jl")
-include("kernels/ghosts.jl")
 include("kernels/diffus.jl")
 include("kernels/advect.jl")
 include("state.jl")
@@ -58,19 +57,18 @@ include("plotting.jl")
 
 export Parameters, Grid, Scales, VisScales
 export compute_scales, compute_vis_scales, print_scales
-export xcore_backend, xcore_zeros, interior
+export xcore_zeros, interior
 export ddx!, ddz!
-export fill_ghosts!, embed_interior!
-export diffus!, advect!
+export diffus!, diffus_with_flux!, advect!, advect_with_flux!
 export FluidState, PhaseState, NoiseState, BnchmData, fluidmech!
 export noise!, store_noise!
 export update!, update_volume_fractions!, update_interpolations!,
        update_pressure!, update_rheology!, update_kinematics!,
        update_viscosity!, update_stresses!, update_dt
 export time_coefs, store_previous!, update_phase_velocities!
-export advect_centered!, diffus_centered!, phsevo!
+export phsevo!
 export initialize!, run!
-export History, record_history!
+export History, record_history!, time_average
 export StepResidual, snapshot!, compute_resnorm, report_iter, print_step!
 export plot_fluid, plot_phase, plot_diffuse, plot_dimensionless, plot_profiles,
        plot_history, save_output

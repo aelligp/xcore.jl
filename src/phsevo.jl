@@ -6,156 +6,21 @@ using LinearAlgebra
 #   res_X = (a1 X - a2 Xo - a3 Xoo) - (b1 ∂_t X + b2 ∂_t Xo + b3 ∂_t Xoo) dt
 #   X  ← X - α res_X / a1
 #
-# where ∂_t X = -∇·(v X) + ∇·(X k_x ∇χ) + G_x. Segregation and noise are not
-# in the phase velocity yet (we use the bulk W, U); the boundary reaction
-# term G_x is zero until we add the boundary-shape function (Da = 0 path).
-
-"""
-    advect_centered!(adv, f, u, w, h, scheme; xBC=:periodic, zBC=:closed) -> adv
-
-Convenience wrapper around `advect!` for non-halo'd cell-centred inputs.
-Allocates a halo buffer, embeds `f`, fills ghosts, and dispatches to the
-appropriate KA kernel. Allocates per call — fine for the per-iteration use
-inside `phsevo!`; can be pre-allocated as workspace if it becomes a hot spot.
-"""
-function advect_centered!(adv::AbstractMatrix{T}, f::AbstractMatrix{T},
-                          u::AbstractMatrix{T}, w::AbstractMatrix{T},
-                          h::Real, scheme::Symbol;
-                          xBC::Symbol = :periodic,
-                          zBC::Symbol = :closed) where {T<:AbstractFloat}
-    halo = scheme_halo(scheme)
-    f_halo = similar(f, size(f, 1) + 2halo, size(f, 2) + 2halo)
-    fill!(f_halo, zero(T))
-    embed_interior!(f_halo, f, halo)
-    fill_ghosts!(f_halo, halo; xBC, zBC)
-
-    # TVD needs one extra face on each side of u and w. Build padded velocity
-    # buffers with periodic-x / repeat-z BCs (matching the f_halo fill above).
-    if scheme === :tvdim
-        Nz, Nx = size(adv)
-        u_pad = similar(u, Nz, Nx + 3)
-        w_pad = similar(w, Nz + 3, Nx)
-        @views u_pad[:, 2:Nx+2] .= u
-        @views w_pad[2:Nz+2, :] .= w
-        if xBC === :periodic
-            @views u_pad[:, 1]    .= u[:, Nx]     # face 0 ↔ face Nx (periodic wrap)
-            @views u_pad[:, Nx+3] .= u[:, 2]      # face Nx+2 ↔ face 2
-        else
-            @views u_pad[:, 1]    .= u[:, 1]
-            @views u_pad[:, Nx+3] .= u[:, Nx+1]
-        end
-        if zBC === :periodic
-            @views w_pad[1,    :] .= w[Nz, :]
-            @views w_pad[Nz+3, :] .= w[2,  :]
-        else
-            @views w_pad[1,    :] .= w[1,    :]
-            @views w_pad[Nz+3, :] .= w[Nz+1, :]
-        end
-        advect!(adv, f_halo, u_pad, w_pad, h, scheme)
-    else
-        advect!(adv, f_halo, u, w, h, scheme)
-    end
-    return adv
-end
-
-"""
-    diffus_centered!(dff, f, k, h; xBC=:periodic, zBC=:closed) -> dff
-
-Convenience wrapper around `diffus!` for non-halo'd cell-centred `f` and
-diffusivity `k`. Mirrors `advect_centered!` — embed, ghost-fill, dispatch.
-"""
-function diffus_centered!(dff::AbstractMatrix{T}, f::AbstractMatrix{T},
-                          k::AbstractMatrix{T}, h::Real;
-                          xBC::Symbol = :periodic,
-                          zBC::Symbol = :closed) where {T<:AbstractFloat}
-    halo = 1
-    f_halo = similar(f, size(f, 1) + 2halo, size(f, 2) + 2halo)
-    k_halo = similar(k, size(k, 1) + 2halo, size(k, 2) + 2halo)
-    fill!(f_halo, zero(T));  fill!(k_halo, zero(T))
-    embed_interior!(f_halo, f, halo);  embed_interior!(k_halo, k, halo)
-    fill_ghosts!(f_halo, halo; xBC, zBC);  fill_ghosts!(k_halo, halo; xBC, zBC)
-    diffus!(dff, f_halo, k_halo, h; halo)
-    return dff
-end
-
-"""
-    advect_centered_with_flux!(adv, qx, qz, f, u, w, h, scheme; xBC, zBC) -> adv
-
-Convenience wrapper around `advect_with_flux!` that handles halo embedding
-for `f` and (for `:tvdim`) padding of `u`, `w`. Writes:
-* `adv`  `(Nz, Nx)`        — cell-centred `div(v·f)`
-* `qx`   `(Nz+2, Nx+1)`    — x-face fluxes (MATLAB sizing)
-* `qz`   `(Nz+1, Nx+2)`    — z-face fluxes (MATLAB sizing)
-"""
-function advect_centered_with_flux!(adv::AbstractMatrix{T},
-                                    qx::AbstractMatrix{T}, qz::AbstractMatrix{T},
-                                    f::AbstractMatrix{T},
-                                    u::AbstractMatrix{T}, w::AbstractMatrix{T},
-                                    h::Real, scheme::Symbol;
-                                    xBC::Symbol = :periodic,
-                                    zBC::Symbol = :closed) where {T<:AbstractFloat}
-    halo = scheme_halo(scheme)
-    f_halo = similar(f, size(f, 1) + 2halo, size(f, 2) + 2halo)
-    fill!(f_halo, zero(T))
-    embed_interior!(f_halo, f, halo)
-    fill_ghosts!(f_halo, halo; xBC, zBC)
-
-    if scheme === :tvdim
-        Nz, Nx = size(adv)
-        u_pad = similar(u, Nz, Nx + 3)
-        w_pad = similar(w, Nz + 3, Nx)
-        @views u_pad[:, 2:Nx+2] .= u
-        @views w_pad[2:Nz+2, :] .= w
-        if xBC === :periodic
-            @views u_pad[:, 1]    .= u[:, Nx]
-            @views u_pad[:, Nx+3] .= u[:, 2]
-        else
-            @views u_pad[:, 1]    .= u[:, 1]
-            @views u_pad[:, Nx+3] .= u[:, Nx+1]
-        end
-        if zBC === :periodic
-            @views w_pad[1,    :] .= w[Nz, :]
-            @views w_pad[Nz+3, :] .= w[2,  :]
-        else
-            @views w_pad[1,    :] .= w[1,    :]
-            @views w_pad[Nz+3, :] .= w[Nz+1, :]
-        end
-        advect_with_flux!(adv, qx, qz, f_halo, u_pad, w_pad, h, scheme; xBC, zBC)
-    else
-        advect_with_flux!(adv, qx, qz, f_halo, u, w, h, scheme; xBC, zBC)
-    end
-    return adv
-end
-
-"""
-    diffus_centered_with_flux!(dff, qx, qz, f, k, h; xBC, zBC) -> dff
-
-Wrapper around `diffus_with_flux!` that handles halo embedding for `f` and `k`.
-"""
-function diffus_centered_with_flux!(dff::AbstractMatrix{T},
-                                    qx::AbstractMatrix{T}, qz::AbstractMatrix{T},
-                                    f::AbstractMatrix{T}, k::AbstractMatrix{T},
-                                    h::Real;
-                                    xBC::Symbol = :periodic,
-                                    zBC::Symbol = :closed) where {T<:AbstractFloat}
-    halo = 1
-    f_halo = similar(f, size(f, 1) + 2halo, size(f, 2) + 2halo)
-    k_halo = similar(k, size(k, 1) + 2halo, size(k, 2) + 2halo)
-    fill!(f_halo, zero(T));  fill!(k_halo, zero(T))
-    embed_interior!(f_halo, f, halo);  embed_interior!(k_halo, k, halo)
-    fill_ghosts!(f_halo, halo; xBC, zBC);  fill_ghosts!(k_halo, halo; xBC, zBC)
-    diffus_with_flux!(dff, qx, qz, f_halo, k_halo, h; halo, xBC, zBC)
-    return dff
-end
+# where ∂_t X = -∇·(v_x X) + ∇·(X k_x ∇χ) + G_x, v_x is the crystal-phase
+# velocity (bulk + segregation + noise, `update_phase_velocities!`) and G_x the
+# boundary crystallisation.
 
 """
     phsevo!(phase, fluid, grid, par, scales;
             ADVN=:weno5, xBC=:periodic, zBC=:closed,
-            a1, a2, a3, b1, b2, b3, dt, alpha = par.alpha) -> nothing
+            a1, a2, a3, b1, b2, b3, dt, alpha = par.alpha) -> norm_upd_X
 
 Advance the phase mass density `X` by one Picard step. Writes `advn_X`,
 `advn_M`, `advn_rho`, `dffn_X`, `dXdt` into `phase`; updates `phase.X`,
 `phase.M`, `phase.x`, `phase.m`. Mirrors `src/phsevo.m`.
+
+Returns the 2-norm of the update `upd_X = -α res_X / a1` before `X` is clamped
+to `[ρε, ρ(1-ε)]`; pass it to [`compute_resnorm`](@ref).
 
 The boundary crystallisation term `Gx = G0 · (1 - x) · bndshape` activates
 when `Da > 0` (which sets `G0` non-zero via `scales`). `bndshape` is
@@ -182,26 +47,29 @@ function phsevo!(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
     # phase advection — populate cell-centred rates AND face-centred fluxes
     # (face fluxes are needed by record_history! to do exact boundary-flux
     # accounting; matches MATLAB phsevo.m:8-9 returning [advn, qz, qx])
-    advect_centered_with_flux!(phase.advn_X, phase.qx_advn_X, phase.qz_advn_X,
-                               phase.X, Ux_face, Wx_face, h, ADVN; xBC, zBC)
-    advect_centered_with_flux!(phase.advn_M, phase.qx_advn_M, phase.qz_advn_M,
-                               phase.M, Um_face, Wm_face, h, ADVN; xBC, zBC)
+    advect_with_flux!(phase.advn_X, phase.qx_advn_X, phase.qz_advn_X,
+                      phase.X, Ux_face, Wx_face, h, ADVN; xBC, zBC)
+    advect_with_flux!(phase.advn_M, phase.qx_advn_M, phase.qz_advn_M,
+                      phase.M, Um_face, Wm_face, h, ADVN; xBC, zBC)
     phase.advn_rho .= phase.advn_X .+ phase.advn_M
 
     # diffusion: f = χ, k = X·k_x. Emit fluxes too (matches phsevo.m:13).
-    Xkx = phase.X .* phase.kx
-    diffus_centered_with_flux!(phase.dffn_X, phase.qx_dffn_X, phase.qz_dffn_X,
-                               phase.chi, Xkx, h; xBC, zBC)
+    Xkx = Broadcast.instantiate(Broadcast.broadcasted(*, phase.X, phase.kx))
+    diffus_with_flux!(phase.dffn_X, phase.qx_dffn_X, phase.qz_dffn_X,
+                      phase.chi, Xkx, h; xBC, zBC)
 
     # boundary crystallisation reaction (G0 = 0 when par.Da = 0)
     @. phase.Gx = T(scales.G0) * (one(T) - phase.x) * phase.bndshape
 
     # rate of change and Picard residual update
     phase.dXdt .= .-phase.advn_X .+ phase.dffn_X .+ phase.Gx
-    res_X = (T(a1) .* phase.X .- T(a2) .* phase.Xo .- T(a3) .* phase.Xoo) .-
-            (T(b1) .* phase.dXdt .+ T(b2) .* phase.dXdto .+ T(b3) .* phase.dXdtoo) .* T(dt)
-    upd_X = -T(alpha) .* res_X ./ T(a1)
-    phase.X .= phase.X .+ upd_X
+    A1, A2, A3 = T(a1), T(a2), T(a3);  B1, B2, B3 = T(b1), T(b2), T(b3)
+    α = T(alpha);  dtT = T(dt)
+    upd(X, Xo, Xoo, r, ro, roo) = -α * ((A1 * X - A2 * Xo - A3 * Xoo) - (B1 * r + B2 * ro + B3 * roo) * dtT) / A1
+    args = (phase.X, phase.Xo, phase.Xoo, phase.dXdt, phase.dXdto, phase.dXdtoo)
+    # ‖upd_X‖ is taken before the clamp: it is the mass term of the Picard residual (report.m:2)
+    nupd = sqrt(sum(abs2, Broadcast.instantiate(Broadcast.broadcasted(upd, args...))))
+    phase.X .+= upd.(args...)
 
     # clamp to [ρ·ε, ρ·(1-ε)] then derive M, x, m
     eps_t = eps(T)
@@ -210,5 +78,5 @@ function phsevo!(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
     phase.x .= phase.X ./ fluid.rho
     phase.m .= phase.M ./ fluid.rho
 
-    return nothing
+    return nupd
 end

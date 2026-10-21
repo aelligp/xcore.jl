@@ -21,7 +21,7 @@ let T = Float64, Nz = 8, Nx = 6, Ny = 4
         @test size.(S.edge_viscosity(f)) == ((Nz + 1, Nx + 1, Ny), (Nz + 1, Nx, Ny + 1),
                                              (Nz, Nx + 1, Ny + 1))
         @test S.velocity(f) === (f.W, f.U, f.V)
-        @test size(c.R_P) == size(c.s_P) == (Nz, Nx, Ny)
+        @test size(c.R_P) == size(c.γ_eff) == (Nz, Nx, Ny)
     end
 
     @testset "Grid3D, coarsening and the multigrid hierarchy" begin

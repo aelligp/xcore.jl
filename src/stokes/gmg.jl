@@ -54,7 +54,7 @@ function smooth!(lvl, par::Parameters, op::StokesOp{D, T}; nsweeps::Int, ninner:
             @timeit_debug TO "residual_P" residual_continuity!(cache, fluid, grid, P0, op.dt; fscale = fs)
             @timeit_debug TO "residual_V" residual_momentum!(cache, fluid, grid, op; dr = true, fscale = fs)
             @timeit_debug TO "update velocity + BCs" begin
-            update_velocity!(cache, fluid)
+            update_velocity!(cache, fluid, par.CFL_PT)
             apply_velocity_bcs!(fluid, grid, op; mfs_mean, Ddom)
             end
             adaptive || continue
@@ -68,11 +68,10 @@ function smooth!(lvl, par::Parameters, op::StokesOp{D, T}; nsweeps::Int, ninner:
             end
             if itPT % par.n_tune_PT == 0
                 @timeit_debug TO "retune (Rayleigh + Gershgorin)" begin
-                λmin = rayleigh_λmin(cache)
+                λmin = rayleigh_λmin(cache, par.CFL_PT)
                 cache.c = 2 * sqrt(λmin) * par.c_fact_PT
                 gershgorin!(cache, fluid, grid, op)
                 check_preconditioner(cache)
-                update_dτ_α_β!(cache, par.CFL_PT)
                 end
             end
         end
@@ -129,7 +128,7 @@ function coarse_solve!(lvl, hier::MGHierarchy{T}, par::Parameters, op::StokesOp;
     win_from = 0;  err_ref = nP
     ρ_best = T(Inf);  γ_best = γfact
     retune!(γ) = (penalty!(cache, lvl.fluid, lvl.grid, op; γfact = γ);
-                  check_preconditioner(cache); update_dτ_α_β!(cache, par.CFL_PT); cache.γfact = γ)
+                  check_preconditioner(cache); cache.γfact = γ)
     for k in 1:hier.ncoarse
         smooth!(lvl, par, op; nsweeps = 1, ninner = coarse_inner, adaptive = true,
                 fscale, P0, mfs_mean, Ddom)

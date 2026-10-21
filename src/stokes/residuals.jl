@@ -153,34 +153,38 @@ function residual_continuity!(cache::StokesCache{D, T}, fluid, grid, P0, dt::Rea
     return nothing
 end
 
-@kernel function _velocity_update_kernel!(v, dvdτ, dv_step, @Const(R), @Const(α), @Const(β),
-                                          @Const(dτ), comp)
+# DR damping of a face with Gershgorin bound λ: (α, β·dτ) with dτ = 2·CFL/√λ,
+# β = 2dτ/(2 + c·dτ), α = (2 − c·dτ)/(2 + c·dτ)
+@inline function _dr_coefficients(λ, c, CFL)
+    dτ = 2 * CFL / sqrt(λ);  cdτ = c * dτ;  idn = inv(2 + cdτ)
+    return (2 - cdτ) * idn, 2 * dτ * idn * dτ
+end
+
+@kernel function _velocity_update_kernel!(v, dvdτ, @Const(R), @Const(λmax), c, CFL, comp)
     J = @index(Global, Cartesian)
     @inbounds begin
         d = _val(comp)
-        rate = α[J] * dvdτ[J] + R[J]
+        α, βdτ = _dr_coefficients(λmax[J], c, CFL)
+        rate = α * dvdτ[J] + R[J]
         dvdτ[J] = rate
-        step = β[J] * dτ[J] * rate
-        dv_step[J] = step
-        v[J + _ones(J) - _unit(J, d)] += step
+        v[J + _ones(J) - _unit(J, d)] += βdτ * rate
     end
 end
 
 """
-    update_velocity!(cache, fluid) -> nothing
+    update_velocity!(cache, fluid, CFL) -> nothing
 
 One damped DR pseudo-time step of every component from the preconditioned
-residual: `dvdτ ← α·dvdτ + R`, `v += β·dτ·dvdτ` (increment kept in `dv_step` for
-the Rayleigh-quotient estimate).
+residual: `dvdτ ← α·dvdτ + R`, `v += β·dτ·dvdτ`, with the coefficients of
+`_dr_coefficients` from `cache.λmax` and `cache.c`.
 """
-function update_velocity!(cache::StokesCache{D}, fluid) where {D}
+function update_velocity!(cache::StokesCache{D, T}, fluid, CFL::Real) where {D, T}
     backend = KernelAbstractions.get_backend(cache.R_P)
     v = velocity(fluid)
     _each_axis(Val(D)) do comp
         d = _val(comp)
-        _velocity_update_kernel!(backend)(v[d], cache.dvdτ[d], cache.dv_step[d], cache.Rv[d],
-                                          cache.α[d], cache.β[d], cache.dτ[d], comp;
-                                          ndrange = size(cache.Rv[d]))
+        _velocity_update_kernel!(backend)(v[d], cache.dvdτ[d], cache.Rv[d], cache.λmax[d],
+                                          cache.c, T(CFL), comp; ndrange = size(cache.Rv[d]))
     end
     return nothing
 end

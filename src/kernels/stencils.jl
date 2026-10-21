@@ -1,5 +1,25 @@
 using KernelAbstractions
 
+# Dimension-generic index arithmetic on CartesianIndex, shared by the stencil
+# kernels and the Stokes solvers.
+@inline _val(::Val{d}) where {d} = d
+@inline _unit(::CartesianIndex{D}, d::Int) where {D} =
+    CartesianIndex(ntuple(k -> ifelse(k == d, 1, 0), Val(D)))
+@inline _ones(::CartesianIndex{D}) where {D} = CartesianIndex(ntuple(_ -> 1, Val(D)))
+@inline _setidx(I::CartesianIndex{D}, d::Int, i::Int) where {D} =
+    CartesianIndex(ntuple(k -> ifelse(k == d, i, I[k]), Val(D)))
+
+# horizontal axes first, then z; `_hz_vaxes` as `Val`s, so that indexing a
+# heterogeneous tuple by axis stays static inside a GPU kernel
+@inline _hz_axes(::Val{D}) where {D} = (ntuple(k -> k + 1, Val(D - 1))..., 1)
+@inline _hz_vaxes(::Val{D}) where {D} = (ntuple(k -> Val(k + 1), Val(D - 1))..., Val(1))
+
+# left fold over a tuple, unrolled at compile time; `f` is inlined at every step
+# (kernel bodies exceed the inliner's default budget)
+@inline _tfoldl(f, acc, ::Tuple{}) = acc
+@inline _tfoldl(f, acc, t::Tuple) = _tfoldl(f, (@inline f(acc, first(t))), Base.tail(t))
+
+
 # ----------------------------------------------------------------------------
 # Bare first-difference operators (no halo required — just shrink by one in
 # the differentiated direction). Faithful to MATLAB's ddx.m/ddz.m, which use

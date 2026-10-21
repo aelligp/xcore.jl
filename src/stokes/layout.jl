@@ -18,28 +18,14 @@
 # Sums over axes run horizontal axes first, then z: the order the stencils of
 # the divergence, the Schur diagonal and the advection flux balance use.
 
-@inline _val(::Val{d}) where {d} = d
-@inline _unit(::CartesianIndex{D}, d::Int) where {D} =
-    CartesianIndex(ntuple(k -> ifelse(k == d, 1, 0), Val(D)))
-@inline _ones(::CartesianIndex{D}) where {D} = CartesianIndex(ntuple(_ -> 1, Val(D)))
-@inline _setidx(I::CartesianIndex{D}, d::Int, i::Int) where {D} =
-    CartesianIndex(ntuple(k -> ifelse(k == d, i, I[k]), Val(D)))
-
 # axes other than d, in increasing order
 @inline _others(::Val{d}, ::Val{D}) where {d, D} = ntuple(i -> i < d ? i : i + 1, Val(D - 1))
-# horizontal axes first, then z
-@inline _hz_axes(::Val{D}) where {D} = (ntuple(k -> k + 1, Val(D - 1))..., 1)
 
 # position of the axis pair (a, b) in the lexicographic edge-viscosity tuple
 @inline function _pair(a::Int, b::Int, D::Int)
     a > b && return _pair(b, a, D)
     return (a - 1) * D - ((a - 1) * a) ÷ 2 + b - a
 end
-
-# left fold over a tuple, unrolled at compile time; `f` is inlined at every step
-# (kernel bodies exceed the inliner's default budget)
-@inline _tfoldl(f, acc, ::Tuple{}) = acc
-@inline _tfoldl(f, acc, t::Tuple) = _tfoldl(f, (@inline f(acc, first(t))), Base.tail(t))
 
 # Σ over the tuple in horizontal-then-z order
 @inline _hsum(g::NTuple{D}) where {D} = _tfoldl(+, g[2], (ntuple(k -> g[k + 2], Val(D - 2))..., g[1]))

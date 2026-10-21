@@ -79,6 +79,15 @@ function _check_iterative_tolerance(what::AbstractString, par)
     return nothing
 end
 
+# The matrix-free solvers fix the free pressure constant by a mean gauge. Shift P
+# so it vanishes in the cell fluidmech.m pins, (round(Nz/2), round(Nx/2)) of the
+# ghost-padded array, so P and Pt carry the same level as the :direct solve.
+function _pin_pressure!(P, grid)
+    i, j = _mround(grid.Nz / 2), _mround(grid.Nx / 2)
+    P .-= P[i:i, j:j]   # 1×1 copy: no scalar indexing on GPU arrays
+    return nothing
+end
+
 # The matrix-free kernels implement periodic or solid-wall sides (slip set by
 # `sds`) and a closed z. `fluidmech!` assembles combinations beyond that, so
 # accepting them here would silently solve a different problem — check instead
@@ -97,11 +106,16 @@ function solve_fluidmech!(s::DyrelSolver, fluid, phase, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3,
                           sds, top_cnv, bot_cnv, open_cnv, xBC, zBC, verbose = false)
     _check_matrixfree_bcs("solver = :dyrel", sds, xBC, zBC)
+    # The open bottom fixes W from the bottom-row continuity, so R_P ≡ 0 there and
+    # the multiplier never sets that pressure row; :direct pins it to zero.
+    open_cnv && throw(ArgumentError(
+        "solver = :dyrel does not implement open_cnv = true; use solver = :direct"))
     st = fluidmech_dyrel!(fluid, phase, s.cache, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
                           rtol_PH = par.forcing_PH,
                           xBC, zBC, sds, top_cnv, bot_cnv, open_cnv, verbose = verbose)
     st.converged || st.relaxed || println("      !  dyrel solve hit budget (itPH=$(st.PH_iters), itPT total=$(st.total_iter))")
+    par.bnchm || _pin_pressure!(fluid.P, grid)
     return st.converged
 end
 
@@ -119,6 +133,7 @@ function solve_fluidmech!(s::GMGSolver, fluid, phase, grid, par, scales;
                         rtol_PH = par.forcing_PH,
                         xBC, zBC, sds, top_cnv, bot_cnv, verbose = verbose)
     st.converged || st.relaxed || println("      !  gmg solve hit V-cycle cap (ncyc=$(st.ncyc))")
+    par.bnchm || _pin_pressure!(fluid.P, grid)
     return st.converged
 end
 
@@ -133,5 +148,6 @@ function solve_fluidmech!(s::VMGSolver, fluid, phase, grid, par, scales;
                         dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
                         γfact = 5, cc = true, rtol_PH = par.forcing_PH,
                         xBC, zBC, sds, top_cnv, bot_cnv, verbose = verbose)
+    par.bnchm || _pin_pressure!(fluid.P, grid)
     return st.converged
 end
