@@ -6,6 +6,7 @@ using Random
 using Statistics
 using TOML, Crayons
 using TimerOutputs
+using WriteVTK: vtk_grid, VTKCellData, VTKPointData, paraview_collection, collection_add_timestep
 
 # Module-level timer for solver profiling. All timed regions use
 # `@timeit_debug TO "..."`, which compiles to a no-op unless debug timings are
@@ -22,40 +23,39 @@ enable_solver_timings()  = (foreach(TimerOutputs.enable_debug_timings, (@__MODUL
 """Disable `@timeit_debug` regions, restoring zero-overhead production behaviour."""
 disable_solver_timings() = (foreach(TimerOutputs.disable_debug_timings, (@__MODULE__, Stokes)); nothing)
 
-include("parameters.jl")
-include("grid.jl")
-include("scales.jl")
+include("setup/parameters.jl")
+include("setup/grid.jl")
+include("setup/scales.jl")
 
-include("backend.jl")
+include("setup/backend.jl")
 include("kernels/stencils.jl")
 include("kernels/diffus.jl")
 include("kernels/advect.jl")
-include("state.jl")
-# 3-D grid and state, solved by the dimension-generic Stokes module below
-include("dyrel3D/grid3d.jl")
-include("dyrel3D/state3d.jl")
-include("fluidmech.jl")
-include("update.jl")
-include("timing.jl")
-include("noise.jl")
-include("store.jl")
-include("phsevo.jl")
-include("history.jl")
-include("diagnose.jl")
-include("output.jl")
-include("restart.jl")
-include("run.jl")
+include("kernels/averages.jl")
+include("setup/state.jl")
+include("solvers/direct.jl")
+include("physics/update.jl")
+include("driver/timing.jl")
+include("physics/noise.jl")
+include("physics/store.jl")
+include("physics/phsevo.jl")
+include("driver/history.jl")
+include("driver/diagnose.jl")
+include("io/output.jl")
+include("io/vtk.jl")
+include("io/restart.jl")
+include("driver/run.jl")
 # Matrix-free Stokes/Navier–Stokes solvers (:dyrel, :gmg, :vmg), one
 # implementation for D = 2 and D = 3. Included after update.jl/phsevo.jl, whose
 # kernels it imports.
-include("stokes/Stokes.jl")
+include("solvers/stokes/Stokes.jl")
 using .Stokes: StokesCache, DyrelCache, fluidmech_dyrel!, fluidmech_gmg!, fluidmech_vmg!,
                build_hierarchy
 # Solver-strategy dispatch; `run!` uses `make_solver`/`solve_fluidmech!` from here.
-include("solver.jl")
-include("plotting.jl")
+include("solvers/dispatch.jl")
+include("io/plotting.jl")
 
-export Parameters, Grid, Scales, VisScales
+export Parameters, Grid, cells, Scales, VisScales
 export compute_scales, compute_vis_scales, print_scales
 export xcore_zeros, interior
 export ddx!, ddz!
@@ -74,8 +74,8 @@ export plot_fluid, plot_phase, plot_diffuse, plot_dimensionless, plot_profiles,
        plot_history, save_output
 export plot_state, plot_mms_comparison
 export save_checkpoint, load_checkpoint!, restart_path, resolve_restart
+export save_vtk
 export StokesCache, DyrelCache, fluidmech_dyrel!, fluidmech_gmg!, fluidmech_vmg!, build_hierarchy
-export Grid3D, FluidState3D, PhaseState3D, coarsen_grid3d
 export TO, enable_solver_timings, disable_solver_timings
 
 function _print_banner(io::IO)

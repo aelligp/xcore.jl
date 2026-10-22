@@ -19,4 +19,5 @@ using KernelAbstractions: CPU
     include("test_dyrel.jl")
     include("test_state3d.jl")
     include("test_stokes3d.jl")
+    include("test_vtk.jl")
 end

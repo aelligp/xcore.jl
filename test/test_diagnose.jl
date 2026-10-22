@@ -8,8 +8,8 @@ function _make_diag_setup(T = Float64)
     par    = Parameters(T; D = 10.0, N = 8, L = 10.0, etam0 = 10.0, x0 = 0.1, Da = 0.0)
     grid   = Grid(par)
     scales = compute_scales(par, grid)
-    fluid  = FluidState(T, CPU(), grid.Nz, grid.Nx)
-    phase  = PhaseState(T, CPU(), grid.Nz, grid.Nx)
+    fluid  = FluidState(T, CPU(), grid.ni[1], grid.ni[2])
+    phase  = PhaseState(T, CPU(), grid.ni[1], grid.ni[2])
     ns     = NoiseState(T, grid, scales)
     hst    = History(T)
     initialize!(phase, fluid, ns, hst, grid, par, scales)
@@ -20,11 +20,11 @@ end
     for T in (Float64, Float32)
         par  = Parameters(T; D = 10.0, N = 10, L = 10.0)
         grid = Grid(par)
-        res  = StepResidual(grid, FluidState(T, CPU(), grid.Nz, grid.Nx))
+        res  = StepResidual(grid, FluidState(T, CPU(), grid.ni[1], grid.ni[2]))
 
-        Nz, Nx = grid.Nz, grid.Nx
-        @test size(res.Wo)   == (Nz + 1, Nx + 2)
-        @test size(res.Uo)   == (Nz + 2, Nx + 1)
+        Nz, Nx = grid.ni[1], grid.ni[2]
+        @test size(res.vo[1])   == (Nz + 1, Nx + 2)
+        @test size(res.vo[2])   == (Nz + 2, Nx + 1)
         @test size(res.Po)   == (Nz + 2, Nx + 2)
         @test size(res.MFSo) == (Nz,     Nx    )
     end
@@ -38,12 +38,12 @@ end
     fluid.U[3, 2] = -7.0
     snapshot!(res, fluid)
 
-    @test res.Wo[2, 2]  == 42.0
-    @test res.Uo[3, 2]  == -7.0
+    @test res.vo[1][2, 2]  == 42.0
+    @test res.vo[2][3, 2]  == -7.0
 
     # mutating original must NOT affect the snapshot
     fluid.W[2, 2] = 0.0
-    @test res.Wo[2, 2]  == 42.0
+    @test res.vo[1][2, 2]  == 42.0
 end
 
 @testset "compute_resnorm is zero when nothing changed" begin

@@ -17,30 +17,23 @@ per run via `StepResidual(grid, fluid)`, then call `snapshot!` at the start of
 each iteration to snapshot the primary unknowns, and `compute_resnorm` after
 each iteration to measure the change.
 """
-struct StepResidual{T, M<:AbstractMatrix{T}}
-    Wo::M;  Uo::M;  Po::M;  MFSo::M
+struct StepResidual{T, D, V<:NTuple{D, AbstractArray{T, D}}, A<:AbstractArray{T, D}}
+    vo::V;  Po::A;  MFSo::A
 end
 
-# Backend-aware: buffers live on the same backend as `fluid` so `snapshot!`'s
-# `.=` stays a device-side copy (a host Matrix destination would scalar-index).
-function StepResidual(grid::Grid{T}, fluid::FluidState{T}) where {T<:AbstractFloat}
-    backend = KernelAbstractions.get_backend(fluid.W)
-    Nz, Nx = grid.Nz, grid.Nx
-    z(s...) = xcore_zeros(backend, T, s...)
-    StepResidual(
-        z(Nz+1, Nx+2), z(Nz+2, Nx+1), z(Nz+2, Nx+2), z(Nz, Nx),
-    )
-end
+# Buffers are copies of the fluid fields, so they live on the same backend and
+# `snapshot!`'s `.=` stays a device-side copy.
+StepResidual(grid::Grid{T, D}, fluid::FluidState{T, D}) where {T<:AbstractFloat, D} =
+    StepResidual(map(similar, velocity(fluid)), similar(fluid.P), similar(fluid.MFS))
 
 """
     snapshot!(res, fluid) -> nothing
 
-Capture current W / U / P / MFS into `res.*o` buffers.  Call at the
-*start* of each Picard iteration, before the sweeps modify the fields.
+Capture the current velocity components, P and MFS into the `res` buffers.
+Call at the *start* of each Picard iteration, before the sweeps modify the fields.
 """
 function snapshot!(res::StepResidual, fluid::FluidState)
-    res.Wo   .= fluid.W
-    res.Uo   .= fluid.U
+    foreach((o, v) -> o .= v, res.vo, velocity(fluid))
     res.Po   .= fluid.P
     res.MFSo .= fluid.MFS
     return nothing
@@ -50,19 +43,19 @@ end
     compute_resnorm(res, fluid, dt, norm_upd_X) -> (resnorm, res_mass, res_mmnt)
 
 Relative Picard residual: norm of the change in each primary field divided by
-the norm of the field itself (mirrors `src/report.m`). The `X` term uses
-`norm_upd_X`, the unclamped update returned by [`phsevo!`](@ref).
+the norm of the field itself (mirrors `src/report.m`; in 3-D the momentum term
+also sums the y-velocity). The `X` term uses `norm_upd_X`, the unclamped update
+returned by [`phsevo!`](@ref).
 """
 function compute_resnorm(res::StepResidual, fluid::FluidState, dt::Real, norm_upd_X::Real)
     ep = eps(Float64)
     # ‖a − b‖₂ as one on-device reduction, without a temporary a .- b
     normdiff(a, b) = sqrt(sum(abs2, Broadcast.instantiate(Broadcast.broadcasted(-, a, b))))
+    relchange(a, b) = normdiff(a, b) / (norm(a) + ep)
     nrho = Float64(norm(fluid.rho))
     res_mass = norm_upd_X                    / (nrho            + ep) +
                normdiff(fluid.MFS, res.MFSo) / (nrho / dt       + ep)
-    res_mmnt = normdiff(fluid.W,   res.Wo)   / (norm(fluid.W)   + ep) +
-               normdiff(fluid.U,   res.Uo)   / (norm(fluid.U)   + ep) +
-               normdiff(fluid.P,   res.Po)   / (norm(fluid.P)   + ep)
+    res_mmnt = sum(map(relchange, velocity(fluid), res.vo)) + relchange(fluid.P, res.Po)
     resnorm = res_mass + res_mmnt
     return resnorm, res_mass, res_mmnt
 end

@@ -101,11 +101,12 @@ may be `nothing`; in that case noise speeds are recorded as zero.
 function record_history!(hst::History{T},
                          time::Real, dt::Real,
                          phase::PhaseState{T}, fluid::FluidState{T},
-                         ns::NoiseState{T}, grid::Grid{T},
+                         ns::NoiseState{T}, grid::Grid{T, D},
                          a1::Real = T(1), a2::Real = T(1), a3::Real = T(0),
-                         b1::Real = T(1), b2::Real = T(0), b3::Real = T(0)) where {T<:AbstractFloat}
+                         b1::Real = T(1), b2::Real = T(0), b3::Real = T(0)) where {T<:AbstractFloat, D}
     h  = grid.h
-    h2 = h^2
+    vol  = prod(ntuple(_ -> h, Val(D)))        # cell volume h^D
+    area = prod(ntuple(_ -> h, Val(D - 1)))    # z-face area h^(D-1)
 
     # Shift cached rates BEFORE computing the new ones — exactly matching
     # src/history.m:3-5. After this, dsumBdto holds the rate from the
@@ -117,35 +118,32 @@ function record_history!(hst::History{T},
     push!(hst.time, T(time))
     push!(hst.dt,   T(dt))
 
-    # --- total mass [kg per unit y-depth] (src/history.m:14-16) ---
+    # --- total mass [kg per unit y-depth in 2-D, kg in 3-D] (src/history.m:14-16) ---
     # MATLAB adds a +eps to avoid div-by-zero in EB; preserve that exactly.
-    sumB = sum(fluid.rho) * h2 + eps(T)
-    sumM = sum(phase.M)   * h2 + eps(T)
-    sumX = sum(phase.X)   * h2 + eps(T)
+    sumB = sum(fluid.rho) * vol + eps(T)
+    sumM = sum(phase.M)   * vol + eps(T)
+    sumX = sum(phase.X)   * vol + eps(T)
     push!(hst.sumB, sumB);  push!(hst.sumM, sumM);  push!(hst.sumX, sumX)
 
     # --- boundary flux integrals (src/history.m:19-28) ---
-    # qz_* are sized (Nz+1, Nx+2); row 1 = top face, row end = bottom face;
-    # interior x-columns are 2:end-1. Each `sum(qz[...,2:end-1]*h)` is the
-    # line integral of the z-flux across the top/bottom boundary, in [kg/s].
+    # qz_* have the ghosted z-face shape (Nz+1, Nx+2[, Ny+2]); plane 1 is the top
+    # face, plane Nz+1 the bottom one, and the horizontal interior is 2:end-1 along
+    # every other axis. Each sum is the surface integral of the z-flux across the
+    # top/bottom boundary, in [kg/s] (per unit y-depth in 2-D).
     qzaX = phase.qz_advn_X;  qzaM = phase.qz_advn_M
     # `qz_dffn_M` is identically zero: only X diffuses, so `phsevo!` emits no melt
     # diffusive flux. It stays in the budget because adding melt diffusion (or an
     # open diffusive boundary) must show up here rather than be silently dropped.
     qzdX = phase.qz_dffn_X;  qzdM = phase.qz_dffn_M
-    Nz1, Nxp2 = size(qzaX)
-    interior = 2:(Nxp2 - 1)
+    plane(q, k) = sum(view(q, k, ntuple(d -> 2:size(q, d + 1) - 1, Val(D - 1))...)) * area
+    Nz1 = size(qzaX, 1)
 
-    top_aX  = sum(@view qzaX[1,    interior]) * h
-    bot_aX  = sum(@view qzaX[Nz1,  interior]) * h
-    top_aM  = sum(@view qzaM[1,    interior]) * h
-    bot_aM  = sum(@view qzaM[Nz1,  interior]) * h
-    top_dX  = sum(@view qzdX[1,    interior]) * h
-    bot_dX  = sum(@view qzdX[Nz1,  interior]) * h
-    top_dM  = sum(@view qzdM[1,    interior]) * h
-    bot_dM  = sum(@view qzdM[Nz1,  interior]) * h
+    top_aX  = plane(qzaX, 1);  bot_aX  = plane(qzaX, Nz1)
+    top_aM  = plane(qzaM, 1);  bot_aM  = plane(qzaM, Nz1)
+    top_dX  = plane(qzdX, 1);  bot_dX  = plane(qzdX, Nz1)
+    top_dM  = plane(qzdM, 1);  bot_dM  = plane(qzdM, Nz1)
 
-    sumGx = sum(phase.Gx) * h2
+    sumGx = sum(phase.Gx) * vol
 
     # Net expected rates of change driven by boundary fluxes + reaction Gx.
     # Sign convention from MATLAB: stored advection flux is signed v*f,
