@@ -18,7 +18,7 @@ function velocity_residual!(lvl, op::StokesOp{D}; fscale) where {D}
     return nothing
 end
 
-_velocity_norm(lvl) = maximum(velocity_norms(lvl.cache))
+velocity_norm(lvl) = maximum(velocity_norms(lvl.cache))
 
 """
     velocity_vcycle!(hier, l, par, op; mfs_mean0) -> nothing
@@ -33,7 +33,7 @@ function velocity_vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::Sto
     lvl = hier.levels[l];  fine = l == 1
     fscale   = fine ? one(T) : zero(T)
     mfs_mean = fine ? T(mfs_mean0) : zero(T)
-    Ddom     = T(lvl.grid.D)
+    Ddom     = T(lvl.grid.li[1])
     P0       = fine ? lvl.fluid.P : lvl.cache.P0
     # the pseudo-transient term is off: P0 = P on the fine level, 0 = 0 on coarse ones
     sm(n, inner, adaptive) = smooth!(lvl, par, op; nsweeps = n, ninner = inner, fscale, P0,
@@ -41,11 +41,11 @@ function velocity_vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::Sto
     res!() = velocity_residual!(lvl, op; fscale)
     if l == length(hier.levels)
         @timeit_debug TO "L$l coarse solve" begin
-        res!();  r0 = _velocity_norm(lvl) + eps(T)
+        res!();  r0 = velocity_norm(lvl) + eps(T)
         for _ in 1:hier.ncoarse
             sm(1, 20 * sum(cells(lvl.grid)), true)
             res!()
-            _velocity_norm(lvl) / r0 < hier.coarse_rtol && break
+            velocity_norm(lvl) / r0 < hier.coarse_rtol && break
         end
         end
         return nothing
@@ -54,20 +54,20 @@ function velocity_vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::Sto
     @timeit_debug TO "L$l residual" res!()
     cl = hier.levels[l + 1]
     @timeit_debug TO "L$l restrict" begin
-    _each_axis(Val(D)) do comp
-        d = _val(comp)
+    foreach_axis(Val(D)) do comp
+        d = unval(comp)
         restrict_face!(cl.cache.bext[d], lvl.cache.Rv[d], comp)
     end
     fill!(cl.cache.bext_P, 0)
-    _zero_solution!(cl)
+    zero_solution!(cl)
     end
     velocity_vcycle!(hier, l + 1, par, op; mfs_mean0)
     @timeit_debug TO "L$l prolong + correct" begin
     v = velocity(lvl.fluid);  vc = velocity(cl.fluid)
-    _each_axis(Val(D)) do comp
-        d = _val(comp);  e = lvl.cache.Rv[d]
-        prolong_face!(e, _compact(vc[d], d), comp, op)
-        vd = _compact(v[d], d)
+    foreach_axis(Val(D)) do comp
+        d = unval(comp);  e = lvl.cache.Rv[d]
+        prolong_face!(e, face_interior(vc[d], d), comp, op)
+        vd = face_interior(v[d], d)
         @. vd += e
     end
     apply_velocity_bcs!(lvl.fluid, lvl.grid, op; mfs_mean, Ddom)
@@ -84,33 +84,33 @@ end
 # the hierarchy's grids (weighted Jacobi, cell transfers); it sets only the step
 # of the multiplier update, not the fixed point R_P = 0.
 
-@kernel function _cc_residual_kernel!(r, @Const(p), @Const(f), w, periodic, invh2)
+@kernel function cc_residual_kernel!(r, @Const(p), @Const(f), w, periodic, invh2)
     I = @index(Global, Cartesian)
     @inbounds begin
         D = length(I);  pc = p[I]
         acc = zero(pc)
         for k in 1:D
-            n = size(p, k);  ek = _unit(I, k)
+            n = size(p, k);  ek = unit_index(I, k)
             if I[k] > 1
                 acc += w[k] * (pc - p[I - ek])
             elseif periodic[k]
-                acc += w[k] * (pc - p[_setidx(I, k, n)])
+                acc += w[k] * (pc - p[replace_index(I, k, n)])
             end
             if I[k] < n
                 acc += w[k] * (pc - p[I + ek])
             elseif periodic[k]
-                acc += w[k] * (pc - p[_setidx(I, k, 1)])
+                acc += w[k] * (pc - p[replace_index(I, k, 1)])
             end
         end
         r[I] = f[I] - acc * invh2
     end
 end
 
-@kernel function _cc_jacobi_kernel!(p, @Const(r), w, periodic, invh2, ω)
+@kernel function cc_jacobi_kernel!(p, @Const(r), w, periodic, invh2, ω)
     I = @index(Global, Cartesian)
     @inbounds begin
         D = length(I)
-        diag = _tfoldl(zero(eltype(p)), ntuple(identity, Val(D))) do s, k
+        diag = tuple_foldl(zero(eltype(p)), ntuple(identity, Val(D))) do s, k
             n = size(p, k)
             s + (periodic[k] ? 2 : (I[k] > 1) + (I[k] < n)) * w[k]
         end
@@ -118,47 +118,47 @@ end
     end
 end
 
-function _cc_sweeps!(w, n, wk, periodic)
+function cc_sweeps!(w, n, wk, periodic)
     backend = KernelAbstractions.get_backend(w.p)
     invh2 = inv(w.h^2)
     for _ in 1:n
-        _cc_residual_kernel!(backend)(w.r, w.p, w.f, wk, periodic, invh2; ndrange = size(w.p))
-        _cc_jacobi_kernel!(backend)(w.p, w.r, wk, periodic, invh2, oftype(w.h, 0.8); ndrange = size(w.p))
+        cc_residual_kernel!(backend)(w.r, w.p, w.f, wk, periodic, invh2; ndrange = size(w.p))
+        cc_jacobi_kernel!(backend)(w.p, w.r, wk, periodic, invh2, oftype(w.h, 0.8); ndrange = size(w.p))
     end
     return nothing
 end
 
-function _cc_vcycle!(ws, l, wk, periodic; ν = 2)
+function cc_vcycle!(ws, l, wk, periodic; ν = 2)
     w = ws[l]
     if l == length(ws)
-        _cc_sweeps!(w, 20 * maximum(size(w.p)), wk, periodic)   # coarsest: Jacobi to near-convergence
+        cc_sweeps!(w, 20 * maximum(size(w.p)), wk, periodic)   # coarsest: Jacobi to near-convergence
         return nothing
     end
-    _cc_sweeps!(w, ν, wk, periodic)
+    cc_sweeps!(w, ν, wk, periodic)
     backend = KernelAbstractions.get_backend(w.p)
-    _cc_residual_kernel!(backend)(w.r, w.p, w.f, wk, periodic, inv(w.h^2); ndrange = size(w.p))
+    cc_residual_kernel!(backend)(w.r, w.p, w.f, wk, periodic, inv(w.h^2); ndrange = size(w.p))
     restrict_cell!(ws[l + 1].f, w.r)
     fill!(ws[l + 1].p, 0)
-    _cc_vcycle!(ws, l + 1, wk, periodic; ν)
+    cc_vcycle!(ws, l + 1, wk, periodic; ν)
     prolong_cell!(w.r, ws[l + 1].p, periodic)
     w.p .+= w.r
-    _cc_sweeps!(w, ν, wk, periodic)
+    cc_sweeps!(w, ν, wk, periodic)
     return nothing
 end
 
 # P += (ω/dt)·A⁻¹(ρ·R_P), A⁻¹ ≈ one Poisson V-cycle (R_P is 1/ρ-scaled, hence
 # the ρ). A has a constant null mode, so the right-hand side and the result are
 # made mean-free.
-function _cc_update!(ws, fluid, c::StokesCache{D, T}, ω, op::StokesOp{D}) where {D, T}
+function cc_update!(ws, fluid, c::StokesCache{D, T}, ω, op::StokesOp{D}) where {D, T}
     wk = map(inv, op.cin)
     f = ws[1].f
     @. f = fluid.rho * c.R_P
     f .-= sum(f) / length(f)
     fill!(ws[1].p, 0)
-    _cc_vcycle!(ws, 1, wk, op.periodic)
+    cc_vcycle!(ws, 1, wk, op.periodic)
     p = ws[1].p
     p .-= sum(p) / length(p)
-    Pint = _interior(fluid.P)
+    Pint = interior(fluid.P)
     @. Pint += T(ω / op.dt) * p
     return nothing
 end
@@ -196,15 +196,15 @@ function fluidmech_vmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
                         verbose::Bool = false) where {T}
     isfinite(dt) || throw(ArgumentError(
         "fluidmech_vmg!: dt must be finite (got $dt); the drunken-sailor term ∂ρ·g0·dt scales with dt"))
-    op = StokesOp(T, _dims(grid), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
+    op = StokesOp(T, dims_val(grid), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
     lvl1 = hier.levels[1];  c = lvl1.cache
     @timeit_debug TO "setup" begin
     P0arr = P0 === nothing ? copyto!(hier.levels[1].cache.P0, fluid.P) : P0
-    bnchm || _update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
+    bnchm || update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
     momentum_advection!(c, fluid, grid, par, op)
     mfs_mean = bnchm ? zero(T) : T(sum(fluid.MFS) / length(fluid.MFS))
     refresh_coefficients!(hier, par, op; γfact)
-    apply_velocity_bcs!(fluid, grid, op; mfs_mean, Ddom = T(grid.D))
+    apply_velocity_bcs!(fluid, grid, op; mfs_mean, Ddom = T(grid.li[1]))
     apply_pressure_bcs!(fluid, op)
     end
     err0 = one(T);  converged = false;  relaxed = false;  PH_iters = 0
@@ -216,12 +216,12 @@ function fluidmech_vmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
         end
         @timeit_debug TO "PH multiplier update" begin
         residual_continuity!(c, fluid, grid, P0arr, Inf)
-        Pint = _interior(fluid.P)
+        Pint = interior(fluid.P)
         c.dP .= Pint
         @. Pint += par.pres_relax_PT * c.γ_eff * c.R_P
         end
         cc && a1 > 0 &&
-            @timeit_debug TO "Cahouet–Chabard Poisson V-cycle" _cc_update!(hier.cc, fluid, c, par.pres_relax_PT, op)
+            @timeit_debug TO "Cahouet–Chabard Poisson V-cycle" cc_update!(hier.cc, fluid, c, par.pres_relax_PT, op)
         # full (penalty-free) residual: the penalty vanishes with R_P at the solution
         @timeit_debug TO "gauge + convergence residual" begin
         bnchm || pressure_gauge!(fluid, P0arr)

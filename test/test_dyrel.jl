@@ -27,7 +27,7 @@ function _dyrel_setup(T = Float64; Npts = 48, ηcontrast = 1.0, γfact = 20.0,
                      atol_PH = 1.0e-6, rel_drop_PT = 1.0e-2)
     grid   = Grid(par)
     scales = compute_scales(par, grid)
-    Nz, Nx = grid.Nz, grid.Nx
+    Nz, Nx = grid.ni[1], grid.ni[2]
     fluid  = FluidState(T, CPU(), Nz, Nx)
     phase  = PhaseState(T, CPU(), Nz, Nx)
     dyrel  = DyrelCache(T, CPU(), grid)
@@ -44,16 +44,16 @@ function _dyrel_setup(T = Float64; Npts = 48, ηcontrast = 1.0, γfact = 20.0,
     # optional viscosity contrast: a stiff central block
     if ηcontrast != 1.0
         for j in 1:Nz, i in 1:Nx
-            zc = (j - 0.5) * grid.h / grid.D
-            xc = (i - 0.5) * grid.h / grid.L
+            zc = (j - 0.5) * grid.h / grid.li[1]
+            xc = (i - 0.5) * grid.h / grid.li[2]
             if abs(xc - 0.5) < 0.15 && abs(zc - 0.5) < 0.15
                 fluid.eta[j, i] = T(ηcontrast)
             end
         end
         # corner viscosity = geometric-mean-ish; simple injection is fine for the test
         for j in 1:Nz+1, i in 1:Nx+1
-            zc = (j - 1) * grid.h / grid.D
-            xc = (i - 1) * grid.h / grid.L
+            zc = (j - 1) * grid.h / grid.li[1]
+            xc = (i - 1) * grid.h / grid.li[2]
             if abs(xc - 0.5) < 0.15 && abs(zc - 0.5) < 0.15
                 fluid.etaco[j, i] = T(ηcontrast)
             end
@@ -62,8 +62,8 @@ function _dyrel_setup(T = Float64; Npts = 48, ηcontrast = 1.0, γfact = 20.0,
 
     # buoyancy blob on z-faces (Nz+1, Nx)
     for j in 1:Nz+1, i in 1:Nx
-        zc = (j - 1) * grid.h / grid.D
-        xc = (i - 0.5) * grid.h / grid.L
+        zc = (j - 1) * grid.h / grid.li[1]
+        xc = (i - 0.5) * grid.h / grid.li[2]
         fluid.Drho[j, i] = exp(-(((xc - 0.5) / 0.1)^2 + ((zc - 0.5) / 0.1)^2))
     end
 
@@ -77,14 +77,14 @@ function _operator_setup(case::Symbol)
                      total_iterMax_PT = 50_000, n_tune_PT = 100,
                      atol_PH = 1.0e-8, alpha = 0.0)
     grid = Grid(par)
-    fluid = FluidState(T, CPU(), grid.Nz, grid.Nx)
-    phase = PhaseState(T, CPU(), grid.Nz, grid.Nx)
+    fluid = FluidState(T, CPU(), grid.ni[1], grid.ni[2])
+    phase = PhaseState(T, CPU(), grid.ni[1], grid.ni[2])
     fluid.eta .= case === :solcx ?
-        [grid.Xc[i] < 0.5 ? 1.0 : 100.0 for j in 1:grid.Nz, i in 1:grid.Nx] :
-        [exp(log(100.0) * (1 - grid.Zc[j])) for j in 1:grid.Nz, i in 1:grid.Nx]
-    XC.compute_corner_eta!(fluid.etaco, fluid.eta; xBC = :closed, zBC = :closed)
-    fluid.rho .= [1 + 0.1 * sin(2π * grid.Xc[i]) * cos(π * grid.Zc[j])
-                  for j in 1:grid.Nz, i in 1:grid.Nx]
+        [grid.xci[2][i] < 0.5 ? 1.0 : 100.0 for j in 1:grid.ni[1], i in 1:grid.ni[2]] :
+        [exp(log(100.0) * (1 - grid.xci[1][j])) for j in 1:grid.ni[1], i in 1:grid.ni[2]]
+    XC.update_edge_viscosity!(fluid; xBC = :closed, zBC = :closed)
+    fluid.rho .= [1 + 0.1 * sin(2π * grid.xci[2][i]) * cos(π * grid.xci[1][j])
+                  for j in 1:grid.ni[1], i in 1:grid.ni[2]]
     XC.update_interpolations!(phase, fluid, grid, par; xBC = :closed)
     return fluid, phase, grid, par, compute_scales(par, grid)
 end
@@ -102,8 +102,8 @@ function _periodic_ns_trajectory(solver::Symbol; nsteps::Int = 3, N::Int = 32, f
                      Da = 0.01, Xi = 0.5, solver, atol = 1.0e-6, forcing_PH, kw...)
     grid = Grid(par)
     scales = compute_scales(par, grid)
-    fluid = FluidState(T, CPU(), grid.Nz, grid.Nx)
-    phase = PhaseState(T, CPU(), grid.Nz, grid.Nx)
+    fluid = FluidState(T, CPU(), grid.ni[1], grid.ni[2])
+    phase = PhaseState(T, CPU(), grid.ni[1], grid.ni[2])
     ns = XC.NoiseState(T, grid, scales)
     hst = XC.History(T)
     XC.initialize!(phase, fluid, ns, hst, grid, par, scales)
@@ -152,7 +152,7 @@ end
         par = Parameters(T; D = 1.0, N = 32, L = 1.0, etam0 = 1.0, g0 = 1.0,
                          alpha = 0.0, gamma = 0.0, atol_PH = 1.0e-7)
         grid = Grid(par); scales = compute_scales(par, grid)
-        Nz, Nx, h = grid.Nz, grid.Nx, grid.h
+        Nz, Nx, h = grid.ni[1], grid.ni[2], grid.h
         fluid = FluidState(T, CPU(), Nz, Nx); phase = PhaseState(T, CPU(), Nz, Nx)
         dyrel = DyrelCache(T, CPU(), grid)
         for A in (fluid.eta, fluid.etaco, fluid.rho, fluid.rhow, fluid.rhou)
@@ -239,10 +239,10 @@ end
     T = Float64
     for (xBC, sds) in ((:periodic, -1), (:closed, 1))
         par = Parameters(T; D = 1.0, N = 8, L = 1.0, g0 = 1.0, gamma = 0.3, alpha = 0.0)
-        grid = Grid(par); Nz, Nx, h = grid.Nz, grid.Nx, grid.h
+        grid = Grid(par); Nz, Nx, h = grid.ni[1], grid.ni[2], grid.h
         fluid = FluidState(T, CPU(), Nz, Nx); phase = PhaseState(T, CPU(), Nz, Nx)
         fluid.eta .= [1 + 0.5 * sinpi(2 * i / Nx) * cospi(j / Nz) for j in 1:Nz, i in 1:Nx]
-        XC.compute_corner_eta!(fluid.etaco, fluid.eta; xBC, zBC = :closed)
+        XC.update_edge_viscosity!(fluid; xBC, zBC = :closed)
         fluid.rho .= [1 + 0.3 * sinpi(2 * (i + 0.3) / Nx) * sinpi(3 * (j + 0.2) / Nz) for j in 1:Nz, i in 1:Nx]
         XC.update_interpolations!(phase, fluid, grid, par; xBC)
         dyrel = DyrelCache(T, CPU(), grid)
@@ -279,7 +279,7 @@ end
     T = Float64
     function inclusion(ratio)
         fluid, phase, dyrel, grid, par, scales = _dyrel_setup(T; Npts = 64, maxit_PH = 100)
-        Nz, Nx = grid.Nz, grid.Nx
+        Nz, Nx = grid.ni[1], grid.ni[2]
         fluid.rho .= [hypot((i - 0.5) / Nx - 0.5, (j - 0.5) / Nz - 0.5) < 0.2 ? ratio : 1.0
                       for j in 1:Nz, i in 1:Nx]
         XC.update_interpolations!(phase, fluid, grid, par; xBC = :periodic)
@@ -468,14 +468,14 @@ end
         par = Parameters(T; D = 1.0, N = 32, L = 1.0, etam0 = 1.0, g0 = 1.0,
                          alpha = 0.0, gamma = 0.0, atol_PH = 1.0e-7, kw...)
         grid = Grid(par); scales = compute_scales(par, grid)
-        fluid = FluidState(T, CPU(), grid.Nz, grid.Nx)
-        phase = PhaseState(T, CPU(), grid.Nz, grid.Nx)
+        fluid = FluidState(T, CPU(), grid.ni[1], grid.ni[2])
+        phase = PhaseState(T, CPU(), grid.ni[1], grid.ni[2])
         for A in (fluid.eta, fluid.etaco, fluid.rho, fluid.rhow, fluid.rhou)
             fill!(A, 1)
         end
         fill!(fluid.MFS, 0)
         fluid.Drho .= [exp(-(((i - 0.5) * grid.h - 0.5)^2 + ((j - 1) * grid.h - 0.5)^2) / 0.01)
-                       for j in 1:grid.Nz+1, i in 1:grid.Nx]
+                       for j in 1:grid.ni[1]+1, i in 1:grid.ni[2]]
         hier = build_hierarchy(fluid, grid, par)
         kw = (; a1 = 1, a2 = 0, a3 = 0, gamma = 0, dt)
         res = fluidmech_gmg!(fluid, phase, hier, grid, par, scales;
@@ -508,13 +508,13 @@ end
     ηc = 1.0e3
     fluid, phase, _, grid, par, scales =
         _dyrel_setup(Float64; Npts = 64, γfact = 50.0)
-    Nz, Nx = grid.Nz, grid.Nx
+    Nz, Nx = grid.ni[1], grid.ni[2]
     for j in 1:Nz, i in 1:Nx
         zc = (j - 0.5) / Nz;  xc = (i - 0.5) / Nx
         fluid.eta[j, i] = abs(zc - 0.5) < 0.12 ? ηc :
                           (abs(xc - 0.5) < 0.08 ? inv(ηc) : 1.0)
     end
-    XC.compute_corner_eta!(fluid.etaco, fluid.eta; xBC = :periodic, zBC = :closed)
+    XC.update_edge_viscosity!(fluid; xBC = :periodic, zBC = :closed)
 
     hier = build_hierarchy(fluid, grid, par)
     res = fluidmech_gmg!(fluid, phase, hier, grid, par, scales;
@@ -544,7 +544,7 @@ end
                      maxit_PH = 100, maxit_PT = 100_000, n_tune_PT = 100,
                      atol_PH = 1.0e-8, rel_drop_PT = 1.0e-3, gamma = 0.0)
     grid   = Grid(par);  scales = compute_scales(par, grid)
-    Nz, Nx = grid.Nz, grid.Nx
+    Nz, Nx = grid.ni[1], grid.ni[2]
     dt = 1.0e6   # large but finite (inertia ≈ 0); avoids 0·Inf in sailor
 
     function _setup!(fluid)

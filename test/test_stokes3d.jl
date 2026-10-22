@@ -11,9 +11,9 @@ function _stokes3d_base(N; atol_PH = 1.0e-7)
     T = Float64
     par = Parameters(T; D = 1.0, N, L = 1.0, etam0 = 1.0, g0 = 1.0, alpha = 0.0,
                      gamma = 0.0, atol_PH)
-    grid = Grid3D(par)
-    fluid = FluidState3D(T, CPU(), grid)
-    return fluid, PhaseState3D(T, CPU(), grid), grid, par, compute_scales(par, Grid(par))
+    grid = Grid(par, Val(3))
+    fluid = FluidState(T, CPU(), grid)
+    return fluid, PhaseState(T, CPU(), grid), grid, par, compute_scales(par, Grid(par))
 end
 
 # Discretely divergence-free flow: v = curl of two edge potentials that vanish at
@@ -21,7 +21,7 @@ end
 # (v, P = c) the exact discrete solution for any constant c.
 function _stokes3d_mms(N, c; dt = 10.0)
     fluid, phase, grid, par, scales = _stokes3d_base(N)
-    Nz, Nx, Ny, h = grid.Nz, grid.Nx, grid.Ny, grid.h
+    Nz, Nx, Ny, h = grid.ni[1], grid.ni[2], grid.ni[3], grid.h
     fluid.eta .= [exp(0.5 * sinpi(2 * (i - 0.5) * h) * cospi((j - 0.5) * h))
                   for j in 1:Nz, i in 1:Nx, k in 1:Ny]
     fill!(fluid.rho, 1)
@@ -64,7 +64,7 @@ end
     T = Float64;  Nz, Nx, Ny = 8, 6, 4
     par = Parameters(T; D = 1.0, N = Nz, L = Nx / Nz, g0 = 9.81)
     g2 = Grid(par);  h = g2.h
-    g3 = XC._grid3d_at(T, Nz, Nx, Ny, h, 1.0, 1.0)
+    g3 = Grid((Nz, Nx, Ny), (Nz, Nx, Ny) .* h)
     kw = (; a1 = 1.3, a2 = -0.4, a3 = 0.1, gamma = 0.7, dt = 0.05, top_cnv = -1, bot_cnv = 1)
     rep(A, n) = repeat(A, 1, 1, n)
     for xBC in (:periodic, :closed)
@@ -75,7 +75,7 @@ end
         for A in (f2.W, f2.U, f2.P, f2.Drho, f2.MFS, f2.rhoWo, f2.rhoUo); A .= randn(T, size(A)); end
         f2.eta .= exp.(randn(T, Nz, Nx));  f2.rho .= 1 .+ 0.3 .* rand(T, Nz, Nx)
         S3.derived_coefficients!(f2, op2)
-        f3 = FluidState3D(T, CPU(), Nz, Nx, Ny)
+        f3 = FluidState(T, CPU(), Nz, Nx, Ny)
         f3.W .= rep(f2.W, Ny + 2);  f3.U .= rep(f2.U, Ny + 2);  f3.P .= rep(f2.P, Ny + 2)
         for n in (:Drho, :MFS, :rhoWo, :eta, :rho); getfield(f3, n) .= rep(getfield(f2, n), Ny); end
         f3.rhoUo .= rep(f2.rhoUo, Ny)
@@ -104,18 +104,18 @@ end
     # x ↔ y: on a random periodic state the V-component is the U-component of
     # the axis-swapped state
     σ(A) = permutedims(A, (1, 3, 2))
-    f = FluidState3D(T, CPU(), Nz, Nx, Ny)
+    f = FluidState(T, CPU(), Nz, Nx, Ny)
     for A in (f.W, f.U, f.V, f.P, f.Drho, f.MFS); A .= randn(T, size(A)); end
     f.eta .= exp.(randn(T, size(f.eta)));  f.rho .= 1 .+ 0.3 .* rand(T, size(f.rho))
     op = S3.StokesOp(T, Val(3), par; kw..., xBC = :periodic, yBC = :periodic)
     S3.derived_coefficients!(f, op)
-    fs = FluidState3D(T, CPU(), Nz, Ny, Nx)
+    fs = FluidState(T, CPU(), Nz, Ny, Nx)
     for (a, b) in ((:W, :W), (:U, :V), (:V, :U), (:P, :P), (:eta, :eta), (:rho, :rho), (:rhow, :rhow),
-                   (:rhou, :rhov), (:rhov, :rhou), (:etaxz, :etayz), (:etayz, :etaxz), (:etaxy, :etaxy),
+                   (:rhou, :rhov), (:rhov, :rhou), (:etaco, :etayz), (:etayz, :etaco), (:etaxy, :etaxy),
                    (:Drho, :Drho), (:MFS, :MFS))
         getfield(fs, a) .= σ(getfield(f, b))
     end
-    g = XC._grid3d_at(T, Nz, Nx, Ny, h, 1.0, 1.0);  gs = XC._grid3d_at(T, Nz, Ny, Nx, h, 1.0, 1.0)
+    g = Grid((Nz, Nx, Ny), (Nz, Nx, Ny) .* h);  gs = Grid((Nz, Ny, Nx), (Nz, Ny, Nx) .* h)
     c = S3.StokesCache(T, CPU(), g);  cs = S3.StokesCache(T, CPU(), gs)
     c.γ_eff .= 1 .+ rand(T, Nz, Nx, Ny);  cs.γ_eff .= σ(c.γ_eff)
     c.η_b .= 1;  cs.η_b .= 1
@@ -136,9 +136,9 @@ end
     Random.seed!(5)
     T = Float64;  Nz, Nx, Ny = 6, 4, 4;  h = 0.3
     par = Parameters(T; D = 1.0, N = 6, L = 1.0, g0 = 9.81)
-    grid = XC._grid3d_at(T, Nz, Nx, Ny, h, 1.0, 1.0)
+    grid = Grid((Nz, Nx, Ny), (Nz, Nx, Ny) .* h)
     for xBC in (:periodic, :closed)
-        f = FluidState3D(T, CPU(), Nz, Nx, Ny)
+        f = FluidState(T, CPU(), Nz, Nx, Ny)
         f.eta .= exp.(randn(T, size(f.eta)));  f.rho .= 1 .+ 0.3 .* rand(T, size(f.rho))
         for A in (f.W, f.U, f.V); A .= randn(T, size(A)); end
         op = S3.StokesOp(T, Val(3), par; a1 = 1.3, a2 = 0, a3 = 0, gamma = 0.7, dt = 0.05,
@@ -149,7 +149,7 @@ end
         S3.apply_velocity_bcs!(f, grid, op)
         v = S3.velocity(f)
         unknowns = [(d, J) for d in 1:3 for J in CartesianIndices(c.Rv[d])
-                    if !S3._dirichlet_face(J, d, size(c.Rv[d], d), op.periodic) &&
+                    if !S3.dirichlet_face(J, d, size(c.Rv[d], d), op.periodic) &&
                        !(op.periodic[d] && J[d] == size(c.Rv[d], d))]
         function Av()
             S3.residual_continuity!(c, f, grid, f.P, Inf)
@@ -158,7 +158,7 @@ end
         end
         r0 = Av();  A = zeros(T, length(unknowns), length(unknowns))
         for (i, (d, J)) in enumerate(unknowns)
-            vi = J + CartesianIndex(1, 1, 1) - S3._unit(J, d)
+            vi = J + CartesianIndex(1, 1, 1) - S3.unit_index(J, d)
             v[d][vi] += 1;  S3.apply_velocity_bcs!(f, grid, op)
             A[:, i] .= Av() .- r0
             v[d][vi] -= 1;  S3.apply_velocity_bcs!(f, grid, op)
@@ -166,9 +166,9 @@ end
         bound = [c.λmax[d][J] * c.Dv[d][J] for (d, J) in unknowns]
         @test all(vec(sum(abs, A; dims = 2)) .<= bound .* (1 + 1.0e-12))
         σ = map(unknowns) do (d, J)
-            n = size(f.rho, d);  e = S3._unit(J, d)
-            lo = J[d] == 1     ? (d == 1 ? J : S3._setidx(J, d, n)) : J - e
-            hi = J[d] == n + 1 ? (d == 1 ? J - e : S3._setidx(J, d, 1)) : J
+            n = size(f.rho, d);  e = S3.unit_index(J, d)
+            lo = J[d] == 1     ? (d == 1 ? J : S3.replace_index(J, d, n)) : J - e
+            hi = J[d] == n + 1 ? (d == 1 ? J - e : S3.replace_index(J, d, 1)) : J
             (f.rho[hi] - f.rho[lo]) / h * par.g0 * 0.05
         end
         # rows next to a reflected ghost carry the reflection in their diagonal
@@ -186,7 +186,7 @@ end
             res = _stokes3d_solve(kind, fluid, phase, grid, par, scales; kw...)
             verr = maximum(maximum(abs, a .- b) for (a, b) in zip((fluid.W, fluid.U, fluid.V), vex))
             (; res, verr = verr / maximum(abs, vex[1]),
-               perr = maximum(abs, S3._interior(fluid.P) .- c))
+               perr = maximum(abs, S3.interior(fluid.P) .- c))
         end
         r0, r1 = results
         its(r) = haskey(r, :ncyc) ? r.ncyc : r.PH_iters
@@ -217,7 +217,7 @@ end
     kw = (; dt = 1.0e-4, a1 = 1, a2 = 0, a3 = 0, gamma = 0, top_cnv = -1, bot_cnv = -1)
     S3.derived_coefficients!(fluid, S3.StokesOp(Float64, Val(3), par; kw...))
     fluid.Drho .= [exp(-(((i - 0.5) * h - 0.5)^2 + ((k - 0.5) * h - 0.5)^2 + ((j - 1) * h - 0.5)^2) / 0.01)
-                   for j in 1:grid.Nz+1, i in 1:grid.Nx, k in 1:grid.Ny]
+                   for j in 1:grid.ni[1]+1, i in 1:grid.ni[2], k in 1:grid.ni[3]]
     res = _stokes3d_solve(:vmg, fluid, phase, grid, par, scales; kw...)
     @test res.converged
     @test res.PH_iters <= 12

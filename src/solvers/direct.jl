@@ -152,7 +152,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
                     b1::Real = T(1), b2::Real = T(0), b3::Real = T(0),
                     verbose = false) where {T<:AbstractFloat}
     bnchm = bnchm_data !== nothing
-    Nz = grid.Nz;  Nx = grid.Nx;  h = grid.h
+    Nz = grid.ni[1];  Nx = grid.ni[2];  h = grid.h
     g0 = par.g0;   gamma = par.gamma
     invh  = inv(h);  invh2 = inv(h)^2
 
@@ -269,7 +269,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         # MFBG = MFSmean · ZZw — for the closed-bottom case enters here as
         # MFSmean · D / h (constant in x). In MMS MFSmean = 0 so this term
         # vanishes; in production it carries the depth-integrated divergence.
-        mfbg_bot = MFSmean * grid.D / h
+        mfbg_bot = MFSmean * grid.li[1] / h
         aa_bot = oc .* vec(MFS[end, :]) .+ (T(1) - oc) * mfbg_bot
         append!(IIR, ii); append!(AAR, aa_bot)
     end
@@ -322,7 +322,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         w_mz = (W[1:end-1, 2:end-1] .+ W[2:end, 2:end-1]) ./ T(2)
         size(cache.advn_mz) == size(f_mz) || (cache.advn_mz = similar(f_mz))
         advn_mz = cache.advn_mz
-        advect!(advn_mz, f_mz, u_mz, w_mz, h, par.ADVN; xBC, zBC)
+        advect!(advn_mz, f_mz, (w_mz, u_mz), h, par.ADVN; xBC, zBC)
         rr = Drho[2:end-1, :] .* g0 .+ (a2 .* rhoWo[2:end-1, :] .+ a3 .* rhoWoo[2:end-1, :]) ./ T(dt) .- advn_mz
         if bnchm
             rr .+= bnchm_data.src_W[2:end-1, 2:end-1]
@@ -429,7 +429,7 @@ function fluidmech!(state::FluidState{T}, grid::Grid{T}, par::Parameters{T};
         end
         size(cache.advn_mx) == size(f_mx) || (cache.advn_mx = similar(f_mx))
         advn_mx = cache.advn_mx
-        advect!(advn_mx, f_mx, u_mx, w_mx, h, par.ADVN; xBC, zBC)
+        advect!(advn_mx, f_mx, (w_mx, u_mx), h, par.ADVN; xBC, zBC)
         if periodic
             col_avg = (advn_mx[:, 1] .+ advn_mx[:, end]) ./ T(2)
             advn_mx[:, 1]   .= col_avg

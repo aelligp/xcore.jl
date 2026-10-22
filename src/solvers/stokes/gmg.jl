@@ -78,7 +78,7 @@ function smooth!(lvl, par::Parameters, op::StokesOp{D, T}; nsweeps::Int, ninner:
         update_P || continue
         @timeit_debug TO "PH multiplier update" begin
         residual_continuity!(cache, fluid, grid, P0, op.dt; fscale = fs)
-        Pint = _interior(fluid.P)
+        Pint = interior(fluid.P)
         @. Pint += par.pres_relax_PT * cache.γ_eff * cache.R_P
         apply_pressure_bcs!(fluid, op)
         end
@@ -87,12 +87,12 @@ function smooth!(lvl, par::Parameters, op::StokesOp{D, T}; nsweeps::Int, ninner:
 end
 
 # zero a coarse level's solution (the correction starts at 0)
-function _zero_solution!(lvl)
+function zero_solution!(lvl)
     foreach(A -> fill!(A, 0), velocity(lvl.fluid));  fill!(lvl.fluid.P, 0)
     return nothing
 end
 
-_remove_mean!(a) = (a .-= sum(a) / length(a); nothing)
+remove_mean!(a) = (a .-= sum(a) / length(a); nothing)
 
 # Inertia-to-viscous ratio a1·ρ·h²/(η·dt) above which the coarsest level retunes
 # its penalty. The rate law ρ = 1/(1 + γfact·λ) assumes the Schur diagonal
@@ -172,7 +172,7 @@ function vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::StokesOp{D};
     lvl = hier.levels[l];  fine = l == 1
     fscale   = fine ? one(T) : zero(T)
     mfs_mean = fine ? T(mfs_mean0) : zero(T)
-    Ddom     = T(lvl.grid.D)
+    Ddom     = T(lvl.grid.li[1])
     P0_lvl   = fine ? P0 : lvl.cache.P0
     sm(n) = smooth!(lvl, par, op; nsweeps = n, ninner = hier.inner, fscale,
                     P0 = P0_lvl, mfs_mean, Ddom)
@@ -185,32 +185,32 @@ function vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::StokesOp{D};
     @timeit_debug TO "L$l residual" level_residual!(lvl, op; P0 = P0_lvl, fscale)
     cl = hier.levels[l + 1]
     @timeit_debug TO "L$l restrict" begin
-    _each_axis(Val(D)) do comp
-        d = _val(comp)
+    foreach_axis(Val(D)) do comp
+        d = unval(comp)
         restrict_face!(cl.cache.bext[d], lvl.cache.Rv[d], comp)
     end
     restrict_cell!(cl.cache.bext_P, lvl.cache.R_P)
-    _zero_solution!(cl)
+    zero_solution!(cl)
     end
     vcycle!(hier, l + 1, par, op; P0, mfs_mean0)
     @timeit_debug TO "L$l prolong + correct" begin
     v = velocity(lvl.fluid);  vc = velocity(cl.fluid)
-    _each_axis(Val(D)) do comp
-        d = _val(comp)
-        prolong_face!(lvl.cache.Rv[d], _compact(vc[d], d), comp, op)
+    foreach_axis(Val(D)) do comp
+        d = unval(comp)
+        prolong_face!(lvl.cache.Rv[d], face_interior(vc[d], d), comp, op)
     end
     eP = lvl.cache.R_P
-    prolong_cell!(eP, _interior(cl.fluid.P), op.periodic)
+    prolong_cell!(eP, interior(cl.fluid.P), op.periodic)
     # The pressure correction carries the null mode; no velocity component has
     # one (Dirichlet or reflected at z), so only P is made mean-free.
-    _remove_mean!(eP)
+    remove_mean!(eP)
     # residual convention b − A·v: the coarse solve returns e ≈ A⁻¹·r, v += γ·e
     γ = hier.γ_mg
     for d in 1:D
-        vd = _compact(v[d], d)
+        vd = face_interior(v[d], d)
         @. vd += γ * lvl.cache.Rv[d]
     end
-    Pint = _interior(lvl.fluid.P)
+    Pint = interior(lvl.fluid.P)
     @. Pint += γ * eP
     apply_velocity_bcs!(lvl.fluid, lvl.grid, op; mfs_mean, Ddom)
     apply_pressure_bcs!(lvl.fluid, op)
@@ -246,15 +246,15 @@ function fluidmech_gmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
                         verbose::Bool = false) where {T}
     isfinite(dt) || throw(ArgumentError(
         "fluidmech_gmg!: dt must be finite (got $dt); the drunken-sailor term ∂ρ·g0·dt scales with dt"))
-    op = StokesOp(T, _dims(grid), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
+    op = StokesOp(T, dims_val(grid), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
     P0arr = P0 === nothing ? copyto!(hier.levels[1].cache.P0, fluid.P) : P0
     lvl1 = hier.levels[1];  fcache = lvl1.cache
     @timeit_debug TO "setup" begin
-    bnchm || _update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
+    bnchm || update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
     momentum_advection!(fcache, fluid, grid, par, op)
     mfs_mean = bnchm ? zero(T) : T(sum(fluid.MFS) / length(fluid.MFS))
     refresh_coefficients!(hier, par, op)
-    apply_velocity_bcs!(fluid, grid, op; mfs_mean, Ddom = T(grid.D))
+    apply_velocity_bcs!(fluid, grid, op; mfs_mean, Ddom = T(grid.li[1]))
     bnchm || pressure_gauge!(fluid, P0arr, fcache.η_b)
     apply_pressure_bcs!(fluid, op)
     end
@@ -262,7 +262,7 @@ function fluidmech_gmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
     errs = T[]
     for cyc in 1:par.maxit_PH
         ncyc = cyc
-        fcache.dP .= _interior(fluid.P)
+        fcache.dP .= interior(fluid.P)
         @timeit_debug TO "V-cycle" vcycle!(hier, 1, par, op; P0 = P0arr, mfs_mean0 = mfs_mean)
         @timeit_debug TO "gauge + convergence residual" begin
         bnchm || pressure_gauge!(fluid, P0arr, fcache.η_b)
@@ -271,7 +271,7 @@ function fluidmech_gmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
         # would otherwise absorb the mass imbalance the gate must bound
         level_residual!(lvl1, op; P0 = fluid.P, fscale = 1)
         nv, nP = residual_norms(fcache, fluid.rho)
-        fcache.dP .= _interior(fluid.P) .- fcache.dP
+        fcache.dP .= interior(fluid.P) .- fcache.dP
         ndP = pressure_change_norm(fcache.dP, fluid, grid.h)
         end
         # The residuals bound the pressure error only up to the conditioning of

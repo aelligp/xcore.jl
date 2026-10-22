@@ -1,5 +1,5 @@
 # Dimension-generic matrix-free Stokes/Navier–Stokes solvers: one implementation
-# for D = 2 (`FluidState`, `Grid`) and D = 3 (`FluidState3D`, `Grid3D`). Kernels
+# for D = 2 and D = 3 (`FluidState{T,D}`, `Grid{T,D}`). Kernels
 # run over `CartesianIndex{D}` with compile-time unit offsets; the velocity is the
 # tuple `velocity(fluid)` with one component per axis. See `layout.jl` for the
 # axis conventions and array shapes.
@@ -16,11 +16,15 @@ using Printf
 using TimerOutputs: @timeit_debug
 using LinearAlgebra: pinv
 
-using ..xcore: TO, Grid, Grid3D, Parameters, Scales, FluidState, FluidState3D,
-               xcore_zeros, coarsen_grid3d,
+using ..xcore: TO, Grid, Parameters, Scales, FluidState,
+               xcore_zeros, interior, face_interior,
+               velocity, edge_viscosity, face_density, momentum_lag1, momentum_lag2,
+               face_mean!, edge_geomean!, foreach_axis,
                update_kinematics!, update_viscosity!,
-               ADVN_SCHEMES, _fluxes, _ghost, _ghost_face,
-               _val, _unit, _ones, _setidx, _hz_axes, _hz_vaxes, _tfoldl
+               ADVN_SCHEMES, face_fluxes, ghost_index, ghost_face_index,
+               unval, unit_index, replace_index, hz_axes, hz_vaxes, tuple_foldl
+
+import ..xcore: cells
 
 include("layout.jl")
 include("cache.jl")

@@ -1,8 +1,7 @@
-# Matrix-free Stokes solvers (`src/stokes/`)
+# Matrix-free Stokes solvers (`src/solvers/stokes/`)
 
-One dimension-generic implementation (D = 2: `FluidState`/`Grid`; D = 3:
-`FluidState3D`/`Grid3D`) serves `par.solver ∈ (:dyrel, :gmg, :vmg)`;
-`src/solver.jl` dispatches. `:direct` (sparse LU, `src/fluidmech.jl`) is the
+One dimension-generic implementation (`FluidState{T,D}`/`Grid{T,D}`, D = 2, 3) serves `par.solver ∈ (:dyrel, :gmg, :vmg)`;
+`src/solvers/dispatch.jl` dispatches. `:direct` (sparse LU, `src/solvers/direct.jl`) is the
 reference: all solvers share one operator and agree to solver tolerance. Each
 call solves one frozen-coefficient system; the outer Picard loop in `run!`
 refreezes η, ρ, advection and the BD2 history.
@@ -35,7 +34,7 @@ For velocity component d, with τ = η(ε̇ − ⅓(∇·v)I) (**no factor 2**):
   N + 2 − e_d and P: N + 2. Cache arrays are compact: R[d]: N + e_d, cell
   fields N.
 - The edge viscosity of axis pair (a < b) has shape N + e_a + e_b, stored
-  lexicographically (2-D `(etaco,)`; 3-D `(etaxz, etayz, etaxy)`). Edge η is
+  lexicographically (2-D `(etaco,)`; 3-D `(etaco, etayz, etaxy)`). Edge η is
   the geometric mean of the four surrounding cells; face ρ is the arithmetic
   mean of the two adjacent cells.
 - Normal stress lives at cells, shear stress at edges.

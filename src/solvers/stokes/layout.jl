@@ -1,5 +1,6 @@
-# Dimension-generic index arithmetic, the accessors that present the 2-D and 3-D
-# state types to the solver as tuples, and the frozen operator coefficients.
+# Dimension-generic index arithmetic and the frozen operator coefficients. The
+# per-axis state accessors (`velocity`, `face_density`, ...) live in
+# src/setup/state.jl.
 #
 # Axis 1 is z (gravity; closed: Dirichlet normal velocity, free/no-slip tangential
 # via `top_cnv`/`bot_cnv`). Axes 2..D are horizontal (x, then y in 3-D), each
@@ -13,77 +14,27 @@
 # Compact face index J of component d ↔ velocity index J + 1 - e_d; cell c ↔
 # P[c + 1]. The edge viscosity of the axis pair (a, b), a < b, has shape
 # N .+ e_a .+ e_b and the pairs are stored in lexicographic order (1,2), (1,3),
-# (2,3): 2-D `(etaco,)`, 3-D `(etaxz, etayz, etaxy)`.
+# (2,3): 2-D `(etaco,)`, 3-D `(etaco, etayz, etaxy)`.
 #
 # Sums over axes run horizontal axes first, then z: the order the stencils of
 # the divergence, the Schur diagonal and the advection flux balance use.
 
 # axes other than d, in increasing order
-@inline _others(::Val{d}, ::Val{D}) where {d, D} = ntuple(i -> i < d ? i : i + 1, Val(D - 1))
+@inline other_axes(::Val{d}, ::Val{D}) where {d, D} = ntuple(i -> i < d ? i : i + 1, Val(D - 1))
 
 # position of the axis pair (a, b) in the lexicographic edge-viscosity tuple
-@inline function _pair(a::Int, b::Int, D::Int)
-    a > b && return _pair(b, a, D)
+@inline function pair_index(a::Int, b::Int, D::Int)
+    a > b && return pair_index(b, a, D)
     return (a - 1) * D - ((a - 1) * a) ÷ 2 + b - a
 end
 
 # Σ over the tuple in horizontal-then-z order
-@inline _hsum(g::NTuple{D}) where {D} = _tfoldl(+, g[2], (ntuple(k -> g[k + 2], Val(D - 2))..., g[1]))
+@inline hz_sum(g::NTuple{D}) where {D} = tuple_foldl(+, g[2], (ntuple(k -> g[k + 2], Val(D - 2))..., g[1]))
 
-# compile-time loop over the components 1..D
-@inline _each_axis(f, ::Val{D}) where {D} = (ntuple(d -> (f(Val(d)); nothing), Val(D)); nothing)
-
-# ---------------------------------------------------------------------------
-# State accessors
-# ---------------------------------------------------------------------------
-
-"""
-    velocity(fluid) -> NTuple{D}
-
-Ghosted face velocities `(W, U)` (2-D) or `(W, U, V)` (3-D), one per axis.
-"""
-velocity(f::FluidState) = (f.W, f.U)
-velocity(f::FluidState3D) = (f.W, f.U, f.V)
-
-"""
-    edge_viscosity(fluid) -> tuple
-
-Edge viscosities in the pair order (1,2), (1,3), (2,3): `(etaco,)` in 2-D,
-`(etaxz, etayz, etaxy)` in 3-D.
-"""
-edge_viscosity(f::FluidState) = (f.etaco,)
-edge_viscosity(f::FluidState3D) = (f.etaxz, f.etayz, f.etaxy)
-
-"""
-    face_density(fluid) -> NTuple{D}
-
-Face densities `(rhow, rhou[, rhov])`, compact face shape.
-"""
-face_density(f::FluidState) = (f.rhow, f.rhou)
-face_density(f::FluidState3D) = (f.rhow, f.rhou, f.rhov)
-
-# BD2 momentum-flux history, one and two steps back
-momentum_lag1(f::FluidState) = (f.rhoWo, f.rhoUo)
-momentum_lag1(f::FluidState3D) = (f.rhoWo, f.rhoUo, f.rhoVo)
-momentum_lag2(f::FluidState) = (f.rhoWoo, f.rhoUoo)
-momentum_lag2(f::FluidState3D) = (f.rhoWoo, f.rhoUoo, f.rhoVoo)
-
-"""
-    cells(grid) -> NTuple{D,Int}
-
-Interior cell counts in axis order: `(Nz, Nx)` or `(Nz, Nx, Ny)`.
-"""
-cells(g::Grid) = (g.Nz, g.Nx)
-cells(g::Grid3D) = (g.Nz, g.Nx, g.Ny)
-
-_ndims(::NTuple{D}) where {D} = D
 
 # zero-initialized state of the same kind at another resolution
-_similar_fluid(::FluidState{T}, backend, N::NTuple{2,Int}) where {T} = FluidState(T, backend, N...)
-_similar_fluid(::FluidState3D{T}, backend, N::NTuple{3,Int}) where {T} = FluidState3D(T, backend, N...)
+similar_fluid(::FluidState{T}, backend, N::Tuple) where {T} = FluidState(T, backend, N...)
 
-# interior (ghost ring removed) of a ghosted cell field
-_interior(P::AbstractArray{<:Any,D}) where {D} = view(P, ntuple(k -> 2:size(P, k) - 1, Val(D))...)
 
 # ---------------------------------------------------------------------------
 # Frozen operator coefficients and boundary conditions of one solve

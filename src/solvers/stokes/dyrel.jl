@@ -16,10 +16,10 @@ const γ_win_width   = 4     # PH sweeps the contraction is measured over
 const γ_max_retunes = 6
 const γ_max_growth  = 50    # per retune, bounding the response to a noisy ρ
 
-_anderson_reset!(aa::AndersonPH) = (aa.n = 0; aa.slot = 0; aa.have_prev = false; nothing)
+anderson_reset!(aa::AndersonPH) = (aa.n = 0; aa.slot = 0; aa.have_prev = false; nothing)
 
 """
-    _anderson_pressure_update!(aa, P, f, m) -> nothing
+    anderson_pressure_update!(aa, P, f, m) -> nothing
 
 Anderson-accelerated (type II, depth `m`) step of the multiplier fixed-point
 iteration `P ← P + f`, where `P` is the interior pressure the sweep's velocity
@@ -31,12 +31,12 @@ history `ΔX = [ΔP]`, `ΔF = [Δf]` of earlier sweeps,
 Only the m×m least-squares problem runs on the host; every array operation is a
 device broadcast or reduction.
 """
-function _anderson_pressure_update!(aa::AndersonPH{T}, P, f, m::Int) where {T}
+function anderson_pressure_update!(aa::AndersonPH{T}, P, f, m::Int) where {T}
     if length(aa.dX) != m
         aa.prev = [similar(f) for _ in 1:2]
         aa.dX = [similar(f) for _ in 1:m];  aa.dF = [similar(f) for _ in 1:m]
         aa.G = zeros(T, m, m);  aa.b = zeros(T, m)
-        _anderson_reset!(aa)
+        anderson_reset!(aa)
     end
     if aa.have_prev
         aa.slot = aa.slot % m + 1
@@ -50,9 +50,9 @@ function _anderson_pressure_update!(aa::AndersonPH{T}, P, f, m::Int) where {T}
     n = aa.n;  G = aa.G;  b = aa.b
     for j in 1:n
         for i in 1:j
-            G[i, j] = G[j, i] = sum(_bc(*, aa.dF[i], aa.dF[j]))
+            G[i, j] = G[j, i] = sum(lazy_broadcast(*, aa.dF[i], aa.dF[j]))
         end
-        b[j] = sum(_bc(*, aa.dF[j], f))
+        b[j] = sum(lazy_broadcast(*, aa.dF[j], f))
     end
     # The history columns turn nearly collinear as the iteration converges; the
     # pseudo-inverse drops the directions the residual differences cannot resolve.
@@ -65,7 +65,7 @@ end
 
 # Mass-flux source from the density evolution (phsevo!'s `advn_rho`), as the
 # direct solver forms it; the outer Picard loop converges it.
-function _update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
+function update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
     T = eltype(fluid.MFS)
     inv_dt = isfinite(dt) ? T(inv(dt)) : zero(T)
     @. fluid.drhodt = -phase.advn_rho
@@ -75,7 +75,7 @@ function _update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
     return nothing
 end
 
-_dims(grid) = Val(length(cells(grid)))
+dims_val(grid) = Val(length(cells(grid)))
 
 """
     fluidmech_dyrel!(fluid, phase, cache, grid, par, scales;
@@ -88,8 +88,7 @@ _dims(grid) = Val(length(cells(grid)))
 
 Solve one momentum + continuity system with dynamic relaxation inside a
 Powell-Hestenes iteration, writing the velocity and pressure into `fluid`
-(D = 2: `FluidState`/`Grid`; D = 3: `FluidState3D`/`Grid3D`; `yBC` is read only
-in 3-D). Full compressible Navier–Stokes terms: BD2 inertia (`a1, a2, a3` and
+(`FluidState{T,D}`/`Grid{T,D}`, D = 2 or 3; `yBC` is read only in 3-D). Full compressible Navier–Stokes terms: BD2 inertia (`a1, a2, a3` and
 the lagged momentum flux on `fluid`), momentum advection frozen at the entry
 velocity (scheme `par.ADVN`), drunken-sailor stabilization, continuity
 `∇·(ρv) = MFS` with MFS updated once from `phase.advn_rho` (skipped with
@@ -126,15 +125,15 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
         "fluidmech_dyrel!: rheology_in_PT is implemented for D = 2 only"))
     op = StokesOp(T, Val(D), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
     h = grid.h
-    _anderson_reset!(cache.anderson)
+    anderson_reset!(cache.anderson)
     P0arr = P0 === nothing ? copyto!(cache.P0, fluid.P) : P0
 
     @timeit_debug TO "setup" begin
-    bnchm || _update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
+    bnchm || update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
     # Mean mass-flux source: drains the net volume source through the bottom
     # (zero in MMS mode, where the bottom stays closed).
     mfs_mean = bnchm ? zero(T) : T(sum(fluid.MFS) / length(fluid.MFS))
-    Ddom = T(grid.D)
+    Ddom = T(grid.li[1])
     momentum_advection!(cache, fluid, grid, par, op)
     # The penalty factor learned by the previous solve is reused: the operator
     # barely moves between Picard sweeps (a fresh cache starts from γfact_PT).
@@ -220,7 +219,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
                 penalty!(cache, fluid, grid, op; γfact)
                 check_preconditioner(cache)
                 end
-                _anderson_reset!(cache.anderson)    # history from a different map
+                anderson_reset!(cache.anderson)    # history from a different map
                 verbose && @printf("  [PH %02d] rho=%.3f over %d sweeps -> gfact=%.4g\n",
                                    itPH, ρ_obs, γ_win_width, γfact)
                 # Only an applied correction spends budget.
@@ -261,7 +260,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
                 # the retune so the preconditioner sees the residual's η.
                 if par.rheology_in_PT
                     update_kinematics!(phase, fluid, grid)
-                    update_viscosity!(phase, fluid, grid, par, scales; xBC, zBC,
+                    update_viscosity!(phase, fluid, grid, par, scales; xBC, yBC, zBC,
                                       relaxation = par.visc_relax_PT)
                 end
                 @timeit_debug TO "retune (Rayleigh + Gershgorin)" begin
@@ -277,7 +276,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
         # update landed after the last continuity evaluation).
         @timeit_debug TO "PH multiplier update" begin
         residual_continuity!(cache, fluid, grid, P0arr, Inf)
-        Pint = _interior(fluid.P)
+        Pint = interior(fluid.P)
         if m_aa > 0
             # P_num = γ_eff·R_P serves as the update scratch: the next dr = true
             # residual rebuilds it first.
@@ -285,7 +284,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
             f .*= par.pres_relax_PT
             # the gauge removes the constant mode, so the history should not fit it
             bnchm || (f .-= sum(f) / length(f))
-            _anderson_pressure_update!(cache.anderson, Pint, f, m_aa)
+            anderson_pressure_update!(cache.anderson, Pint, f, m_aa)
         else
             @. Pint += par.pres_relax_PT * cache.γ_eff * cache.R_P
         end

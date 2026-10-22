@@ -4,7 +4,7 @@
 # the fluid state directly). Cell-centered fields have shape `N`.
 
 # Anderson-acceleration history of the Powell-Hestenes multiplier iteration
-# (see `_anderson_pressure_update!`). Cell-centered arrays and the host-side
+# (see `anderson_pressure_update!`). Cell-centered arrays and the host-side
 # m×m least-squares scratch, allocated on first use.
 mutable struct AndersonPH{T<:AbstractFloat, A<:AbstractArray{T}}
     prev::Vector{A}     # [pressure, update] of the previous sweep
@@ -74,7 +74,7 @@ function StokesCache(::Type{T}, backend, N::NTuple{D, Int}) where {T<:AbstractFl
                                 z(N), z(N), z(N), z(N .+ 2), z(N),
                                 AndersonPH{T, A}(), zero(T), zero(T))
 end
-StokesCache(::Type{T}, backend, grid::Union{Grid, Grid3D}) where {T<:AbstractFloat} =
+StokesCache(::Type{T}, backend, grid::Grid) where {T<:AbstractFloat} =
     StokesCache(T, backend, cells(grid))
 
 cells(c::StokesCache) = size(c.R_P)

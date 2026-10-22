@@ -1,6 +1,6 @@
 using xcore
 using xcore: Parameters, Grid, FluidState, PhaseState, DyrelCache, build_hierarchy,
-             compute_scales, fluidmech!, fluidmech_dyrel!, fluidmech_gmg!, compute_corner_eta!
+             compute_scales, fluidmech!, fluidmech_dyrel!, fluidmech_gmg!, update_edge_viscosity!
 using KernelAbstractions: CPU
 using LinearAlgebra
 using Statistics
@@ -21,7 +21,7 @@ include("solkz_solution.jl")
 #
 # Viscosity convention: xcore's deviatoric stress is tau = eta(e - div(v)/3),
 # without the conventional factor 2 (see the stress expressions in
-# src/stokes/residuals.jl and the 2/3 and 1/2 stencil weights in fluidmech.jl). The
+# src/solvers/stokes/residuals.jl and the 2/3 and 1/2 stencil weights in fluidmech.jl). The
 # reference solutions are posed for tau = 2*eta_ref(e - div(v)/3), so the
 # benchmark viscosity must be loaded as eta = 2*eta_ref or the computed
 # velocities come out twice too large.
@@ -83,7 +83,7 @@ function sol_setup(::Type{T}, N::Integer, case::Symbol; Δη::Real = 1.0e6,
     par  = Parameters(T; D = L_b, N = N, L = L_b, g0 = 1.0, gamma = 0.0,
                       Da = 0.0, Xi = 0.0, alpha = 0.0, atol_PH = atol_PH)
     grid = Grid(par)
-    Nz, Nx = grid.Nz, grid.Nx
+    Nz, Nx = grid.ni[1], grid.ni[2]
 
     fluid = FluidState(T, CPU(), Nz, Nx)
     phase = PhaseState(T, CPU(), Nz, Nx)
@@ -97,12 +97,12 @@ function sol_setup(::Type{T}, N::Integer, case::Symbol; Δη::Real = 1.0e6,
         (x, y) -> -sin(T(2) * y) * cos(T(3π) * x)
 
     D = T(L_b)
-    fluid.eta .= [2 * ηf(grid.Xc[i], D - grid.Zc[j]) for j in 1:Nz, i in 1:Nx]
+    fluid.eta .= [2 * ηf(grid.xci[2][i], D - grid.xci[1][j]) for j in 1:Nz, i in 1:Nx]
     _smooth_eta!(fluid.eta, smooth_eta)
-    compute_corner_eta!(fluid.etaco, fluid.eta; xBC = :closed, zBC = :closed)
+    update_edge_viscosity!(fluid; xBC = :closed, zBC = :closed)
     # uniform inertial density; buoyancy lives in Drho on the z-faces
     fluid.rho .= 1;  fluid.rhow .= 1;  fluid.rhou .= 1
-    fluid.Drho .= [ρf(grid.Xc[i], D - grid.Zf[j]) for j in 1:(Nz + 1), i in 1:Nx]
+    fluid.Drho .= [ρf(grid.xci[2][i], D - grid.xvi[1][j]) for j in 1:(Nz + 1), i in 1:Nx]
 
     return par, grid, fluid, phase, compute_scales(par, grid)
 end
@@ -124,7 +124,7 @@ function sol_solve!(fluid::FluidState{T}, phase, grid, par, scales,
         cache = DyrelCache(T, CPU(), grid)
         return fluidmech_dyrel!(fluid, phase, cache, grid, par, scales; kw...)
     elseif solver === :gmg
-        hier = build_hierarchy(fluid, grid, par; xBC = :closed)
+        hier = build_hierarchy(fluid, grid, par)
         return fluidmech_gmg!(fluid, phase, hier, grid, par, scales; kw...)
     end
     throw(ArgumentError("sol_solve!: unknown solver $solver"))
@@ -145,19 +145,19 @@ function sol_errors(fluid::FluidState{T}, grid::Grid{T}, case::Symbol;
     exact = case === :solcx ?
         (x, y) -> _solCx_solution(x, y, 1.0, Δη) :
         (x, y) -> _solkz_solution(x, y; Δη = Δη)
-    Nz, Nx, D = grid.Nz, grid.Nx, T(L_b)
+    Nz, Nx, D = grid.ni[1], grid.ni[2], T(L_b)
 
     # U at (Zc, Xf): interior z-rows, all x-faces
     Uh = fluid.U[2:(end - 1), :]
-    Ue = [exact(grid.Xf[i], D - grid.Zc[j])[1] for j in 1:Nz, i in 1:(Nx + 1)]
+    Ue = [exact(grid.xvi[2][i], D - grid.xci[1][j])[1] for j in 1:Nz, i in 1:(Nx + 1)]
 
     # W at (Zf, Xc): all z-faces, interior x-columns
     Wh = fluid.W[:, 2:(end - 1)]
-    We = [-exact(grid.Xc[i], D - grid.Zf[j])[2] for j in 1:(Nz + 1), i in 1:Nx]
+    We = [-exact(grid.xci[2][i], D - grid.xvi[1][j])[2] for j in 1:(Nz + 1), i in 1:Nx]
 
     # P at (Zc, Xc): interior cells, gauge removed from both fields
     Ph = fluid.P[2:(end - 1), 2:(end - 1)]
-    Pe = [exact(grid.Xc[i], D - grid.Zc[j])[3] for j in 1:Nz, i in 1:Nx]
+    Pe = [exact(grid.xci[2][i], D - grid.xci[1][j])[3] for j in 1:Nz, i in 1:Nx]
     Ph = Ph .- mean(Ph);  Pe = Pe .- mean(Pe)
 
     return (; U = norm(Uh .- Ue) / norm(Ue),
@@ -198,14 +198,14 @@ function sol_errors_L1(fluid::FluidState{T}, grid::Grid{T}, case::Symbol;
     exact = case === :solcx ?
         (x, y) -> _solCx_solution(x, y, 1.0, Δη) :
         (x, y) -> _solkz_solution(x, y; Δη = Δη)
-    Nz, Nx, D = grid.Nz, grid.Nx, T(L_b)
+    Nz, Nx, D = grid.ni[1], grid.ni[2], T(L_b)
 
     Uh = fluid.U[2:(end - 1), :]
-    Ue = [exact(grid.Xf[i], D - grid.Zc[j])[1] for j in 1:Nz, i in 1:(Nx + 1)]
+    Ue = [exact(grid.xvi[2][i], D - grid.xci[1][j])[1] for j in 1:Nz, i in 1:(Nx + 1)]
     Wh = fluid.W[:, 2:(end - 1)]
-    We = [-exact(grid.Xc[i], D - grid.Zf[j])[2] for j in 1:(Nz + 1), i in 1:Nx]
+    We = [-exact(grid.xci[2][i], D - grid.xvi[1][j])[2] for j in 1:(Nz + 1), i in 1:Nx]
     Ph = fluid.P[2:(end - 1), 2:(end - 1)]
-    Pe = [exact(grid.Xc[i], D - grid.Zc[j])[3] for j in 1:Nz, i in 1:Nx]
+    Pe = [exact(grid.xci[2][i], D - grid.xci[1][j])[3] for j in 1:Nz, i in 1:Nx]
     Ph = Ph .- mean(Ph);  Pe = Pe .- mean(Pe)
 
     # U spans the x-faces (dimension 2 here), W the z-faces (dimension 1)

@@ -20,34 +20,34 @@
 # Wall faces of a bounded horizontal axis are Dirichlet: D = λmax = 1. The
 # z-boundary W faces repeat the boundary cell.
 
-@kernel function _gershgorin_kernel!(Dd, λd, comp, @Const(η), @Const(ηe), @Const(γ_eff),
+@kernel function gershgorin_kernel!(Dd, λd, comp, @Const(η), @Const(ηe), @Const(γ_eff),
                                      @Const(ρf), @Const(rho), periodic,
                                      invh2, invh, cn, cc, cs, iner, g0dt)
     J = @index(Global, Cartesian)
     @inbounds begin
-        d  = _val(comp)
+        d  = unval(comp)
         D  = length(J)
         Nd = size(η, d)
-        ed = _unit(J, d)
+        ed = unit_index(J, d)
         ρd = ρf[d]
         wall = d != 1 && !periodic[d] && (J[d] == 1 || J[d] == Nd + 1)
-        lo = J[d] == 1      ? (d == 1 ? J : _setidx(J, d, Nd)) : J - ed
-        hi = J[d] == Nd + 1 ? (d == 1 ? J - ed : _setidx(J, d, 1)) : J
+        lo = J[d] == 1      ? (d == 1 ? J : replace_index(J, d, Nd)) : J - ed
+        hi = J[d] == Nd + 1 ? (d == 1 ? J - ed : replace_index(J, d, 1)) : J
         η_hi = η[hi];  η_lo = η[lo]
         gρ_hi = γ_eff[hi] / rho[hi];  gρ_lo = γ_eff[lo] / rho[lo]
         γ_diag = ρd[J] * (gρ_hi + gρ_lo)
-        ks = _others(comp, Val(D))
-        shear2 = _tfoldl(zero(η_hi), ks) do s, k
-            @inbounds s + cs * (ηe[_pair(d, k, D)][J + _unit(J, k)] + ηe[_pair(d, k, D)][J]) * invh2
+        ks = other_axes(comp, Val(D))
+        shear2 = tuple_foldl(zero(η_hi), ks) do s, k
+            @inbounds s + cs * (ηe[pair_index(d, k, D)][J + unit_index(J, k)] + ηe[pair_index(d, k, D)][J]) * invh2
         end
-        shear1 = _tfoldl(zero(η_hi), ks) do s, k
-            @inbounds s + cs * (ηe[_pair(d, k, D)][J + _unit(J, k)] + ηe[_pair(d, k, D)][J]) * invh
+        shear1 = tuple_foldl(zero(η_hi), ks) do s, k
+            @inbounds s + cs * (ηe[pair_index(d, k, D)][J + unit_index(J, k)] + ηe[pair_index(d, k, D)][J]) * invh
         end
         # cross coupling to component k: the k-faces of cells hi and lo; the
         # upper face shares the upper edge viscosity, the lower face the lower
-        cross = _tfoldl(zero(η_hi), ks) do s, k
+        cross = tuple_foldl(zero(η_hi), ks) do s, k
             @inbounds begin
-                ek = _unit(J, k);  ηp = ηe[_pair(d, k, D)]
+                ek = unit_index(J, k);  ηp = ηe[pair_index(d, k, D)]
                 e1 = ηp[J + ek];  e2 = ηp[J];  ρk = ρf[k]
                 s + (abs(gρ_hi * ρk[hi + ek] - cc * η_hi + cs * e1) +
                      abs(gρ_hi * ρk[hi]      - cc * η_hi + cs * e2) +
@@ -79,9 +79,9 @@ function gershgorin!(cache::StokesCache{D, T}, fluid, grid, op::StokesOp{D}) whe
     invh = T(inv(grid.h));  invh2 = invh * invh
     ηe = edge_viscosity(fluid);  ρf = face_density(fluid)
     g0dt = op.g0 * op.dt
-    _each_axis(Val(D)) do comp
-        d = _val(comp)
-        _gershgorin_kernel!(backend)(cache.Dv[d], cache.λmax[d], comp, fluid.eta, ηe,
+    foreach_axis(Val(D)) do comp
+        d = unval(comp)
+        gershgorin_kernel!(backend)(cache.Dv[d], cache.λmax[d], comp, fluid.eta, ηe,
                                      cache.γ_eff, ρf, fluid.rho, op.periodic,
                                      invh2, invh, T(2//3), T(1//3), T(1//2),
                                      op.cin[d] * op.inv_dt, g0dt; ndrange = size(cache.Dv[d]))
@@ -93,12 +93,12 @@ end
 # (z-boundary W, walls of a bounded axis) cannot respond to a pressure change
 # and are left out; counting them would deflate the penalty γ_eff = γfact/s_P
 # exactly in the boundary cells.
-@kernel function _penalty_kernel!(γ_eff, @Const(Dv), @Const(ρf), @Const(rho), periodic, invh2, γ)
+@kernel function penalty_kernel!(γ_eff, @Const(Dv), @Const(ρf), @Const(rho), periodic, invh2, γ)
     c = @index(Global, Cartesian)
     @inbounds begin
         D = length(c);  Z = zero(eltype(γ_eff))
-        sfac = _tfoldl(Z, _hz_axes(Val(D))) do s, k
-            ek = _unit(c, k)
+        sfac = tuple_foldl(Z, hz_axes(Val(D))) do s, k
+            ek = unit_index(c, k)
             fixed = k == 1 || !periodic[k]
             @inbounds begin
                 lo = fixed && c[k] == 1            ? Z : ρf[k][c] / Dv[k][c]
@@ -130,7 +130,7 @@ function penalty!(cache::StokesCache{D, T}, fluid, grid, op::StokesOp{D};
                   γfact::Real) where {D, T}
     fill!(cache.γ_eff, zero(T))
     gershgorin!(cache, fluid, grid, op)
-    _penalty_kernel!(KernelAbstractions.get_backend(cache.γ_eff))(
+    penalty_kernel!(KernelAbstractions.get_backend(cache.γ_eff))(
         cache.γ_eff, cache.Dv, face_density(fluid), fluid.rho, op.periodic,
         T(inv(grid.h)^2), T(γfact); ndrange = size(cache.γ_eff))
     dtT = op.dt
