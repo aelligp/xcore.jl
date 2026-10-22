@@ -19,6 +19,7 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
     nop::Int            = 100
     ndm_op::Bool        = false
     plot_op::Bool       = true
+    vtk_op::Bool        = false             # ParaView frames (save_vtk) every nop steps
     save_op::Bool       = false
     plot_cv::Bool       = false
     colourmap::Symbol   = :lapaz

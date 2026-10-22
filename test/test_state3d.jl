@@ -6,11 +6,11 @@ import xcore as XC
 using KernelAbstractions: CPU
 
 let T = Float64, Nz = 8, Nx = 6, Ny = 4
-    f = FluidState3D(T, CPU(), Nz, Nx, Ny)
+    f = FluidState(T, CPU(), Nz, Nx, Ny)
     c = StokesCache(T, CPU(), (Nz, Nx, Ny))
     S = XC.Stokes
 
-    @testset "FluidState3D / StokesCache shapes" begin
+    @testset "3-D FluidState / StokesCache shapes" begin
         @test size(f.W) == (Nz + 1, Nx + 2, Ny + 2)
         @test size(f.U) == (Nz + 2, Nx + 1, Ny + 2)
         @test size(f.V) == (Nz + 2, Nx + 2, Ny + 1)
@@ -24,17 +24,17 @@ let T = Float64, Nz = 8, Nx = 6, Ny = 4
         @test size(c.R_P) == size(c.γ_eff) == (Nz, Nx, Ny)
     end
 
-    @testset "Grid3D, coarsening and the multigrid hierarchy" begin
+    @testset "3-D Grid, coarsening and the multigrid hierarchy" begin
         par = Parameters(T; N = 64, L = 1.0, D = 1.0)
-        g  = Grid3D(par)
-        gc = coarsen_grid3d(g)
-        @test (gc.Nz, gc.Nx, gc.Ny) == (g.Nz ÷ 2, g.Nx ÷ 2, g.Ny ÷ 2)
+        g  = Grid(par, Val(3))
+        gc = S.coarsen(g)
+        @test (gc.ni[1], gc.ni[2], gc.ni[3]) == (g.ni[1] ÷ 2, g.ni[2] ÷ 2, g.ni[3] ÷ 2)
         @test gc.h ≈ 2g.h
-        fl = FluidState3D(T, CPU(), g)
+        fl = FluidState(T, CPU(), g)
         hier = build_hierarchy(fl, g, par; minlvl = 16)
         @test [S.cells(l.grid) for l in hier.levels] == [(64, 64, 64), (32, 32, 32), (16, 16, 16)]
         @test hier.levels[1].fluid === fl
-        @test_throws ArgumentError build_hierarchy(FluidState3D(T, CPU(), 48, 48, 48),
-                                                   XC._grid3d_at(T, 48, 48, 48, 1 / 48, 1.0, 1.0), par)
+        @test_throws ArgumentError build_hierarchy(FluidState(T, CPU(), 48, 48, 48),
+                                                   Grid((48, 48, 48), (1.0, 1.0, 1.0)), par)
     end
 end

@@ -35,11 +35,11 @@ function adapt_backend(backend, A::AbstractArray{S}) where {S}
 end
 
 """
-    interior(f::AbstractArray, halo::Integer) -> SubArray
+    interior(f::AbstractArray, halo::Integer = 1) -> SubArray
 
-View into the interior of a halo'd 2D field, excluding `halo` rings on every
+View into the interior of a halo'd field, excluding `halo` rings on every
 side. Used both to read interior values for comparison and to assign into the
 interior from MATLAB-sized arrays.
 """
-interior(f::AbstractArray{<:Any,2}, halo::Integer) =
-    view(f, (halo+1):(size(f,1)-halo), (halo+1):(size(f,2)-halo))
+interior(f::AbstractArray{<:Any, D}, halo::Integer = 1) where {D} =
+    view(f, ntuple(k -> (halo + 1):(size(f, k) - halo), Val(D))...)

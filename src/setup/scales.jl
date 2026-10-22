@@ -293,7 +293,7 @@ function compute_vis_scales(par::Parameters{T}, scales::Scales{T},
         chi0 = Float64(scales.chi0)
         wmsc_val = T(scales.w0 * chi0 / (1 - chi0))
         return VisScales{T}(
-            T(grid.D), "1",
+            T(grid.li[1]), "1",
             T(scales.W0), "1",
             T(scales.w0), wmsc_val, "1",
             T(scales.w0),            # whsc = w0 in ndm (mirrors MATLAB whsc = w0)
@@ -312,7 +312,7 @@ function compute_vis_scales(par::Parameters{T}, scales::Scales{T},
         )
     else
         # ---- dimensional output: human-friendly units by magnitude ----------
-        D  = Float64(grid.D)
+        D  = Float64(grid.li[1])
         W0 = Float64(scales.W0);  w0 = Float64(scales.w0)
         p0 = Float64(scales.p0)
 
