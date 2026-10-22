@@ -17,7 +17,7 @@ aliases:
 This note answers one question concretely, at the level of code lines: **where
 and how do the inertial terms enter xcore's momentum solve, and what exactly
 changes relative to a slow creeping-Stokes problem?** The reference is the
-**direct solver** `fluidmech!` (`src/fluidmech.jl`) — the faithful port of the
+**direct solver** `fluidmech!` (`src/solvers/direct.jl`) — the faithful port of the
 MATLAB `fluidmech.m` and the discretisation behind the methods paper. The
 matrix-free solvers (`:dyrel`, `:gmg`) replicate it term for term (§7); the
 solver-level consequences of inertia (Gershgorin bound, Schur penalty) are in
@@ -29,18 +29,18 @@ here.
 > \Delta\rho\,g$: the velocity block is the viscous stencil and the RHS is
 > buoyancy. xcore adds exactly **four** terms, in two places:
 > **two diagonals into the matrix** — the implicit BD2 inertia
-> $a_1\rho_f/\Delta t$ ([fluidmech.jl:262](../src/fluidmech.jl#L262),
-> [:337](../src/fluidmech.jl#L337)) and the drunken-sailor stabiliser
-> $g_0\,\partial\rho\,\Delta t$ ([:269](../src/fluidmech.jl#L269),
-> [:344](../src/fluidmech.jl#L344)) — and **two forcings onto the RHS** — the
+> $a_1\rho_f/\Delta t$ ([fluidmech.jl:262](../src/solvers/direct.jl#L262),
+> [:337](../src/solvers/direct.jl#L337)) and the drunken-sailor stabiliser
+> $g_0\,\partial\rho\,\Delta t$ ([:269](../src/solvers/direct.jl#L269),
+> [:344](../src/solvers/direct.jl#L344)) — and **two forcings onto the RHS** — the
 > lagged BD2 momentum-flux history $(a_2\rho\mathbf v^{\circ} +
-> a_3\rho\mathbf v^{\circ\circ})/\Delta t$ ([:303](../src/fluidmech.jl#L303),
-> [:381](../src/fluidmech.jl#L381)) and the momentum advection
+> a_3\rho\mathbf v^{\circ\circ})/\Delta t$ ([:303](../src/solvers/direct.jl#L303),
+> [:381](../src/solvers/direct.jl#L381)) and the momentum advection
 > $\nabla\!\cdot\!(\mathbf v\otimes\rho\mathbf v)$ evaluated at the current
-> Picard iterate ([:297–302](../src/fluidmech.jl#L297-L302)). The continuity
+> Picard iterate ([:297–302](../src/solvers/direct.jl#L297-L302)). The continuity
 > blocks are untouched by inertia. Crucially, BD2 is applied to the
 > **momentum flux $\rho\mathbf v$, not to the velocity** — the stored history
-> is the product field `rhoWo = ρ_w·W` ([store.jl:24-27](../src/store.jl#L24-L27)).
+> is the product field `rhoWo = ρ_w·W` ([store.jl:24-27](../src/physics/store.jl#L24-L27)).
 > Setting $\Delta t \to \infty$ (the default `dt = 1e32`, used by the MMS
 > benchmark) kills all four terms and the same code *is* the creeping-Stokes
 > solver.
@@ -62,7 +62,7 @@ In the assembled system $\begin{pmatrix}K_V & G\\ D_M & K_P\end{pmatrix}
 this means: $K_V$ contains only the viscous stress-divergence stencil, and
 $R_V$ contains only buoyancy. In the code that baseline is visible verbatim —
 the viscous bands of the W-equation rows
-([fluidmech.jl:263-274](../src/fluidmech.jl#L263-L274)):
+([fluidmech.jl:263-274](../src/solvers/direct.jl#L263-L274)):
 
 ```julia
 append!(AAL, T(2/3).*(EtaP1.+EtaP2).*invh2 .+ T(1/2).*(EtaC1.+EtaC2).*invh2)    # 2 center    (ii,ii)
@@ -83,12 +83,12 @@ term. **Everything else in the W/U rows is inertia-related and is the subject
 of this note.**
 
 The code contains this limit as a switch: `fluidmech!` defaults to
-`dt = T(1e32)` ([fluidmech.jl:137](../src/fluidmech.jl#L137)), so every
+`dt = T(1e32)` ([fluidmech.jl:137](../src/solvers/direct.jl#L137)), so every
 $1/\Delta t$ term is numerically zero and the drunken-sailor band is skipped in
-benchmark mode (`!bnchm` guard, [:268](../src/fluidmech.jl#L268)). The MMS
+benchmark mode (`!bnchm` guard, [:268](../src/solvers/direct.jl#L268)). The MMS
 verification (`test/test_mms.jl`) therefore exercises exactly the
 creeping-Stokes operator. Production runs pass the real, CFL-limited `dt` from
-`run.jl` ([run.jl:311](../src/run.jl#L311), `update_dt`).
+`run.jl` ([run.jl:311](../src/driver/run.jl#L311), `update_dt`).
 
 ---
 
@@ -96,7 +96,7 @@ creeping-Stokes operator. Production runs pass the real, CFL-limited `dt` from
 
 The momentum balance keeps $\partial_t(\rho \mathbf v)$ in **conservative
 form**. With the BDF2 weights from
-[timing.jl:18-36](../src/timing.jl#L18-L36),
+[timing.jl:18-36](../src/driver/timing.jl#L18-L36),
 
 $$
 \partial_t(\rho \mathbf v)\Big|^{\,n} \;\approx\;
@@ -109,7 +109,7 @@ falling back to backward Euler $(1,1,0)$ for the first two steps of a run
 (`:bd2im` is the default `TINT`). The decisive implementation detail is *what
 gets stored as history*. At the end of each accepted time step,
 `store_previous!` saves the **product** field, not the velocity
-([store.jl:24-27](../src/store.jl#L24-L27)):
+([store.jl:24-27](../src/physics/store.jl#L24-L27)):
 
 ```julia
 fluid.rhoWoo .= fluid.rhoWo
@@ -132,8 +132,8 @@ The three BD2 terms then split between matrix and RHS:
 
 | term | time level | treatment | where |
 |---|---|---|---|
-| $a_1 (\rho\mathbf v)^n/\Delta t$ | current (unknown) | **implicit diagonal** in $K_V$: density frozen at the current Picard iterate, velocity is the matrix unknown — $a_1\rho_f^{(k)}/\Delta t$ on the diagonal | [fluidmech.jl:262](../src/fluidmech.jl#L262) (W), [:337](../src/fluidmech.jl#L337) (U) |
-| $a_2 (\rho\mathbf v)^{n-1}/\Delta t$ | known | RHS forcing | [:303](../src/fluidmech.jl#L303), [:381](../src/fluidmech.jl#L381) |
+| $a_1 (\rho\mathbf v)^n/\Delta t$ | current (unknown) | **implicit diagonal** in $K_V$: density frozen at the current Picard iterate, velocity is the matrix unknown — $a_1\rho_f^{(k)}/\Delta t$ on the diagonal | [fluidmech.jl:262](../src/solvers/direct.jl#L262) (W), [:337](../src/solvers/direct.jl#L337) (U) |
+| $a_2 (\rho\mathbf v)^{n-1}/\Delta t$ | known | RHS forcing | [:303](../src/solvers/direct.jl#L303), [:381](../src/solvers/direct.jl#L381) |
 | $a_3 (\rho\mathbf v)^{n-2}/\Delta t$ | known | RHS forcing (same lines) | — |
 
 The two assembly lines, verbatim:
@@ -163,7 +163,7 @@ the pressure.)
 $\nabla\!\cdot\!(\mathbf v\otimes\rho\mathbf v)$ is genuinely nonlinear, so the
 direct solver handles it by Picard freezing: each `fluidmech!` call evaluates
 it **at the current iterate** and puts it on the RHS
-([fluidmech.jl:297-302](../src/fluidmech.jl#L297-L302)):
+([fluidmech.jl:297-302](../src/solvers/direct.jl#L297-L302)):
 
 ```julia
 f_mz = rhow[2:end-1, :] .* W[2:end-1, 2:end-1]        # advected quantity: z-momentum ρ_w W
@@ -176,11 +176,11 @@ Again the advected quantity is the **momentum density** $\rho_w W$, transported
 by the face-averaged velocity — conservative form, scheme selected by
 `par.ADVN` (the same `advect_centered!` machinery as phase transport;
 `src/kernels/advect.jl`). The x-momentum analogue is at
-[:371-380](../src/fluidmech.jl#L371-L380), including the periodic
+[:371-380](../src/solvers/direct.jl#L371-L380), including the periodic
 column-averaging of the two duplicated boundary columns
-([:378-380](../src/fluidmech.jl#L378-L380)).
+([:378-380](../src/solvers/direct.jl#L378-L380)).
 
-Because `run.jl`'s Picard loop ([run.jl:259-289](../src/run.jl#L259-L289))
+Because `run.jl`'s Picard loop ([run.jl:259-289](../src/driver/run.jl#L259-L289))
 re-calls `fluidmech!` each sweep — with at least 3 sweeps enforced — the
 advection term is re-evaluated at each new velocity. At the Picard fixed point
 it is therefore evaluated at $\mathbf v^n$ itself: **the converged step is
@@ -193,8 +193,8 @@ diagonal's density $\rho^{(k)} \to \rho^n$.
 ## 4. The drunken-sailor diagonal
 
 The fourth and least standard term, on both W and U rows
-([fluidmech.jl:269](../src/fluidmech.jl#L269),
-[:344](../src/fluidmech.jl#L344)):
+([fluidmech.jl:269](../src/solvers/direct.jl#L269),
+[:344](../src/solvers/direct.jl#L344)):
 
 ```julia
 append!(AAL, vec((rho[2:end, :] .- rho[1:end-1, :]) .* invh) .* g0 .* T(dt))   # W diag
@@ -217,7 +217,7 @@ note).
 ## 5. The γ augmentation of the U inertia
 
 The U-diagonal is $(a_1 + \gamma)\,\rho_u/\Delta t$ with $\gamma =$
-`par.gamma` $= 10^{-3}$ ([parameters.jl:80](../src/parameters.jl#L80)). The
+`par.gamma` $= 10^{-3}$ ([parameters.jl:80](../src/setup/parameters.jl#L80)). The
 MATLAB original documents its purpose (`usr/par_default.m:73`):
 
 ```matlab
@@ -232,24 +232,24 @@ weakly damps it. It is *not* part of the physical BD2 weight (the lagged RHS
 uses plain $a_2, a_3$), so the discrete momentum balance carries an
 $O(\gamma/a_1) = O(10^{-3})$ bias on U; at $\Delta t\to\infty$ it disappears
 entirely (MMS instead pins one U cell explicitly,
-[fluidmech.jl:536-541](../src/fluidmech.jl#L536-L541)).
+[fluidmech.jl:536-541](../src/solvers/direct.jl#L536-L541)).
 
 ---
 
 ## 6. Where inertia does **not** go — and why that matters
 
 The inertial terms touch only the $K_V$ block and $R_V$. The pressure-gradient
-block `GG` ([fluidmech.jl:402-427](../src/fluidmech.jl#L402-L427)), the
+block `GG` ([fluidmech.jl:402-427](../src/solvers/direct.jl#L402-L427)), the
 mass-flux divergence block `DM` (the $\pm\rho_f/h$ stencil,
-[:437-440](../src/fluidmech.jl#L437-L440)), and the continuity RHS (`MFS`)
+[:437-440](../src/solvers/direct.jl#L437-L440)), and the continuity RHS (`MFS`)
 are **identical to the creeping-Stokes case**. Summarising the full delta:
 
 | # | term | enters as | matrix/RHS | code |
 |---|---|---|---|---|
-| 1 | $a_1\rho_f/\Delta t$ (BD2, current) | diagonal of $K_V$ | matrix | [262](../src/fluidmech.jl#L262), [337](../src/fluidmech.jl#L337) |
-| 2 | $(a_2\rho\mathbf v^\circ + a_3\rho\mathbf v^{\circ\circ})/\Delta t$ (BD2, lagged) | forcing | RHS | [303](../src/fluidmech.jl#L303), [381](../src/fluidmech.jl#L381) |
-| 3 | $\nabla\!\cdot\!(\mathbf v\otimes\rho\mathbf v)$ at Picard iterate | forcing | RHS | [297–302](../src/fluidmech.jl#L297-L302), [371–380](../src/fluidmech.jl#L371-L380) |
-| 4 | $g_0\,\partial\rho\,\Delta t$ (sailor) | diagonal of $K_V$ | matrix | [269](../src/fluidmech.jl#L269), [344](../src/fluidmech.jl#L344) |
+| 1 | $a_1\rho_f/\Delta t$ (BD2, current) | diagonal of $K_V$ | matrix | [262](../src/solvers/direct.jl#L262), [337](../src/solvers/direct.jl#L337) |
+| 2 | $(a_2\rho\mathbf v^\circ + a_3\rho\mathbf v^{\circ\circ})/\Delta t$ (BD2, lagged) | forcing | RHS | [303](../src/solvers/direct.jl#L303), [381](../src/solvers/direct.jl#L381) |
+| 3 | $\nabla\!\cdot\!(\mathbf v\otimes\rho\mathbf v)$ at Picard iterate | forcing | RHS | [297–302](../src/solvers/direct.jl#L297-L302), [371–380](../src/solvers/direct.jl#L371-L380) |
+| 4 | $g_0\,\partial\rho\,\Delta t$ (sailor) | diagonal of $K_V$ | matrix | [269](../src/solvers/direct.jl#L269), [344](../src/solvers/direct.jl#L344) |
 
 The asymmetry — momentum block changed, constraint blocks unchanged — is the
 single most important structural fact downstream. Comparing diagonal
@@ -267,7 +267,7 @@ CFL-limited $\Delta t$). Then:
 - $K_V$ becomes **strongly diagonally dominant** — good news for any
   Jacobi-type iteration on the velocity (the DR inner loop converges fast),
   and the reason the direct solver's symmetric Jacobi scaling
-  ([fluidmech.jl:584-595](../src/fluidmech.jl#L584-L595)) keeps UMFPACK
+  ([fluidmech.jl:584-595](../src/solvers/direct.jl#L584-L595)) keeps UMFPACK
   well-behaved.
 - the **Schur complement** $S = D_M K_V^{-1} G$ becomes inertia-scaled and
   spatially variable, $S \sim (\Delta t/a_1\rho)\nabla^2$, instead of the

@@ -15,16 +15,16 @@ be = CPU()
 # ---------------------------------------------------------------------------
 
 par = Parameters(Float64;
-    runID   = "D1_dm2_e1_N1024_vmg",
+    runID   = "D1_dm2_e1_N256_vmg_refactor",
     outdir  = joinpath(@__DIR__, "..", "out"),
     save_op = true,
-    nop     = 10,          # save figures every nop steps
+    nop     = 50,          # save figures every nop steps
     nrh     = 1,            # record history every step
     restart = 0,            # set to frame number to restart from a specific checkpoint; -1 for most recent
 
     # domain
     D  = 1e1,
-    N  = 1024,
+    N  = 256,
     L  = 1e1 * 1.5,         # 1.5 × D
 
     # timing
@@ -63,8 +63,8 @@ grid   = Grid(par)
 scales = compute_scales(par, grid)
 print_scales(scales, par)
 
-fluid  = FluidState(Float64, be, grid.Nz, grid.Nx)
-phase  = PhaseState(Float64, be, grid.Nz, grid.Nx)
+fluid  = FluidState(Float64, be, grid.ni[1], grid.ni[2])
+phase  = PhaseState(Float64, be, grid.ni[1], grid.ni[2])
 ns     = NoiseState(Float64, be, grid, scales)
 hst    = History(Float64)
 

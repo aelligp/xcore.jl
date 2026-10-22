@@ -34,7 +34,7 @@
 # wall-biased wake.
 
 using xcore
-using xcore: make_solver, solve_fluidmech!, compute_corner_eta!
+using xcore: make_solver, solve_fluidmech!, update_edge_viscosity!
 using CairoMakie
 using KernelAbstractions: CPU
 using Printf
@@ -64,7 +64,7 @@ function cylinder_setup(::Type{T} = Float64; solver::Symbol = :direct,
                      Da = 0, Xi = 0, alpha = 0, atol_PH = atol_PH,
                      γfact_PT = gfact)
     grid = Grid(par)
-    Nz, Nx = grid.Nz, grid.Nx
+    Nz, Nx = grid.ni[1], grid.ni[2]
     fluid = FluidState(T, CPU(), Nz, Nx)
     phase = PhaseState(T, CPU(), Nz, Nx)
 
@@ -75,16 +75,16 @@ function cylinder_setup(::Type{T} = Float64; solver::Symbol = :direct,
     maskU = falses(Nz + 2, Nx + 1)      # x-faces at (Zc, Xf), z-ghost rows
     maskW = falses(Nz + 1, Nx + 2)      # z-faces at (Zf, Xc), x-ghost columns
     for j in 1:Nz, i in 1:(Nx + 1)
-        maskU[j + 1, i] = solid(grid.Xf[i], grid.Zc[j])
+        maskU[j + 1, i] = solid(grid.xvi[2][i], grid.xci[1][j])
     end
     for j in 1:(Nz + 1), i in 1:Nx
-        maskW[j, i + 1] = solid(grid.Xc[i], grid.Zf[j])
+        maskW[j, i + 1] = solid(grid.xci[2][i], grid.xvi[1][j])
     end
 
     # Uniform viscosity: the cylinder is imposed on the velocity, not on the
     # rheology. eta = 2·nu carries the factor-2 stress convention.
     fluid.eta .= T(2) / T(Re)
-    compute_corner_eta!(fluid.etaco, fluid.eta; xBC = :periodic, zBC = :closed)
+    update_edge_viscosity!(fluid; xBC = :periodic, zBC = :closed)
 
     # Uniform density: continuity reduces to div(v) = 0 and the inertia is
     # plain rho·dv/dt. It also removes gravity, which needs no separate switch:
@@ -145,13 +145,13 @@ function cylinder_run(solver::Symbol; tend::Real = 60, nsnap::Integer = 4,
     st = cylinder_setup(; solver, kw...)
     (; par, grid, fluid, phase, scales, maskU, maskW, dt, Uinf) = st
     T = eltype(fluid.W)
-    fsolver = make_solver(par, fluid, phase, grid; xBC = :periodic)
+    fsolver = make_solver(par, fluid, phase, grid)
 
     nsteps = ceil(Int, tend / dt)
     snapat = Set(round(Int, nsteps * k / nsnap) for k in 1:nsnap)
     # wake probe three diameters downstream, on the cylinder's centreline
-    jp = argmin(abs.(grid.Zf .- st.zc))
-    ip = argmin(abs.(grid.Xc .- (st.xc + 3 * st.d))) + 1
+    jp = argmin(abs.(grid.xvi[1] .- st.zc))
+    ip = argmin(abs.(grid.xci[2] .- (st.xc + 3 * st.d))) + 1
 
     snaps = NamedTuple[]
     tp = T[];  wp = T[]
@@ -207,7 +207,7 @@ function vorticity_figure(runs; outdir = joinpath(@__DIR__, "figs"))
                   ylabel = k == 1 ? String(r.solver) : "",
                   xticksvisible = false, xticklabelsvisible = false,
                   yticksvisible = false, yticklabelsvisible = false)
-        hm = heatmap!(ax, grid.Xf, grid.Zf, permutedims(Float64.(s.vort));
+        hm = heatmap!(ax, grid.xvi[2], grid.xvi[1], permutedims(Float64.(s.vort));
                       colormap = :balance, colorrange = (-lim, lim))
         arc!(ax, Point2f(r.st.xc, r.st.zc), r.st.d / 2, -π, π;
              color = :black, linewidth = 1.5)
@@ -215,7 +215,7 @@ function vorticity_figure(runs; outdir = joinpath(@__DIR__, "figs"))
     Colorbar(fig[1:nrow, ncol + 1], hm; label = "vorticity  (U/d)")
     Label(fig[0, 1:(ncol + 1)],
           @sprintf("Flow past a cylinder — vorticity   (Re = %g, %d×%d grid)",
-                   first(runs).st.Re, grid.Nz, grid.Nx);
+                   first(runs).st.Re, grid.ni[1], grid.ni[2]);
           fontsize = 20)
 
     mkpath(outdir)

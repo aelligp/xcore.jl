@@ -57,8 +57,8 @@ for N in NS
     par0   = base_par(N, :direct)
     grid   = Grid(par0)
     scales = compute_scales(par0, grid)
-    fluid0 = FluidState(T, CPU(), grid.Nz, grid.Nx)
-    phase0 = PhaseState(T, CPU(), grid.Nz, grid.Nx)
+    fluid0 = FluidState(T, CPU(), grid.ni[1], grid.ni[2])
+    phase0 = PhaseState(T, CPU(), grid.ni[1], grid.ni[2])
     ns     = NoiseState(T, grid, scales)
     _, dt, _ = initialize!(phase0, fluid0, ns, History(T), grid, par0, scales)
     coefs  = NamedTuple{(:a1, :a2, :a3, :b1, :b2, :b3)}(time_coefs(T, par0.TINT, 1))
@@ -67,7 +67,7 @@ for N in NS
     for s in SOLVERS
         par    = base_par(N, s)
         fluid  = deepcopy(fluid0);  phase = deepcopy(phase0)
-        solver = xcore.make_solver(par, fluid, phase, grid; BCS.xBC)
+        solver = xcore.make_solver(par, fluid, phase, grid)
         sweep!() = (restore!(fluid, fluid0); restore!(phase, phase0);
                     xcore.solve_fluidmech!(solver, fluid, phase, grid, par, scales;
                                      dt, coefs..., BCS...))

@@ -64,8 +64,8 @@ for atol in ATOL
 
     grid   = Grid(par)
     scales = compute_scales(par, grid)
-    fluid  = FluidState(Float64, CPU(), grid.Nz, grid.Nx)
-    phase  = PhaseState(Float64, CPU(), grid.Nz, grid.Nx)
+    fluid  = FluidState(Float64, CPU(), grid.ni[1], grid.ni[2])
+    phase  = PhaseState(Float64, CPU(), grid.ni[1], grid.ni[2])
     ns     = NoiseState(Float64, grid, scales)
     hst    = History(Float64)
     time0, dt0, step0 = initialize!(phase, fluid, ns, hst, grid, par, scales)

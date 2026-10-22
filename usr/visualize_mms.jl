@@ -29,7 +29,7 @@ for N in (64, 128,256)
                         rhom0 = 2700, rhox0 = 3200, d0 = 1e-2,
                         Da = 0.0, Xi = 0.0, gamma = 0.0)
     grid = Grid(par)
-    state = FluidState(T, CPU(), grid.Nz, grid.Nx)
+    state = FluidState(T, CPU(), grid.ni[1], grid.ni[2])
 
     # inject analytic material fields
     state.eta   .= mms.eta

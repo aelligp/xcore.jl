@@ -72,7 +72,7 @@ function build(::Type{T}, backend, N) where {T}
                      maxit_PH=50, maxit_PT=50_000, n_tune_PT=50,
                      atol_PH=atolPH, rel_drop_PT=reldrop, gamma=0.0)
     grid = Grid(par);  scales = compute_scales(par, grid)
-    Nz, Nx = grid.Nz, grid.Nx
+    Nz, Nx = grid.ni[1], grid.ni[2]
     fluid = FluidState(T, backend, Nz, Nx)
     phase = PhaseState(T, backend, Nz, Nx)
     dy    = DyrelCache(T, backend, grid)

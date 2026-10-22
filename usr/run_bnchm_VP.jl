@@ -34,7 +34,7 @@ for N in NS
                        rhom0 = 2700, rhox0 = 3200, d0 = 1e-2,
                        Da = 0.0, Xi = 0.0, gamma = 0.0)
     grid = Grid(par)
-    fluid = FluidState(T, CPU(), grid.Nz, grid.Nx)
+    fluid = FluidState(T, CPU(), grid.ni[1], grid.ni[2])
 
     # inject analytic material fields (no constitutive blend in MMS mode)
     fluid.eta   .= mms.eta

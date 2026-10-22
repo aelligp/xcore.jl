@@ -38,7 +38,7 @@ function setup(N)
                      rhom0 = 2700, rhox0 = 3200, d0 = 1e-2,
                      Da = 0.0, Xi = 0.0, gamma = 0.0)
     grid  = Grid(par)
-    fluid = FluidState(T, CPU(), grid.Nz, grid.Nx)
+    fluid = FluidState(T, CPU(), grid.ni[1], grid.ni[2])
     fluid.eta   .= mms.eta;   fluid.etaco .= mms.etaco
     fluid.rho   .= mms.rho;   fluid.rhow  .= mms.rhow;  fluid.rhou .= mms.rhou
     fluid.Drho  .= mms.Drho;  fluid.MFS   .= mms.MFS

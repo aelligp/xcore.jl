@@ -152,10 +152,10 @@ function _analytic_fields(grid, case::Symbol; Δη::Real, L_b::Real = 1)
     exact = case === :solcx ?
         (x, y) -> _solCx_solution(x, y, 1.0, Δη) :
         (x, y) -> _solkz_solution(x, y; Δη = Δη)
-    Nz, Nx, D = grid.Nz, grid.Nx, float(L_b)
-    U = [exact(grid.Xf[i], D - grid.Zc[j])[1] for j in 1:Nz, i in 1:(Nx + 1)]
-    W = [-exact(grid.Xc[i], D - grid.Zf[j])[2] for j in 1:(Nz + 1), i in 1:Nx]
-    P = [exact(grid.Xc[i], D - grid.Zc[j])[3] for j in 1:Nz, i in 1:Nx]
+    Nz, Nx, D = grid.ni[1], grid.ni[2], float(L_b)
+    U = [exact(grid.xvi[2][i], D - grid.xci[1][j])[1] for j in 1:Nz, i in 1:(Nx + 1)]
+    W = [-exact(grid.xci[2][i], D - grid.xvi[1][j])[2] for j in 1:(Nz + 1), i in 1:Nx]
+    P = [exact(grid.xci[2][i], D - grid.xci[1][j])[3] for j in 1:Nz, i in 1:Nx]
     return (; U, W, P)
 end
 
@@ -190,9 +190,9 @@ function fields_figure(case::Symbol; N::Integer = 64, Δη::Real = 1.0e6,
 
     fig = Figure(; size = (1450, 1200), fontsize = 17)
     # each staggered field carries its own coordinate vectors
-    rows = ((:U, grid.Xf, grid.Zc, num.U, ana.U),
-            (:W, grid.Xc, grid.Zf, num.W, ana.W),
-            (:P, grid.Xc, grid.Zc, Pn,    Pa))
+    rows = ((:U, grid.xvi[2], grid.xci[1], num.U, ana.U),
+            (:W, grid.xci[2], grid.xvi[1], num.W, ana.W),
+            (:P, grid.xci[2], grid.xci[1], Pn,    Pa))
     for (i, (sym, x, z, n, a)) in enumerate(rows)
         _panel!(fig, i, 1, "$sym  numerical",  x, z, n, :balance)
         _panel!(fig, i, 3, "$sym  analytic",   x, z, a, :balance)
