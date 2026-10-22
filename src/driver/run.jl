@@ -94,6 +94,8 @@ function initialize!(phase::PhaseState{T}, fluid::FluidState{T}, ns::NoiseState{
     # ---- restart: short-circuit fresh init when par.restart != 0 ----------
     if par.restart != 0
         path = resolve_restart(par.outdir, par.runID, par.restart)
+        # Unlike init.m, no update/store follows: the checkpoint holds every
+        # field, including the previous time levels, so the run continues exactly.
         meta = load_checkpoint!(path, phase, fluid, ns, hst)
         # rebuild the geometric shape functions (deterministic from grid; not
         # checkpointed because they're cheap and might evolve with code changes)

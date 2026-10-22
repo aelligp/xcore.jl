@@ -117,3 +117,27 @@ end
     eII2 = sqrt.(a.phase.eII .^ 2 .+ slice(b.phase.eyy) .^ 2 ./ 2)
     @test maximum(abs, slice(b.phase.eII) .- eII2) / maximum(a.phase.eII) < 1e-8
 end
+
+@testset "restart from a checkpoint continues the run" begin
+    function restart_pair(mkgrid; kw...)
+        outdir = mktempdir()
+        return map((0, 1)) do restart    # restart = 1 resumes after step 3
+            run_case(mkgrid; nsteps = 6, restart, save_op = true, plot_op = false, nop = 3,
+                     outdir, runID = "restart", kw...)
+        end
+    end
+    # :direct keeps no state between steps, so the restart is exact.
+    a, b = restart_pair(Grid; solver = :direct)
+    differing(s, t) = [f for f in fieldnames(typeof(s))
+                       if getfield(s, f) isa AbstractArray && !isequal(getfield(s, f), getfield(t, f))]
+    @test differing(a.phase, b.phase) == []
+    @test differing(a.fluid, b.fluid) == []
+    @test differing(a.hst, b.hst) == []
+    # :dyrel warm-starts from its cache, which is not checkpointed, so the
+    # restarted 3-D run agrees to the solver tolerance.
+    a, b = restart_pair(par -> Grid(par, Val(3)); atol = 1.0e-10)
+    rel(A, B) = maximum(abs, A .- B) / maximum(abs, A)
+    @test all(f -> rel(getfield(a.fluid, f), getfield(b.fluid, f)) < 1e-10, (:W, :U, :V, :P))
+    @test rel(a.phase.x, b.phase.x) < 1e-10
+    @test rel(a.hst.x_mean, b.hst.x_mean) < 1e-10
+end
