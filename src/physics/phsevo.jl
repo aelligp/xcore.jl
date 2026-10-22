@@ -12,12 +12,12 @@ using LinearAlgebra
 
 """
     phsevo!(phase, fluid, grid, par, scales;
-            ADVN=:weno5, xBC=:periodic, zBC=:closed,
+            ADVN=:weno5, xBC=:periodic, yBC=:periodic, zBC=:closed,
             a1, a2, a3, b1, b2, b3, dt, alpha = par.alpha) -> norm_upd_X
 
 Advance the phase mass density `X` by one Picard step. Writes `advn_X`,
 `advn_M`, `advn_rho`, `dffn_X`, `dXdt` into `phase`; updates `phase.X`,
-`phase.M`, `phase.x`, `phase.m`. Mirrors `src/phsevo.m`.
+`phase.M`, `phase.x`, `phase.m`. Mirrors `src/phsevo.m`. `yBC` is read only in 3-D.
 
 Returns the 2-norm of the update `upd_X = -α res_X / a1` before `X` is clamped
 to `[ρε, ρ(1-ε)]`; pass it to [`compute_resnorm`](@ref).
@@ -26,37 +26,35 @@ The boundary crystallisation term `Gx = G0 · (1 - x) · bndshape` activates
 when `Da > 0` (which sets `G0` non-zero via `scales`). `bndshape` is
 populated by `compute_bndshape!` during `initialize!`.
 """
-function phsevo!(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
+function phsevo!(phase::PhaseState{T, D}, fluid::FluidState{T, D}, grid::Grid{T, D},
                  par::Parameters{T}, scales::Scales{T};
                  ADVN::Symbol = :weno5,
                  xBC::Symbol = :periodic,
+                 yBC::Symbol = :periodic,
                  zBC::Symbol = :closed,
                  a1::Real, a2::Real, a3::Real,
                  b1::Real, b2::Real, b3::Real,
                  dt::Real,
-                 alpha::Real = par.alpha) where {T<:AbstractFloat}
+                 alpha::Real = par.alpha) where {T<:AbstractFloat, D}
     h = grid.h
 
-    # crop ghost cols/rows off the staggered phase velocities to get the
-    # face-velocity sizing that advect! wants
-    Wx_face = @view phase.Wx[:, 2:end-1]            # (Nz+1, Nx)
-    Wm_face = @view phase.Wm[:, 2:end-1]
-    Ux_face = @view phase.Ux[2:end-1, :]            # (Nz, Nx+1)
-    Um_face = @view phase.Um[2:end-1, :]
+    # phase velocities on the compact faces of each axis
+    vx = map(face_interior, per_axis(Val(D), phase.Wx, phase.Ux, phase.Vx), ntuple(identity, Val(D)))
+    vm = map(face_interior, per_axis(Val(D), phase.Wm, phase.Um, phase.Vm), ntuple(identity, Val(D)))
 
-    # phase advection — populate cell-centred rates AND face-centred fluxes
+    # phase advection — populate cell-centered rates AND face-centered fluxes
     # (face fluxes are needed by record_history! to do exact boundary-flux
     # accounting; matches MATLAB phsevo.m:8-9 returning [advn, qz, qx])
-    advect_with_flux!(phase.advn_X, phase.qx_advn_X, phase.qz_advn_X,
-                      phase.X, Ux_face, Wx_face, h, ADVN; xBC, zBC)
-    advect_with_flux!(phase.advn_M, phase.qx_advn_M, phase.qz_advn_M,
-                      phase.M, Um_face, Wm_face, h, ADVN; xBC, zBC)
+    advect_with_flux!(phase.advn_X, per_axis(Val(D), phase.qz_advn_X, phase.qx_advn_X, phase.qy_advn_X),
+                      phase.X, vx, h, ADVN; xBC, yBC, zBC)
+    advect_with_flux!(phase.advn_M, per_axis(Val(D), phase.qz_advn_M, phase.qx_advn_M, phase.qy_advn_M),
+                      phase.M, vm, h, ADVN; xBC, yBC, zBC)
     phase.advn_rho .= phase.advn_X .+ phase.advn_M
 
     # diffusion: f = χ, k = X·k_x. Emit fluxes too (matches phsevo.m:13).
     Xkx = Broadcast.instantiate(Broadcast.broadcasted(*, phase.X, phase.kx))
-    diffus_with_flux!(phase.dffn_X, phase.qx_dffn_X, phase.qz_dffn_X,
-                      phase.chi, Xkx, h; xBC, zBC)
+    diffus_with_flux!(phase.dffn_X, per_axis(Val(D), phase.qz_dffn_X, phase.qx_dffn_X, phase.qy_dffn_X),
+                      phase.chi, Xkx, h; xBC, yBC, zBC)
 
     # boundary crystallisation reaction (G0 = 0 when par.Da = 0)
     @. phase.Gx = T(scales.G0) * (one(T) - phase.x) * phase.bndshape
