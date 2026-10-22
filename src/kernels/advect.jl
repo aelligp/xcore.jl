@@ -2,7 +2,7 @@ using KernelAbstractions
 
 # Conservative advection div(v f) of a cell field f with face-normal velocities
 # v[k], in flux form. Each scheme is a one-dimensional face reconstruction
-# (`_fluxes`, translations of the branches of src/advect.m) applied along every
+# (`face_fluxes`, translations of the branches of src/advect.m) applied along every
 # axis. Neighbors outside the domain follow the ghost rule of their axis:
 # periodic wrap, otherwise repeat of the edge cell (or edge face, for the TVD
 # velocities). Sums over axes run horizontal axes first, then z.
@@ -63,15 +63,15 @@ end
 # One-dimensional face fluxes (q_hi, q_lo) of a cell along an axis: `F(m)` is the
 # advected field m cells from the current one; `vl`, `vh` the velocities of the
 # low/high faces, `vll`, `vhh` those one face further out (TVD only).
-@inline function _fluxes(::Val{:centr}, F, vl, vh, vll, vhh, half)
+@inline function face_fluxes(::Val{:centr}, F, vl, vh, vll, vhh, half)
     fc = F(0)
     return vh * (fc + F(1)) * half, vl * (fc + F(-1)) * half
 end
-@inline function _fluxes(::Val{:upwd1}, F, vl, vh, vll, vhh, half)
+@inline function face_fluxes(::Val{:upwd1}, F, vl, vh, vll, vhh, half)
     fc = F(0);  fm = F(-1);  fp = F(1)
     return _pos(vh, half) * fc + _neg(vh, half) * fp, _pos(vl, half) * fm + _neg(vl, half) * fc
 end
-@inline function _fluxes(::Val{:quick}, F, vl, vh, vll, vhh, half)
+@inline function face_fluxes(::Val{:quick}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  sixth = T(1//6)
     fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
     fppos = sixth * (2 * fp + 5 * fc - fm)
@@ -81,7 +81,7 @@ end
     return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
            _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
 end
-@inline function _fluxes(::Val{:fromm}, F, vl, vh, vll, vhh, half)
+@inline function face_fluxes(::Val{:fromm}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  quarter = T(0.25)
     fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
     fppos = fc + quarter * (fp - fm)
@@ -91,7 +91,7 @@ end
     return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
            _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
 end
-@inline function _fluxes(::Val{:weno3}, F, vl, vh, vll, vhh, half)
+@inline function face_fluxes(::Val{:weno3}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  ε = T(1e-6)
     fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
     fppos = _weno3_poly(fm, fc, fp, ε)
@@ -101,7 +101,7 @@ end
     return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
            _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
 end
-@inline function _fluxes(::Val{:weno5}, F, vl, vh, vll, vhh, half)
+@inline function face_fluxes(::Val{:weno5}, F, vl, vh, vll, vhh, half)
     ε = eps(typeof(half))
     fmmm = F(-3);  fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2);  fppp = F(3)
     fppos = _weno5_poly(fmm, fm, fc, fp, fpp, ε)
@@ -111,7 +111,7 @@ end
     return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
            _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
 end
-@inline function _fluxes(::Val{:tvdim}, F, vl, vh, vll, vhh, half)
+@inline function face_fluxes(::Val{:tvdim}, F, vl, vh, vll, vhh, half)
     fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
     lpos = _pos(vl, half);  lneg = _neg(vl, half)
     hpos = _pos(vh, half);  hneg = _neg(vh, half)
@@ -123,18 +123,18 @@ end
 end
 
 # ghost rule of a row with n cells: periodic wrap, otherwise edge repeat
-@inline _ghost(i, n, periodic) = periodic ? mod1(i, n) : clamp(i, 1, n)
+@inline ghost_index(i, n, periodic) = periodic ? mod1(i, n) : clamp(i, 1, n)
 # face index outside 1..n+1 (one face further out, TVD only)
-@inline _ghost_face(i, n, periodic) = i < 1 ? (periodic ? n : 1) : (i > n + 1 ? (periodic ? 2 : n + 1) : i)
+@inline ghost_face_index(i, n, periodic) = i < 1 ? (periodic ? n : 1) : (i > n + 1 ? (periodic ? 2 : n + 1) : i)
 
 # fluxes (q_hi, q_lo) of cell c of `f` along axis k; c[k] = n + 1 is the ghost
 # cell past the high boundary, whose q_lo is the flux through the last face
 Base.@propagate_inbounds @inline function _cell_fluxes(scheme, f, vk, c, k, periodic, half)
     n = size(f, k);  p = periodic[k];  i = c[k]
-    F(m) = f[_setidx(c, k, _ghost(i + m, n, p))]
-    vel(j) = vk[_setidx(c, k, _ghost_face(j, n, p))]
+    F(m) = f[replace_index(c, k, ghost_index(i + m, n, p))]
+    vel(j) = vk[replace_index(c, k, ghost_face_index(j, n, p))]
     tvd = scheme isa Val{:tvdim}
-    return _fluxes(scheme, F, vel(i), vel(i + 1),
+    return face_fluxes(scheme, F, vel(i), vel(i + 1),
                    tvd ? vel(i - 1) : zero(half), tvd ? vel(i + 2) : zero(half), half)
 end
 
@@ -143,10 +143,10 @@ end
 @kernel function _advect_kernel!(adv, @Const(f), v, scheme, periodic, invh, half)
     c = @index(Global, Cartesian)
     @inbounds begin
-        ax = _hz_vaxes(Val(length(c)))
-        qk(a) = (k = _val(a); _cell_fluxes(scheme, f, v[k], c, k, periodic, half))
+        ax = hz_vaxes(Val(length(c)))
+        qk(a) = (k = unval(a); _cell_fluxes(scheme, f, v[k], c, k, periodic, half))
         q1 = qk(ax[1])
-        acc = _tfoldl((s, a) -> (q = qk(a); s + q[1] - q[2]), q1[1] - q1[2], Base.tail(ax))
+        acc = tuple_foldl((s, a) -> (q = qk(a); s + q[1] - q[2]), q1[1] - q1[2], Base.tail(ax))
         adv[c] = acc * invh
     end
 end
@@ -154,92 +154,70 @@ end
 # q: fluxes through the faces normal to `axis`, the face I between cells I - e and I
 @kernel function _advective_flux_kernel!(q, @Const(f), @Const(vk), axis, scheme, periodic, half)
     I = @index(Global, Cartesian)
-    @inbounds q[I] = _cell_fluxes(scheme, f, vk, I, _val(axis), periodic, half)[2]
+    @inbounds q[I] = _cell_fluxes(scheme, f, vk, I, unval(axis), periodic, half)[2]
 end
 
 @kernel function _flux_divergence_kernel!(adv, q, invh)
     c = @index(Global, Cartesian)
     @inbounds begin
-        ax = _hz_vaxes(Val(length(c)))
-        hi(a) = (k = _val(a); q[k][c + _unit(c, k)]);  lo(a) = q[_val(a)][c]
-        adv[c] = _tfoldl((s, a) -> s + hi(a) - lo(a), hi(ax[1]) - lo(ax[1]), Base.tail(ax)) * invh
+        ax = hz_vaxes(Val(length(c)))
+        hi(a) = (k = unval(a); q[k][c + unit_index(c, k)]);  lo(a) = q[unval(a)][c]
+        adv[c] = tuple_foldl((s, a) -> s + hi(a) - lo(a), hi(ax[1]) - lo(ax[1]), Base.tail(ax)) * invh
     end
 end
 
 # -------------------- front-end --------------------------------------------
 
-function _advection_setup(scheme, xBC, zBC)
-    scheme in ADVN_SCHEMES || throw(ArgumentError("advect!: unsupported scheme = :$scheme"))
-    for bc in (xBC, zBC)
-        bc in (:periodic, :closed) || throw(ArgumentError("advect!: unsupported BC = :$bc"))
-    end
-    return Val(scheme), (zBC === :periodic, xBC === :periodic)
+function advection_setup(name, adv, f, v, scheme, xBC, yBC, zBC)
+    scheme in ADVN_SCHEMES || throw(ArgumentError("$name: unsupported scheme = :$scheme"))
+    N = size(f)
+    size(adv) == N && length(v) == length(N) &&
+        all(d -> size(v[d]) == face_shape(N, d), eachindex(v)) ||
+        throw(DimensionMismatch("$name: need adv and f of size N, v[d] of size N .+ e_d; " *
+                                "got $(size(adv)), $(size(f)), $(map(size, v))"))
+    Base.require_one_based_indexing(adv, f, v...)
+    return Val(scheme), periodic_axes(name, Val(ndims(f)), xBC, yBC, zBC)
 end
 
 """
-    advect!(adv, f, u, w, h, scheme; xBC=:periodic, zBC=:closed) -> adv
+    advect!(adv, f, v, h, scheme; xBC=:periodic, yBC=:periodic, zBC=:closed) -> adv
 
-Conservative advection `div(v f)` of the cell field `f` (`(Nz, Nx)`) with the
-face velocities `u` (`(Nz, Nx+1)`) and `w` (`(Nz+1, Nx)`), scheme
-`∈ (:centr, :upwd1, :quick, :fromm, :weno3, :weno5, :tvdim)` as in
-`src/advect.m`. Ghost cells follow `xBC`/`zBC` (`:periodic` wrap or `:closed`
-edge repeat).
+Conservative advection `div(v f)` of the cell field `f` (size `N`, axes
+`(z, x[, y])`) with the face velocities `v = (w, u[, v_y])`, `v[d]` of size
+`N .+ e_d`; scheme `∈ (:centr, :upwd1, :quick, :fromm, :weno3, :weno5, :tvdim)`
+as in `src/advect.m`. Ghost cells follow `xBC`/`yBC`/`zBC` (`:periodic` wrap or
+`:closed` edge repeat); `yBC` is read only in 3-D.
 """
-function advect!(adv::AbstractMatrix, f::AbstractMatrix, u::AbstractMatrix, w::AbstractMatrix,
-                 h::Real, scheme::Symbol; xBC::Symbol = :periodic, zBC::Symbol = :closed)
-    Nz, Nx = size(f)
-    size(adv) == (Nz, Nx) && size(u) == (Nz, Nx + 1) && size(w) == (Nz + 1, Nx) ||
-        throw(DimensionMismatch("advect!: need adv, f (Nz, Nx), u (Nz, Nx+1), w (Nz+1, Nx); " *
-                                "got $(size(adv)), $(size(f)), $(size(u)), $(size(w))"))
-    s, periodic = _advection_setup(scheme, xBC, zBC)
+function advect!(adv::AbstractArray, f::AbstractArray, v::Tuple, h::Real, scheme::Symbol;
+                 xBC::Symbol = :periodic, yBC::Symbol = :periodic, zBC::Symbol = :closed)
+    s, periodic = advection_setup("advect!", adv, f, v, scheme, xBC, yBC, zBC)
     T = eltype(adv);  backend = KernelAbstractions.get_backend(adv)
-    _advect_kernel!(backend)(adv, f, (w, u), s, periodic, T(inv(h)), T(0.5); ndrange = size(adv))
+    _advect_kernel!(backend)(adv, f, v, s, periodic, T(inv(h)), T(0.5); ndrange = size(adv))
     KernelAbstractions.synchronize(backend)
     return adv
 end
 
 """
-    advect_with_flux!(adv, qx, qz, f, u, w, h, scheme; xBC, zBC) -> adv
+    advect_with_flux!(adv, q, f, v, h, scheme; xBC, yBC, zBC) -> adv
 
-`advect!` that also returns the face fluxes, with `adv` their exact divergence:
-* `qx` `(Nz+2, Nx+1)` — x-face fluxes with z-boundary padding (rows 1, Nz+2)
-* `qz` `(Nz+1, Nx+2)` — z-face fluxes with x-boundary padding (cols 1, Nx+2)
-
-The padding is filled as in `advect.m:144-161`: periodic ⇒ wrap
-(`qz[:,1] = qz[:,end-1]`), otherwise ⇒ repeat (`qz[:,1] = qz[:,2]`).
+`advect!` that also returns the face fluxes `q = (q_z, q_x[, q_y])`, with `adv`
+their exact divergence. `q[d]` has size `N .+ 2 .- e_d`: the faces normal to
+axis d plus one padding layer along every other axis, filled as in
+`advect.m:144-161` (periodic ⇒ wrap, otherwise ⇒ repeat). In 2-D this is
+`q_z` `(Nz+1, Nx+2)` and `q_x` `(Nz+2, Nx+1)`.
 """
-function advect_with_flux!(adv::AbstractMatrix, qx::AbstractMatrix, qz::AbstractMatrix,
-                           f::AbstractMatrix, u::AbstractMatrix, w::AbstractMatrix,
+function advect_with_flux!(adv::AbstractArray, q::Tuple, f::AbstractArray, v::Tuple,
                            h::Real, scheme::Symbol;
-                           xBC::Symbol = :periodic, zBC::Symbol = :closed)
-    Nz, Nx = size(f)
-    size(adv) == (Nz, Nx) && size(u) == (Nz, Nx + 1) && size(w) == (Nz + 1, Nx) &&
-        size(qx) == (Nz + 2, Nx + 1) && size(qz) == (Nz + 1, Nx + 2) ||
-        throw(DimensionMismatch("advect_with_flux!: need adv, f (Nz, Nx), u (Nz, Nx+1), " *
-                                "w (Nz+1, Nx), qx (Nz+2, Nx+1), qz (Nz+1, Nx+2)"))
-    s, periodic = _advection_setup(scheme, xBC, zBC)
+                           xBC::Symbol = :periodic, yBC::Symbol = :periodic, zBC::Symbol = :closed)
+    s, periodic = advection_setup("advect_with_flux!", adv, f, v, scheme, xBC, yBC, zBC)
+    check_padded_fluxes("advect_with_flux!", q, size(f))
     T = eltype(adv);  backend = KernelAbstractions.get_backend(adv)
-    q = (view(qz, 1:Nz+1, 2:Nx+1), view(qx, 2:Nz+1, 1:Nx+1))
-    for (k, vk) in ((Val(1), w), (Val(2), u))
-        qk = q[_val(k)]
-        _advective_flux_kernel!(backend)(qk, f, vk, k, s, periodic, T(0.5); ndrange = size(qk))
+    qi = ntuple(d -> face_interior(q[d], d), length(q))
+    for d in eachindex(qi)
+        _advective_flux_kernel!(backend)(qi[d], f, v[d], Val(d), s, periodic, T(0.5); ndrange = size(qi[d]))
     end
-    _flux_divergence_kernel!(backend)(adv, q, T(inv(h)); ndrange = size(adv))
+    _flux_divergence_kernel!(backend)(adv, qi, T(inv(h)); ndrange = size(adv))
     KernelAbstractions.synchronize(backend)
-
-    if xBC === :periodic && Nx > 1
-        @views qz[:, 1]      .= qz[:, Nx + 1]
-        @views qz[:, Nx + 2] .= qz[:, 2]
-    else
-        @views qz[:, 1]      .= qz[:, 2]
-        @views qz[:, Nx + 2] .= qz[:, Nx + 1]
-    end
-    if zBC === :periodic && Nz > 1
-        @views qx[1, :]      .= qx[Nz + 1, :]
-        @views qx[Nz + 2, :] .= qx[2, :]
-    else
-        @views qx[1, :]      .= qx[2, :]
-        @views qx[Nz + 2, :] .= qx[Nz + 1, :]
-    end
+    fill_face_ghosts!(q, periodic)
     return adv
 end
