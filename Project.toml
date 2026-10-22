@@ -16,6 +16,7 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 TimerOutputs = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
+WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [weakdeps]
 Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
@@ -30,12 +31,15 @@ FFTW = "1"
 JLD2 = "0.6"
 KernelAbstractions = "0.9, 0.10"
 Makie = "0.24"
+ReadVTK = "0.2"
 TOML = "1"
 TimerOutputs = "1"
+WriteVTK = "1.22"
 julia = "1.10"
 
 [extras]
+ReadVTK = "dc215faf-f008-4882-a9f7-a79a826fadc3"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["ReadVTK", "Test"]

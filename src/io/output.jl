@@ -1,4 +1,5 @@
-# Output every `par.nop` steps: figures (Makie extension) and a JLD2 checkpoint.
+# Output every `par.nop` steps: figures (Makie extension), ParaView frames and a
+# JLD2 checkpoint.
 
 # ---------------------------------------------------------------------------
 # Convenience: save all panels at once
@@ -11,7 +12,9 @@
 
 With `par.plot_op`, compute visualization scales from `par` + `scales` +
 `grid` and write all six figure panels to `outdir/runID/` as PNG files; this
-requires a loaded Makie backend (`using CairoMakie`). When `checkpoint=true`
+requires a loaded Makie backend (`using CairoMakie`) and a 2-D grid. With
+`par.vtk_op`, write the ParaView frame `<runID>_<frame>.vtr` (see [`save_vtk`](@ref))
+to the same directory and add it to the time series `<runID>.pvd`. When `checkpoint=true`
 (default), also writes a JLD2 restart file `<runID>_<frame>.jld2` plus the
 rolling `<runID>_cont.jld2`, mirroring MATLAB's per-frame + continuation
 file pattern (`output.m`).
@@ -34,6 +37,8 @@ function save_output(phase::PhaseState, fluid::FluidState,
     tag = @sprintf("%s_%04d", runID, frame)
 
     if par.plot_op
+        grid isa Grid{<:Any, 2} ||
+            error("save_output: the figures of par.plot_op = true are 2-D; set plot_op = false and vtk_op = true for a 3-D grid")
         Base.get_extension(@__MODULE__, :xcoreMakieExt) === nothing && error(
             "save_output: par.plot_op = true needs a Makie backend; " *
             "load one (`using CairoMakie`) or set plot_op = false")
@@ -45,6 +50,8 @@ function save_output(phase::PhaseState, fluid::FluidState,
         plot_profiles(     phase, fluid,     grid, vis; time, path = joinpath(dir, "$(tag)_prf.png"))
         plot_history(      hst,              vis;        scales, path = joinpath(dir, "$(runID)_hst.png"))
     end
+
+    par.vtk_op && save_vtk(joinpath(dir, tag), phase, fluid, ns, grid; t = time, pvd = joinpath(dir, runID))
 
     if checkpoint
         # per-frame snapshot + rolling continuation file (mirrors MATLAB's

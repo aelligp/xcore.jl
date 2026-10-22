@@ -21,7 +21,7 @@ using Statistics: mean
 
 # Pixel dimensions matching MATLAB's geometry formula
 function _figsize(grid::Grid; ncols::Int, nrows::Int)
-    D = Float64(grid.D);  L = Float64(grid.L)
+    D = Float64(grid.li[1]);  L = Float64(grid.li[2])
     axh = 6.0 * sqrt(D / L)            # cm per panel (height)
     axw = 6.0 * sqrt(L / D) + 1.5      # cm per panel (width, includes colorbar)
     ahs = 0.6;  avs = 0.8              # horizontal / vertical gap between panels
@@ -103,8 +103,8 @@ end
 function xcore.plot_fluid(phase::PhaseState, fluid::FluidState,
                     grid::Grid, vis::VisScales; time::Real = 0,
                     path::Union{Nothing,AbstractString} = nothing)
-    Xc = Float64.(grid.Xc);  Zc = Float64.(grid.Zc)
-    Xf = Float64.(grid.Xf);  Zf = Float64.(grid.Zf)
+    Xc = Float64.(grid.xci[2]);  Zc = Float64.(grid.xci[1])
+    Xf = Float64.(grid.xvi[2]);  Zf = Float64.(grid.xvi[1])
     fw, fh = _figsize(grid; ncols = 3, nrows = 2)
 
     xl = "Width [$(vis.sun)]"; yl = "Depth [$(vis.sun)]"
@@ -144,9 +144,9 @@ end
 function xcore.plot_phase(phase::PhaseState,
                     grid::Grid, vis::VisScales; time::Real = 0,
                     path::Union{Nothing,AbstractString} = nothing)
-    Xcs = Float64.(grid.Xc) ./ vis.ssc
-    Zcs = Float64.(grid.Zc) ./ vis.ssc
-    Zfs = Float64.(grid.Zf) ./ vis.ssc
+    Xcs = Float64.(grid.xci[2]) ./ vis.ssc
+    Zcs = Float64.(grid.xci[1]) ./ vis.ssc
+    Zfs = Float64.(grid.xvi[1]) ./ vis.ssc
     fw, fh = _figsize(grid; ncols = 2, nrows = 2)
 
     xl = "Width [$(vis.sun)]"; yl = "Depth [$(vis.sun)]"
@@ -191,8 +191,8 @@ end
 function xcore.plot_diffuse(phase::PhaseState, ns::NoiseState,
                       grid::Grid, vis::VisScales; time::Real = 0,
                       path::Union{Nothing,AbstractString} = nothing)
-    Xcs = Float64.(grid.Xc) ./ vis.ssc
-    Zcs = Float64.(grid.Zc) ./ vis.ssc
+    Xcs = Float64.(grid.xci[2]) ./ vis.ssc
+    Zcs = Float64.(grid.xci[1]) ./ vis.ssc
     fw, fh = _figsize(grid; ncols = 3, nrows = 2)
     xl = "Width [$(vis.sun)]"; yl = "Depth [$(vis.sun)]"
 
@@ -229,8 +229,8 @@ end
 function xcore.plot_dimensionless(phase::PhaseState, ns::NoiseState,
                              grid::Grid, vis::VisScales; time::Real = 0,
                              path::Union{Nothing,AbstractString} = nothing)
-    Xcs = Float64.(grid.Xc) ./ vis.ssc
-    Zcs = Float64.(grid.Zc) ./ vis.ssc
+    Xcs = Float64.(grid.xci[2]) ./ vis.ssc
+    Zcs = Float64.(grid.xci[1]) ./ vis.ssc
     fw, fh = _figsize(grid; ncols = 3, nrows = 2)
     xl = "Width [$(vis.sun)]"; yl = "Depth [$(vis.sun)]"
 
@@ -273,8 +273,8 @@ end
 function xcore.plot_profiles(phase::PhaseState, fluid::FluidState,
                        grid::Grid, vis::VisScales; time::Real = 0,
                        path::Union{Nothing,AbstractString} = nothing)
-    Zcs = Float64.(grid.Zc) ./ Float64(vis.ssc)
-    D_s = Float64(grid.D)   / Float64(vis.ssc)
+    Zcs = Float64.(grid.xci[1]) ./ Float64(vis.ssc)
+    D_s = Float64(grid.li[1])   / Float64(vis.ssc)
     yl  = "Depth [$(vis.sun)]"
 
     tsc, tun = _time_scale(time)
@@ -417,8 +417,8 @@ function xcore.plot_state(fluid::FluidState, grid::Grid;
                     phase::Union{Nothing, PhaseState} = nothing,
                     path::Union{Nothing, AbstractString} = nothing,
                     title::AbstractString = "xcore state")
-    Xc = Float64.(grid.Xc);  Zc = Float64.(grid.Zc)
-    Xf = Float64.(grid.Xf);  Zf = Float64.(grid.Zf)
+    Xc = Float64.(grid.xci[2]);  Zc = Float64.(grid.xci[1])
+    Xf = Float64.(grid.xvi[2]);  Zf = Float64.(grid.xvi[1])
 
     nrows = phase === nothing ? 2 : 3
     fig   = Figure(size = (1400, 380 * nrows))
@@ -447,11 +447,11 @@ end
 function xcore.plot_mms_comparison(fluid::FluidState, mms::NamedTuple, grid::Grid;
                              path::Union{Nothing, AbstractString} = nothing,
                              title::AbstractString = "MMS Stokes comparison")
-    Xc = Float64.(grid.Xc);  Zc = Float64.(grid.Zc)
-    Xf = Float64.(grid.Xf);  Zf = Float64.(grid.Zf)
+    Xc = Float64.(grid.xci[2]);  Zc = Float64.(grid.xci[1])
+    Xf = Float64.(grid.xvi[2]);  Zf = Float64.(grid.xvi[1])
 
     fig = Figure(size = (1600, 1200))
-    Label(fig[0, 1:6], "$(title) — N = $(grid.Nz)"; fontsize = 18, halign = :center)
+    Label(fig[0, 1:6], "$(title) — N = $(grid.ni[1])"; fontsize = 18, halign = :center)
 
     rows = (
         ("W", Xc, Zf, fluid.W[:, 2:end-1],       mms.W_exact[:, 2:end-1]),
