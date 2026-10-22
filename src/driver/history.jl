@@ -1,12 +1,17 @@
 using Statistics
 
-# Port of src/history.m.  Accumulates per-step scalar diagnostics into
-# growing vectors via push!.  The three-column convention from MATLAB
-# (column 1 = min, 2 = mean/rms/geomean, 3 = max, 4 = std where present)
-# is preserved as named triples for clarity.
+# Port of src/history.m. Per-step scalar diagnostics are appended to growing
+# vectors. MATLAB's column convention (1 = min, 2 = mean/rms/geomean, 3 = max,
+# 4 = std where present) is kept as `_min`, `_mean`/`_rms`/`_gm`, `_max` fields.
 
-_rms(A)    = sqrt(mean(x -> x^2, A))
-_geomean(A) = exp(mean(log, max.(A, eps(eltype(A)))))
+rms(A)     = sqrt(mean(x -> x^2, A))
+geomean(A) = exp(mean(log, max.(A, eps(eltype(A)))))
+
+# Append min, `center(A)` and max of `A` to the three history vectors.
+function push_range!(vmin, vcenter, vmax, A, center)
+    push!(vmin, minimum(A));  push!(vcenter, center(A));  push!(vmax, maximum(A))
+    return nothing
+end
 
 """
     History{T}
@@ -93,10 +98,11 @@ function History(::Type{T}) where {T<:AbstractFloat}
 end
 
 """
-    record_history!(hst, step, time, dt, phase, fluid, ns, grid)
+    record_history!(hst, time, dt, phase, fluid, ns, grid, a1=1, a2=1, a3=0, b1=1, b2=0, b3=0)
 
-Append one record to `hst`. Called every `nrh` steps. The `ns` argument
-may be `nothing`; in that case noise speeds are recorded as zero.
+Append one record to `hst`. Called every `nrh` steps. `a1..a3`, `b1..b3` are
+the BD2 coefficients of the time integrator used for the mass-drift
+bookkeeping `DB`, `DM`, `DX`.
 """
 function record_history!(hst::History{T},
                          time::Real, dt::Real,
@@ -108,8 +114,7 @@ function record_history!(hst::History{T},
     vol  = prod(ntuple(_ -> h, Val(D)))        # cell volume h^D
     area = prod(ntuple(_ -> h, Val(D - 1)))    # z-face area h^(D-1)
 
-    # Shift cached rates BEFORE computing the new ones — exactly matching
-    # src/history.m:3-5. After this, dsumBdto holds the rate from the
+    # Shift cached rates before computing the new ones (src/history.m:3-5). After this, dsumBdto holds the rate from the
     # previous call, dsumBdtoo the call before that.
     hst.dsumBdtoo = hst.dsumBdto;  hst.dsumBdto = hst.dsumBdt
     hst.dsumMdtoo = hst.dsumMdto;  hst.dsumMdto = hst.dsumMdt
@@ -181,43 +186,34 @@ function record_history!(hst::History{T},
     push!(hst.EM, (sumM - hst.DM[stp] - hst.sumM[1]) / sumB0)
     push!(hst.EX, (sumX - hst.DX[stp] - hst.sumX[1]) / sumB0)
 
-    # --- crystallinity ---
-    push!(hst.x_min,  minimum(phase.x))
+    # --- field statistics: (min, centre, max) triples, std for x ---
     push!(hst.x_mean, mean(phase.x))
-    push!(hst.x_max,  maximum(phase.x))
     push!(hst.x_std,  std(phase.x))
+    push!(hst.x_min,  minimum(phase.x))
+    push!(hst.x_max,  maximum(phase.x))
 
-    # --- convection speed ---
-    push!(hst.V_min, minimum(phase.V))
-    push!(hst.V_rms, _rms(phase.V))
-    push!(hst.V_max, maximum(phase.V))
+    push_range!(hst.V_min,  hst.V_rms,  hst.V_max,  phase.V,  rms)
+    push_range!(hst.vx_min, hst.vx_rms, hst.vx_max, phase.vx, rms)
+    push_range!(hst.vm_min, hst.vm_rms, hst.vm_max, phase.vm, rms)
 
-    # --- segregation speeds ---
-    push!(hst.vx_min, minimum(phase.vx));  push!(hst.vx_rms, _rms(phase.vx));  push!(hst.vx_max, maximum(phase.vx))
-    push!(hst.vm_min, minimum(phase.vm));  push!(hst.vm_rms, _rms(phase.vm));  push!(hst.vm_max, maximum(phase.vm))
+    push_range!(hst.xie_min, hst.xie_rms, hst.xie_max, ns.xie, rms)
+    push_range!(hst.xix_min, hst.xix_rms, hst.xix_max, ns.xix, rms)
+    push_range!(hst.xis_min, hst.xis_rms, hst.xis_max, ns.xis, rms)
 
-    # --- noise speeds ---
-    push!(hst.xie_min, minimum(ns.xie));  push!(hst.xie_rms, _rms(ns.xie));  push!(hst.xie_max, maximum(ns.xie))
-    push!(hst.xix_min, minimum(ns.xix));  push!(hst.xix_rms, _rms(ns.xix));  push!(hst.xix_max, maximum(ns.xix))
-    push!(hst.xis_min, minimum(ns.xis));  push!(hst.xis_rms, _rms(ns.xis));  push!(hst.xis_max, maximum(ns.xis))
+    push_range!(hst.Ra_min,  hst.Ra_gm,  hst.Ra_max,  phase.Ra,  geomean)
+    push_range!(hst.Rc_min,  hst.Rc_gm,  hst.Rc_max,  phase.Rc,  geomean)
+    push_range!(hst.ReD_min, hst.ReD_gm, hst.ReD_max, phase.ReD, geomean)
+    push_range!(hst.Red_min, hst.Red_gm, hst.Red_max, phase.Red, geomean)
 
-    # --- dimensionless numbers ---
-    push!(hst.Ra_min, minimum(phase.Ra));   push!(hst.Ra_gm, _geomean(phase.Ra));  push!(hst.Ra_max, maximum(phase.Ra))
-    push!(hst.Rc_min, minimum(phase.Rc));   push!(hst.Rc_gm, _geomean(phase.Rc));  push!(hst.Rc_max, maximum(phase.Rc))
-    push!(hst.ReD_min, minimum(phase.ReD)); push!(hst.ReD_gm, _geomean(phase.ReD)); push!(hst.ReD_max, maximum(phase.ReD))
-    push!(hst.Red_min, minimum(phase.Red)); push!(hst.Red_gm, _geomean(phase.Red)); push!(hst.Red_max, maximum(phase.Red))
+    push_range!(hst.ks_min, hst.ks_gm, hst.ks_max, phase.ks, geomean)
+    push_range!(hst.ke_min, hst.ke_gm, hst.ke_max, phase.ke, geomean)
+    push_range!(hst.kx_min, hst.kx_gm, hst.kx_max, phase.kx, geomean)
 
-    # --- diffusivities ---
-    push!(hst.ks_min, minimum(phase.ks));  push!(hst.ks_gm, _geomean(phase.ks));  push!(hst.ks_max, maximum(phase.ks))
-    push!(hst.ke_min, minimum(phase.ke));  push!(hst.ke_gm, _geomean(phase.ke));  push!(hst.ke_max, maximum(phase.ke))
-    push!(hst.kx_min, minimum(phase.kx));  push!(hst.kx_gm, _geomean(phase.kx));  push!(hst.kx_max, maximum(phase.kx))
-
-    # --- viscosities ---
-    push!(hst.eta_min, minimum(fluid.eta));       push!(hst.eta_gm, _geomean(fluid.eta));       push!(hst.eta_max, maximum(fluid.eta))
-    push!(hst.etamix_min, minimum(phase.etamix)); push!(hst.etamix_gm, _geomean(phase.etamix)); push!(hst.etamix_max, maximum(phase.etamix))
-    push!(hst.etae_min, minimum(phase.etae));     push!(hst.etae_gm, _geomean(phase.etae));     push!(hst.etae_max, maximum(phase.etae))
-    push!(hst.etas_min, minimum(phase.etas));     push!(hst.etas_gm, _geomean(phase.etas));     push!(hst.etas_max, maximum(phase.etas))
-    push!(hst.etat_min, minimum(phase.etat));     push!(hst.etat_gm, _geomean(phase.etat));     push!(hst.etat_max, maximum(phase.etat))
+    push_range!(hst.eta_min,    hst.eta_gm,    hst.eta_max,    fluid.eta,     geomean)
+    push_range!(hst.etamix_min, hst.etamix_gm, hst.etamix_max, phase.etamix, geomean)
+    push_range!(hst.etae_min,   hst.etae_gm,   hst.etae_max,   phase.etae,   geomean)
+    push_range!(hst.etas_min,   hst.etas_gm,   hst.etas_max,   phase.etas,   geomean)
+    push_range!(hst.etat_min,   hst.etat_gm,   hst.etat_max,   phase.etat,   geomean)
 
     return nothing
 end

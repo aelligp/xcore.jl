@@ -1,10 +1,6 @@
 # Output every `par.nop` steps: figures (Makie extension), ParaView frames and a
 # JLD2 checkpoint.
 
-# ---------------------------------------------------------------------------
-# Convenience: save all panels at once
-# ---------------------------------------------------------------------------
-
 """
     save_output(phase, fluid, ns, hst, grid, par, scales, time;
                 outdir="out", runID="run", frame=0,
@@ -14,13 +10,12 @@ With `par.plot_op`, compute visualization scales from `par` + `scales` +
 `grid` and write all six figure panels to `outdir/runID/` as PNG files; this
 requires a loaded Makie backend (`using CairoMakie`) and a 2-D grid. With
 `par.vtk_op`, write the ParaView frame `<runID>_<frame>.vtr` (see [`save_vtk`](@ref))
-to the same directory and add it to the time series `<runID>.pvd`. When `checkpoint=true`
-(default), also writes a JLD2 restart file `<runID>_<frame>.jld2` plus the
-rolling `<runID>_cont.jld2`, mirroring MATLAB's per-frame + continuation
-file pattern (`output.m`).
+to the same directory and add it to the time series `<runID>.pvd`. With
+`checkpoint = true`, also write the restart file `<runID>_<frame>.jld2` and
+copy it to the rolling `<runID>_cont.jld2`.
 
 `dt` and `step` are saved into the checkpoint so a restart can resume the
-time loop exactly. Pass them through from the run callback.
+time loop exactly. Pass them through from the run loop.
 """
 function save_output(phase::PhaseState, fluid::FluidState,
                      ns::NoiseState, hst::History,
@@ -54,8 +49,7 @@ function save_output(phase::PhaseState, fluid::FluidState,
     par.vtk_op && save_vtk(joinpath(dir, tag), phase, fluid, ns, grid; t = time, pvd = joinpath(dir, runID))
 
     if checkpoint
-        # per-frame snapshot + rolling continuation file (mirrors MATLAB's
-        # `_<frame>.mat` + `_cont.mat` pattern in output.m)
+        # per-frame snapshot plus rolling continuation file (output.m)
         frame_path = restart_path(outdir, runID; frame)
         cont_path  = restart_path(outdir, runID; frame = -1)
         save_checkpoint(frame_path, phase, fluid, ns, hst; time, dt, step)

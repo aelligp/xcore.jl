@@ -31,6 +31,7 @@ end
 # Σ over the tuple in horizontal-then-z order
 @inline hz_sum(g::NTuple{D}) where {D} = tuple_foldl(+, g[2], (ntuple(k -> g[k + 2], Val(D - 2))..., g[1]))
 
+dims_val(grid) = Val(length(cells(grid)))
 
 # zero-initialized state of the same kind at another resolution
 similar_fluid(::FluidState{T}, backend, N::Tuple) where {T} = FluidState(T, backend, N...)

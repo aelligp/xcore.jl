@@ -1,5 +1,3 @@
-using LinearAlgebra
-
 # Port of src/phsevo.m. Updates the phase mass density `X` (and derived
 # `M`, `x`, `m`) via a semi-implicit residual:
 #
@@ -42,16 +40,15 @@ function phsevo!(phase::PhaseState{T, D}, fluid::FluidState{T, D}, grid::Grid{T,
     vx = map(face_interior, per_axis(Val(D), phase.Wx, phase.Ux, phase.Vx), ntuple(identity, Val(D)))
     vm = map(face_interior, per_axis(Val(D), phase.Wm, phase.Um, phase.Vm), ntuple(identity, Val(D)))
 
-    # phase advection — populate cell-centered rates AND face-centered fluxes
-    # (face fluxes are needed by record_history! to do exact boundary-flux
-    # accounting; matches MATLAB phsevo.m:8-9 returning [advn, qz, qx])
+    # phase advection: cell-centered rates and face fluxes (phsevo.m:8-9); the
+    # face fluxes give `record_history!` its exact boundary-flux accounting
     advect_with_flux!(phase.advn_X, per_axis(Val(D), phase.qz_advn_X, phase.qx_advn_X, phase.qy_advn_X),
                       phase.X, vx, h, ADVN; xBC, yBC, zBC)
     advect_with_flux!(phase.advn_M, per_axis(Val(D), phase.qz_advn_M, phase.qx_advn_M, phase.qy_advn_M),
                       phase.M, vm, h, ADVN; xBC, yBC, zBC)
     phase.advn_rho .= phase.advn_X .+ phase.advn_M
 
-    # diffusion: f = χ, k = X·k_x. Emit fluxes too (matches phsevo.m:13).
+    # diffusion: f = χ, k = X·k_x, with face fluxes (phsevo.m:13)
     Xkx = Broadcast.instantiate(Broadcast.broadcasted(*, phase.X, phase.kx))
     diffus_with_flux!(phase.dffn_X, per_axis(Val(D), phase.qz_dffn_X, phase.qx_dffn_X, phase.qy_dffn_X),
                       phase.chi, Xkx, h; xBC, yBC, zBC)

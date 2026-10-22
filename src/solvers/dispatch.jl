@@ -1,7 +1,7 @@
 # Fluid-mechanics solver strategy.
 #
 # A thin dispatch layer over the three Stokes/Navier-Stokes solvers so the Picard
-# loop in `run!` calls ONE polymorphic `solve_fluidmech!` instead of branching on
+# loop in `run!` calls one polymorphic `solve_fluidmech!` instead of branching on
 # `par.solver`. Each strategy owns whatever persistent state its solver needs
 # (caches, MG hierarchy), allocated once by `make_solver` and reused across all
 # Picard sweeps and time steps.
@@ -33,13 +33,13 @@ function make_solver(par::Parameters{T}, fluid::FluidState{T}, phase::PhaseState
             "solver = :direct is 2-D only; use :dyrel, :gmg or :vmg for a 3-D grid"))
         return DirectSolver()
     elseif par.solver === :dyrel
-        _check_iterative_tolerance("solver = :dyrel", par)
+        check_iterative_tolerance("solver = :dyrel", par)
         return DyrelSolver(StokesCache(T, be, grid))
     elseif par.solver === :gmg
-        _check_iterative_tolerance("solver = :gmg", par)
+        check_iterative_tolerance("solver = :gmg", par)
         return GMGSolver(build_hierarchy(fluid, grid, par))
     elseif par.solver === :vmg
-        _check_iterative_tolerance("solver = :vmg", par)
+        check_iterative_tolerance("solver = :vmg", par)
         # Velocity V-cycle design point of `fluidmech_vmg!`: 16 DR
         # iterations per smoothing step, one pre- and one post-smooth.
         return VMGSolver(build_hierarchy(fluid, grid, par; inner = 16, npre = 1, npost = 1))
@@ -65,7 +65,7 @@ function solve_fluidmech!(::DirectSolver, fluid, phase, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3,
                           sds, top_cnv, bot_cnv, open_cnv, xBC, yBC = :periodic, zBC, verbose = false)
     fluidmech!(fluid, grid, par; phase, sds, top_cnv, bot_cnv, open_cnv, xBC, zBC,
-               dt, a1, a2, a3, b1, b2, b3, verbose = verbose)
+               dt, a1, a2, a3, b1, b2, b3)
     return true      # sparse LU: solved exactly or it threw
 end
 
@@ -73,7 +73,7 @@ end
 # that stops above the nonlinear target makes that change small without the
 # equations being solved — the loop then reports convergence on fields that are
 # wrong by the linear solver's own tolerance.
-function _check_iterative_tolerance(what::AbstractString, par)
+function check_iterative_tolerance(what::AbstractString, par)
     par.atol_PH <= par.atol || throw(ArgumentError(
         "$what: par.atol_PH = $(par.atol_PH) is looser than the Picard target " *
         "par.atol = $(par.atol); the nonlinear loop cannot converge below the " *
@@ -85,8 +85,8 @@ end
 # so it vanishes in the cell fluidmech.m pins, (round(Nz/2), round(Nx/2)) of the
 # ghost-padded array, so P and Pt carry the same level as the :direct solve; in
 # 3-D the pinned cell also sits at round(Ny/2).
-function _pin_pressure!(P, grid)
-    I = map(n -> _mround(n / 2), cells(grid))
+function pin_pressure!(P, grid)
+    I = map(n -> mround(n / 2), cells(grid))
     P .-= P[map(i -> i:i, I)...]   # 1-element copy: no scalar indexing on GPU arrays
     return nothing
 end
@@ -95,7 +95,7 @@ end
 # `sds`) and a closed z; in 3-D the y sides follow `yBC` like the x sides.
 # `fluidmech!` assembles combinations beyond that, so accepting them here would
 # silently solve a different problem — check instead of assuming.
-function _check_matrixfree_bcs(what::AbstractString, grid, sds, xBC, yBC, zBC)
+function check_matrixfree_bcs(what::AbstractString, grid, sds, xBC, yBC, zBC)
     sds in (-1, 1) || throw(ArgumentError(
         "$what: sds must be -1 (free slip) or +1 (no slip), got sds = $sds"))
     xBC === :periodic && sds != -1 && throw(ArgumentError(
@@ -110,7 +110,7 @@ end
 function solve_fluidmech!(s::DyrelSolver, fluid, phase, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3,
                           sds, top_cnv, bot_cnv, open_cnv, xBC, yBC = :periodic, zBC, verbose = false)
-    _check_matrixfree_bcs("solver = :dyrel", grid, sds, xBC, yBC, zBC)
+    check_matrixfree_bcs("solver = :dyrel", grid, sds, xBC, yBC, zBC)
     # The open bottom fixes W from the bottom-row continuity, so R_P ≡ 0 there and
     # the multiplier never sets that pressure row; :direct pins it to zero.
     open_cnv && throw(ArgumentError(
@@ -118,16 +118,16 @@ function solve_fluidmech!(s::DyrelSolver, fluid, phase, grid, par, scales;
     st = fluidmech_dyrel!(fluid, phase, s.cache, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
                           rtol_PH = par.forcing_PH,
-                          xBC, yBC, zBC, sds, top_cnv, bot_cnv, open_cnv, verbose = verbose)
+                          xBC, yBC, zBC, sds, top_cnv, bot_cnv, open_cnv, verbose)
     st.converged || st.relaxed || println("      !  dyrel solve hit budget (itPH=$(st.PH_iters), itPT total=$(st.total_iter))")
-    par.bnchm || _pin_pressure!(fluid.P, grid)
+    par.bnchm || pin_pressure!(fluid.P, grid)
     return st.converged
 end
 
 function solve_fluidmech!(s::GMGSolver, fluid, phase, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3,
                           sds, top_cnv, bot_cnv, open_cnv, xBC, yBC = :periodic, zBC, verbose = false)
-    _check_matrixfree_bcs("solver = :gmg", grid, sds, xBC, yBC, zBC)
+    check_matrixfree_bcs("solver = :gmg", grid, sds, xBC, yBC, zBC)
     # The V-cycle's coarse levels solve the homogeneous error equation with a
     # closed bottom (no drain, so no net mass source is re-injected per level).
     # An open bottom would need its own homogeneous coarse-level form.
@@ -136,23 +136,23 @@ function solve_fluidmech!(s::GMGSolver, fluid, phase, grid, par, scales;
     st = fluidmech_gmg!(fluid, phase, s.hier, grid, par, scales;
                         dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
                         rtol_PH = par.forcing_PH,
-                        xBC, yBC, zBC, sds, top_cnv, bot_cnv, verbose = verbose)
+                        xBC, yBC, zBC, sds, top_cnv, bot_cnv, verbose)
     st.converged || st.relaxed || println("      !  gmg solve hit V-cycle cap (ncyc=$(st.ncyc))")
-    par.bnchm || _pin_pressure!(fluid.P, grid)
+    par.bnchm || pin_pressure!(fluid.P, grid)
     return st.converged
 end
 
 function solve_fluidmech!(s::VMGSolver, fluid, phase, grid, par, scales;
                           dt, a1, a2, a3, b1, b2, b3,
                           sds, top_cnv, bot_cnv, open_cnv, xBC, yBC = :periodic, zBC, verbose = false)
-    _check_matrixfree_bcs("solver = :vmg", grid, sds, xBC, yBC, zBC)
+    check_matrixfree_bcs("solver = :vmg", grid, sds, xBC, yBC, zBC)
     # The velocity V-cycle's coarse levels assume a closed bottom, as in :gmg.
     open_cnv && throw(ArgumentError(
         "solver = :vmg does not implement open_cnv = true; use solver = :dyrel or :direct"))
     st = fluidmech_vmg!(fluid, phase, s.hier, grid, par, scales;
                         dt, a1, a2, a3, b1, b2, b3, gamma = par.gamma,
                         γfact = 5, cc = true, rtol_PH = par.forcing_PH,
-                        xBC, yBC, zBC, sds, top_cnv, bot_cnv, verbose = verbose)
-    par.bnchm || _pin_pressure!(fluid.P, grid)
+                        xBC, yBC, zBC, sds, top_cnv, bot_cnv, verbose)
+    par.bnchm || pin_pressure!(fluid.P, grid)
     return st.converged
 end

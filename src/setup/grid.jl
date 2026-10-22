@@ -3,7 +3,7 @@
 
 Staggered finite-difference grid in `D = 2` or `3` dimensions with square
 cells of size `h`, stored per axis like JustRelax's `Geometry`. Mirrors the
-coordinate setup at the top of `src/init.m`.
+coordinate setup at the top of `init.m`.
 
 Every per-axis field is a `D`-tuple ordered `(z, x[, y])`: z points down
 (gravity), x and y are horizontal.

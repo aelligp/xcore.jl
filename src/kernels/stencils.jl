@@ -96,14 +96,14 @@ end
 # `diff(a,1,dim)./h` for constant grid spacing.
 # ----------------------------------------------------------------------------
 
-@kernel function _ddx_kernel!(out, @Const(f), invh)
+@kernel function ddx_kernel!(out, @Const(f), invh)
     iz, ix = @index(Global, NTuple)
-    @inbounds out[iz, ix] = (f[iz, ix + 1] - f[iz, ix]) * invh
+    out[iz, ix] = (f[iz, ix + 1] - f[iz, ix]) * invh
 end
 
-@kernel function _ddz_kernel!(out, @Const(f), invh)
+@kernel function ddz_kernel!(out, @Const(f), invh)
     iz, ix = @index(Global, NTuple)
-    @inbounds out[iz, ix] = (f[iz + 1, ix] - f[iz, ix]) * invh
+    out[iz, ix] = (f[iz + 1, ix] - f[iz, ix]) * invh
 end
 
 """
@@ -118,7 +118,7 @@ function ddx!(out::AbstractMatrix, f::AbstractMatrix, h::Real)
     @assert size(out, 2) == size(f, 2) - 1        "ddx!: output must be one col narrower than input"
     backend = KernelAbstractions.get_backend(out)
     T = eltype(out)
-    _ddx_kernel!(backend)(out, f, T(inv(h)); ndrange = size(out))
+    ddx_kernel!(backend)(out, f, T(inv(h)); ndrange = size(out))
     KernelAbstractions.synchronize(backend)
     return out
 end
@@ -134,7 +134,7 @@ function ddz!(out::AbstractMatrix, f::AbstractMatrix, h::Real)
     @assert size(out, 2) == size(f, 2)            "ddz!: column count mismatch"
     backend = KernelAbstractions.get_backend(out)
     T = eltype(out)
-    _ddz_kernel!(backend)(out, f, T(inv(h)); ndrange = size(out))
+    ddz_kernel!(backend)(out, f, T(inv(h)); ndrange = size(out))
     KernelAbstractions.synchronize(backend)
     return out
 end

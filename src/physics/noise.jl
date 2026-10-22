@@ -26,11 +26,10 @@ noise_randn!(_,                       A::AbstractArray) = Random.randn!(A)
 # The particle noises are gradients of the scalar potentials psix, psis; psix is
 # driven by the eddy white noise (in 3-D its normalized sum over the components).
 
-# Array-type-generic so the noise fields live on whatever backend the rest of
-# the state uses (CPU `Array`, CUDA `CuArray`, AMD `ROCArray`, …). `A` is the
-# real field type, `AC` the complex FFT-filter type, `R` the RNG (host
-# `MersenneTwister` on CPU; on a device the per-element `randn!(A)` device RNG
-# is used and `rng` is ignored — see `noise_randn!`).
+# Type parameters of `NoiseState`: `A` is the real field type, `AC` the complex
+# FFT-filter type, `R` the RNG (host `MersenneTwister` on CPU; on a device the
+# array package's `randn!(A)` is used and `rng` is ignored, see `noise_randn!`).
+# The fields live on whatever backend the rest of the state uses.
 
 """
     NoiseState{T,D}
@@ -136,7 +135,7 @@ function NoiseState(::Type{T}, backend, grid::Grid{T, D}, scales::Scales{T};
     z(dims)  = xcore_zeros(backend, T, dims...)
     zc(dims) = xcore_zeros(backend, Complex{T}, dims...)
     y(dims)  = D == 3 ? z(dims) : nothing
-    face(d) = (z(ghost_face_shape(N, 1)), z(ghost_face_shape(N, 2)), y(ghost_face_shape(N, 3)))
+    faces() = (z(ghost_face_shape(N, 1)), z(ghost_face_shape(N, 2)), y(ghost_face_shape(N, 3)))
     A = typeof(z(N))
 
     return NoiseState{T, D, A, typeof(Gkpe), MersenneTwister, D == 3 ? A : Nothing}(
@@ -145,7 +144,7 @@ function NoiseState(::Type{T}, backend, grid::Grid{T, D}, scales::Scales{T};
         z(N), z(N),                                        # re, rs
         y(N), y(N), y(N), y(N), y(N), y(N),                # psie_z/x, psieo_z/x, re_z/x
         Gkpe, Gkps, padL0, padl0, fL, fl,
-        face(1)..., face(2)..., face(3)...,                # xie*, xix*, xis* on faces z, x, y
+        faces()..., faces()..., faces()...,                # xie*, xix*, xis* on faces z, x, y
         z(N), z(N), z(N),                                  # xie, xix, xis
         MersenneTwister(seed),
         z(N),                                              # psi_flt
@@ -250,29 +249,35 @@ function noise!(ns::NoiseState{T, D}, phase::PhaseState{T, D}, grid::Grid{T, D},
                 yBC::Symbol = :periodic) where {T<:AbstractFloat, D}
     periodic = periodic_axes("noise!", Val(D), xBC, yBC, :closed)
 
-    Xi   = T(par.Xi)
-    L0   = T(scales.L0)
-    l0   = T(scales.l0)
-    txi0 = T(scales.txi0)
-    eps_T = eps(T)
-    # scalars stay outside `@.`: a literal converted inside a broadcast is
-    # evaluated per element, in Float64, which Float32-only GPUs reject
-    dtT  = T(dt)
-    τcap = T(1e2) * dtT
-    χ0 = T(1e-4);  μ0 = T(0.4);  dμ = T(0.05)
-    # potential to flux-component variance normalisation; the 3-D curl sums two
-    # independent potential derivatives per component
-    fL = ns.fL;  fl = ns.fl
-    fLe = D == 3 ? fL / sqrt(T(2)) : fL
-
-    # draw white noise once per outer step (host MersenneTwister on CPU;
-    # the array package's device RNG on GPU — see `noise_randn!`)
+    # Draw once per outer step (host MersenneTwister on CPU, the array
+    # package's device RNG on GPU; see `noise_randn!`).
     if first_iter
         foreach(r -> noise_randn!(ns.rng, r), eddy_white_noise(ns))
         noise_randn!(ns.rng, ns.rs)
     end
 
-    # --- OU time update of the eddy, particle-eddy and settling potentials ---
+    ou_update!(ns, phase, par, scales, dt)
+    eddy_fluxes!(ns, periodic)
+    particle_fluxes!(ns, phase, periodic)
+    noise_magnitudes!(ns)
+    return nothing
+end
+
+# OU time update of the eddy, particle-eddy and settling potentials (noise.m).
+function ou_update!(ns::NoiseState{T, D}, phase, par, scales, dt) where {T, D}
+    Xi    = T(par.Xi)
+    L0    = T(scales.L0)
+    l0    = T(scales.l0)
+    txi0  = T(scales.txi0)
+    eps_T = eps(T)
+    # Scalars stay outside `@.`: a literal converted inside a broadcast is
+    # evaluated per element, in Float64, which Float32-only GPUs reject.
+    dtT   = T(dt)
+    τcap  = T(1e2) * dtT
+    # Potential to flux-component variance normalization; the 3-D curl sums two
+    # independent potential derivatives per component.
+    fLe = D == 3 ? ns.fL / sqrt(T(2)) : ns.fL
+
     foreach(eddy_potential(ns), eddy_previous(ns), eddy_white_noise(ns)) do psi, psio, r
         @. psi = ou_step(psio, r, decorrelation_time(L0, phase.V, eps_T),
                          eddy_amplitude(Xi, phase.fReL, phase.ke, decorrelation_time(L0, phase.V, eps_T)),
@@ -282,13 +287,16 @@ function noise!(ns::NoiseState{T, D}, phase::PhaseState{T, D}, grid::Grid{T, D},
     @. ns.psix = ou_step(ns.psixo, rx, decorrelation_time(L0, phase.V, eps_T),
                          xtal_amplitude(Xi, phase.chi, phase.fReL, phase.ke,
                                         decorrelation_time(L0, phase.V, eps_T), txi0),
-                         fL, dtT, τcap)
+                         ns.fL, dtT, τcap)
     @. ns.psis = ou_step(ns.psiso, ns.rs, decorrelation_time(l0, phase.vx, eps_T),
                          settling_amplitude(Xi, phase.chi, phase.ks, decorrelation_time(l0, phase.vx, eps_T)),
-                         fl, dtT, τcap)
+                         ns.fl, dtT, τcap)
+    return nothing
+end
 
-    # --- eddy noise fluxes from the filtered potential (noise.m lines 61-64):
-    # ghost-extend each filtered component, average it onto its edges, take −curl
+# Eddy noise fluxes from the filtered potential (noise.m lines 61-64): ghost-extend
+# each filtered component, average it onto its edges, take −curl.
+function eddy_fluxes!(ns::NoiseState{<:Any, D}, periodic) where {D}
     for (psi, Ae, pair) in zip(eddy_potential(ns), eddy_edges(ns), eddy_edge_pairs(Val(D)))
         filtered_extension!(ns, psi, ns.eddy_pad, ns.Gkpe, ns.padL0, periodic)
         edge_average!(Ae, ns.psi_ext, pair)
@@ -296,9 +304,13 @@ function noise!(ns::NoiseState{T, D}, phase::PhaseState{T, D}, grid::Grid{T, D},
     xie = per_axis(Val(D), ns.xiew, ns.xieu, ns.xiev)
     eddy_curl!(map(face_interior, xie, ntuple(identity, Val(D))), eddy_edges(ns))
     fill_face_ghosts!(xie, periodic)
+    return nothing
+end
 
-    # --- particle-eddy and settling noise (noise.m lines 71-76): −∇ψ on the
-    # ghosted faces, tapered to vanish near chi = 0 and where mu < 0.4 ---
+# Particle-eddy and settling noise (noise.m lines 71-76): −∇ψ on the ghosted
+# faces, tapered to vanish near chi = 0 and where mu < 0.4.
+function particle_fluxes!(ns::NoiseState{T, D}, phase, periodic) where {T, D}
+    χ0 = T(1e-4);  μ0 = T(0.4);  dμ = T(0.05)
     chif = per_axis(Val(D), phase.chiw, phase.chiu, phase.chiv)
     muf  = per_axis(Val(D), phase.muw,  phase.muu,  phase.muv)
     for (psi, pad, Gk, npad, ξ) in ((ns.psix, ns.eddy_pad, ns.Gkpe, ns.padL0, per_axis(Val(D), ns.xixw, ns.xixu, ns.xixv)),
@@ -308,16 +320,18 @@ function noise!(ns::NoiseState{T, D}, phase::PhaseState{T, D}, grid::Grid{T, D},
             ξ[d] .= .-forward_diff(ns.psi_ext, d) .* noise_taper.(chif[d], muf[d], χ0, μ0, dμ)
         end
     end
+    return nothing
+end
 
-    # --- noise speed magnitudes (cell-centered, for diagnostics) ---
+# Cell-centered noise speed magnitudes (diagnostics).
+function noise_magnitudes!(ns::NoiseState{<:Any, D}) where {D}
     backend = KernelAbstractions.get_backend(ns.xie)
     for (mag, ξ) in ((ns.xis, per_axis(Val(D), ns.xisw, ns.xisu, ns.xisv)),
                      (ns.xix, per_axis(Val(D), ns.xixw, ns.xixu, ns.xixv)),
-                     (ns.xie, xie))
+                     (ns.xie, per_axis(Val(D), ns.xiew, ns.xieu, ns.xiev)))
         noise_magnitude_kernel!(backend)(mag, ξ; ndrange = size(mag))
     end
     KernelAbstractions.synchronize(backend)
-
     return nothing
 end
 
@@ -356,9 +370,8 @@ function compute_fft_filter!(psi_flt::AbstractArray{T}, psi_pad::AbstractArray{C
     fill!(psi_pad, zero(Complex{T}))
     inner .= psi
 
-    # FFT → multiply filter → IFFT, all IN-PLACE (`fft!`/`ifft!`) so the
-    # transforms reuse `psi_pad` instead of allocating fresh output arrays each
-    # call. AbstractFFTs in-place generics dispatch to FFTW / cuFFT / rocFFT.
+    # FFT → multiply filter → IFFT, in place so `psi_pad` is reused. The
+    # AbstractFFTs generics dispatch to FFTW, cuFFT or rocFFT.
     fft!(psi_pad, 1:ndims(psi_pad))
     psi_pad .*= Gk
     ifft!(psi_pad, 1:ndims(psi_pad))

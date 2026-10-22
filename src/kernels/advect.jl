@@ -12,7 +12,7 @@ const ADVN_SCHEMES = (:centr, :upwd1, :quick, :fromm, :weno3, :weno5, :tvdim)
 # -------------------- reconstructions --------------------------------------
 
 # WENO5 (Jiang & Shu, 1996)
-@inline function _weno5_poly(fmm::T, fm::T, fc::T, fp::T, fpp::T, eps_val::T) where {T<:AbstractFloat}
+@inline function weno5_poly(fmm::T, fm::T, fc::T, fp::T, fpp::T, eps_val::T) where {T<:AbstractFloat}
     sixth   = T(1//6)
     quarter = T(1//4)
     thirteen_twelfths = T(13//12)
@@ -33,7 +33,7 @@ const ADVN_SCHEMES = (:centr, :upwd1, :quick, :fromm, :weno3, :weno5, :tvdim)
 end
 
 # WENO3; the regularizer is a fixed 1e-6 (advect.m:318), not machine eps
-@inline function _weno3_poly(fm::T, fc::T, fp::T, eps_val::T) where {T<:AbstractFloat}
+@inline function weno3_poly(fm::T, fc::T, fp::T, eps_val::T) where {T<:AbstractFloat}
     half = T(0.5)
     p1 = half * (fc + fp)
     p2 = half * (T(3) * fc - fm)
@@ -48,7 +48,7 @@ end
 end
 
 # TVD with the superbee limiter on the flux ratio (advect.m:393-400)
-@inline function _tvd_flux(fm::T, fc::T, fp::T, vm::T, vp::T) where {T<:AbstractFloat}
+@inline function tvd_flux(fm::T, fc::T, fp::T, vm::T, vp::T) where {T<:AbstractFloat}
     num = vm * (fc - fm)
     den = vp * (fp - fc)
     # den ≈ 0 ⇒ R ≈ 0 (no slope change), without dividing 0/0
@@ -57,8 +57,8 @@ end
     return fc + T(0.5) * l * (fp - fc)
 end
 
-@inline _pos(u, half) = (u + abs(u)) * half
-@inline _neg(u, half) = (u - abs(u)) * half
+@inline pospart(u, half) = (u + abs(u)) * half
+@inline negpart(u, half) = (u - abs(u)) * half
 
 # One-dimensional face fluxes (q_hi, q_lo) of a cell along an axis: `F(m)` is the
 # advected field m cells from the current one; `vl`, `vh` the velocities of the
@@ -69,7 +69,7 @@ end
 end
 @inline function face_fluxes(::Val{:upwd1}, F, vl, vh, vll, vhh, half)
     fc = F(0);  fm = F(-1);  fp = F(1)
-    return _pos(vh, half) * fc + _neg(vh, half) * fp, _pos(vl, half) * fm + _neg(vl, half) * fc
+    return pospart(vh, half) * fc + negpart(vh, half) * fp, pospart(vl, half) * fm + negpart(vl, half) * fc
 end
 @inline function face_fluxes(::Val{:quick}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  sixth = T(1//6)
@@ -78,8 +78,8 @@ end
     fpneg = sixth * (2 * fc + 5 * fp - fpp)
     fmpos = sixth * (2 * fc + 5 * fm - fmm)
     fmneg = sixth * (2 * fm + 5 * fc - fp)
-    return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
-           _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
+    return pospart(vh, half) * fppos + negpart(vh, half) * fpneg,
+           pospart(vl, half) * fmpos + negpart(vl, half) * fmneg
 end
 @inline function face_fluxes(::Val{:fromm}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  quarter = T(0.25)
@@ -88,37 +88,37 @@ end
     fpneg = fp + quarter * (fc - fpp)
     fmpos = fm + quarter * (fc - fmm)
     fmneg = fc + quarter * (fm - fp)
-    return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
-           _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
+    return pospart(vh, half) * fppos + negpart(vh, half) * fpneg,
+           pospart(vl, half) * fmpos + negpart(vl, half) * fmneg
 end
 @inline function face_fluxes(::Val{:weno3}, F, vl, vh, vll, vhh, half)
     T = typeof(half);  ε = T(1e-6)
     fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
-    fppos = _weno3_poly(fm, fc, fp, ε)
-    fpneg = _weno3_poly(fpp, fp, fc, ε)
-    fmpos = _weno3_poly(fmm, fm, fc, ε)
-    fmneg = _weno3_poly(fp, fc, fm, ε)
-    return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
-           _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
+    fppos = weno3_poly(fm, fc, fp, ε)
+    fpneg = weno3_poly(fpp, fp, fc, ε)
+    fmpos = weno3_poly(fmm, fm, fc, ε)
+    fmneg = weno3_poly(fp, fc, fm, ε)
+    return pospart(vh, half) * fppos + negpart(vh, half) * fpneg,
+           pospart(vl, half) * fmpos + negpart(vl, half) * fmneg
 end
 @inline function face_fluxes(::Val{:weno5}, F, vl, vh, vll, vhh, half)
     ε = eps(typeof(half))
     fmmm = F(-3);  fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2);  fppp = F(3)
-    fppos = _weno5_poly(fmm, fm, fc, fp, fpp, ε)
-    fpneg = _weno5_poly(fppp, fpp, fp, fc, fm, ε)
-    fmpos = _weno5_poly(fmmm, fmm, fm, fc, fp, ε)
-    fmneg = _weno5_poly(fpp, fp, fc, fm, fmm, ε)
-    return _pos(vh, half) * fppos + _neg(vh, half) * fpneg,
-           _pos(vl, half) * fmpos + _neg(vl, half) * fmneg
+    fppos = weno5_poly(fmm, fm, fc, fp, fpp, ε)
+    fpneg = weno5_poly(fppp, fpp, fp, fc, fm, ε)
+    fmpos = weno5_poly(fmmm, fmm, fm, fc, fp, ε)
+    fmneg = weno5_poly(fpp, fp, fc, fm, fmm, ε)
+    return pospart(vh, half) * fppos + negpart(vh, half) * fpneg,
+           pospart(vl, half) * fmpos + negpart(vl, half) * fmneg
 end
 @inline function face_fluxes(::Val{:tvdim}, F, vl, vh, vll, vhh, half)
     fmm = F(-2);  fm = F(-1);  fc = F(0);  fp = F(1);  fpp = F(2)
-    lpos = _pos(vl, half);  lneg = _neg(vl, half)
-    hpos = _pos(vh, half);  hneg = _neg(vh, half)
-    fppos = _tvd_flux(fm, fc, fp, lpos, hpos)
-    fpneg = _tvd_flux(fpp, fp, fc, _neg(vhh, half), hneg)
-    fmpos = _tvd_flux(fmm, fm, fc, _pos(vll, half), lpos)
-    fmneg = _tvd_flux(fp, fc, fm, hneg, lneg)
+    lpos = pospart(vl, half);  lneg = negpart(vl, half)
+    hpos = pospart(vh, half);  hneg = negpart(vh, half)
+    fppos = tvd_flux(fm, fc, fp, lpos, hpos)
+    fpneg = tvd_flux(fpp, fp, fc, negpart(vhh, half), hneg)
+    fmpos = tvd_flux(fmm, fm, fc, pospart(vll, half), lpos)
+    fmneg = tvd_flux(fp, fc, fm, hneg, lneg)
     return hpos * fppos + hneg * fpneg, lpos * fmpos + lneg * fmneg
 end
 
@@ -129,7 +129,7 @@ end
 
 # fluxes (q_hi, q_lo) of cell c of `f` along axis k; c[k] = n + 1 is the ghost
 # cell past the high boundary, whose q_lo is the flux through the last face
-Base.@propagate_inbounds @inline function _cell_fluxes(scheme, f, vk, c, k, periodic, half)
+@inline function cell_fluxes(scheme, f, vk, c, k, periodic, half)
     n = size(f, k);  p = periodic[k];  i = c[k]
     F(m) = f[replace_index(c, k, ghost_index(i + m, n, p))]
     vel(j) = vk[replace_index(c, k, ghost_face_index(j, n, p))]
@@ -140,30 +140,26 @@ end
 
 # -------------------- kernels ----------------------------------------------
 
-@kernel function _advect_kernel!(adv, @Const(f), v, scheme, periodic, invh, half)
+@kernel function advect_kernel!(adv, @Const(f), v, scheme, periodic, invh, half)
     c = @index(Global, Cartesian)
-    @inbounds begin
-        ax = hz_vaxes(Val(length(c)))
-        qk(a) = (k = unval(a); _cell_fluxes(scheme, f, v[k], c, k, periodic, half))
-        q1 = qk(ax[1])
-        acc = tuple_foldl((s, a) -> (q = qk(a); s + q[1] - q[2]), q1[1] - q1[2], Base.tail(ax))
-        adv[c] = acc * invh
-    end
+    ax = hz_vaxes(Val(length(c)))
+    qk(a) = (k = unval(a); cell_fluxes(scheme, f, v[k], c, k, periodic, half))
+    q1 = qk(ax[1])
+    acc = tuple_foldl((s, a) -> (q = qk(a); s + q[1] - q[2]), q1[1] - q1[2], Base.tail(ax))
+    adv[c] = acc * invh
 end
 
 # q: fluxes through the faces normal to `axis`, the face I between cells I - e and I
-@kernel function _advective_flux_kernel!(q, @Const(f), @Const(vk), axis, scheme, periodic, half)
+@kernel function advective_flux_kernel!(q, @Const(f), @Const(vk), axis, scheme, periodic, half)
     I = @index(Global, Cartesian)
-    @inbounds q[I] = _cell_fluxes(scheme, f, vk, I, unval(axis), periodic, half)[2]
+    q[I] = cell_fluxes(scheme, f, vk, I, unval(axis), periodic, half)[2]
 end
 
-@kernel function _flux_divergence_kernel!(adv, q, invh)
+@kernel function flux_divergence_kernel!(adv, q, invh)
     c = @index(Global, Cartesian)
-    @inbounds begin
-        ax = hz_vaxes(Val(length(c)))
-        hi(a) = (k = unval(a); q[k][c + unit_index(c, k)]);  lo(a) = q[unval(a)][c]
-        adv[c] = tuple_foldl((s, a) -> s + hi(a) - lo(a), hi(ax[1]) - lo(ax[1]), Base.tail(ax)) * invh
-    end
+    ax = hz_vaxes(Val(length(c)))
+    hi(a) = (k = unval(a); q[k][c + unit_index(c, k)]);  lo(a) = q[unval(a)][c]
+    adv[c] = tuple_foldl((s, a) -> s + hi(a) - lo(a), hi(ax[1]) - lo(ax[1]), Base.tail(ax)) * invh
 end
 
 # -------------------- front-end --------------------------------------------
@@ -192,7 +188,7 @@ function advect!(adv::AbstractArray, f::AbstractArray, v::Tuple, h::Real, scheme
                  xBC::Symbol = :periodic, yBC::Symbol = :periodic, zBC::Symbol = :closed)
     s, periodic = advection_setup("advect!", adv, f, v, scheme, xBC, yBC, zBC)
     T = eltype(adv);  backend = KernelAbstractions.get_backend(adv)
-    _advect_kernel!(backend)(adv, f, v, s, periodic, T(inv(h)), T(0.5); ndrange = size(adv))
+    advect_kernel!(backend)(adv, f, v, s, periodic, T(inv(h)), T(0.5); ndrange = size(adv))
     KernelAbstractions.synchronize(backend)
     return adv
 end
@@ -214,9 +210,9 @@ function advect_with_flux!(adv::AbstractArray, q::Tuple, f::AbstractArray, v::Tu
     T = eltype(adv);  backend = KernelAbstractions.get_backend(adv)
     qi = ntuple(d -> face_interior(q[d], d), length(q))
     for d in eachindex(qi)
-        _advective_flux_kernel!(backend)(qi[d], f, v[d], Val(d), s, periodic, T(0.5); ndrange = size(qi[d]))
+        advective_flux_kernel!(backend)(qi[d], f, v[d], Val(d), s, periodic, T(0.5); ndrange = size(qi[d]))
     end
-    _flux_divergence_kernel!(backend)(adv, qi, T(inv(h)); ndrange = size(adv))
+    flux_divergence_kernel!(backend)(adv, qi, T(inv(h)); ndrange = size(adv))
     KernelAbstractions.synchronize(backend)
     fill_face_ghosts!(q, periodic)
     return adv

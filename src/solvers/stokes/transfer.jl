@@ -16,30 +16,26 @@
 
 @kernel function restrict_cell_kernel!(coarse, @Const(fine))
     J = @index(Global, Cartesian)
-    @inbounds begin
-        D = length(J);  T = eltype(coarse)
-        base = 2J - oneunit(J)
-        offs = CartesianIndices(ntuple(_ -> 0:1, Val(D)))
-        s = fine[base]
-        for k in 2:length(offs)
-            s += fine[base + offs[k]]
-        end
-        coarse[J] = s * T(1 / 2^D)
+    D = length(J);  T = eltype(coarse)
+    base = 2J - oneunit(J)
+    offs = CartesianIndices(ntuple(_ -> 0:1, Val(D)))
+    s = fine[base]
+    for k in 2:length(offs)
+        s += fine[base + offs[k]]
     end
+    coarse[J] = s * T(1 / 2^D)
 end
 
 @kernel function restrict_face_kernel!(coarse, @Const(fine), comp)
     J = @index(Global, Cartesian)
-    @inbounds begin
-        d = unval(comp);  D = length(J);  T = eltype(coarse)
-        base = 2J - oneunit(J)
-        offs = CartesianIndices(ntuple(k -> k == d ? (0:0) : (0:1), Val(D)))
-        s = fine[base]
-        for k in 2:length(offs)
-            s += fine[base + offs[k]]
-        end
-        coarse[J] = s * T(1 / 2^(D - 1))
+    d = unval(comp);  D = length(J);  T = eltype(coarse)
+    base = 2J - oneunit(J)
+    offs = CartesianIndices(ntuple(k -> k == d ? (0:0) : (0:1), Val(D)))
+    s = fine[base]
+    for k in 2:length(offs)
+        s += fine[base + offs[k]]
     end
+    coarse[J] = s * T(1 / 2^(D - 1))
 end
 
 """
@@ -70,26 +66,24 @@ restrict_face!(coarse, fine, d::Int) = restrict_face!(coarse, fine, Val(d))
 
 @kernel function prolong_cell_kernel!(fine, @Const(coarse), periodic)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        D = length(I);  T = eltype(fine)
-        Jc  = CartesianIndex(ntuple(k -> (I[k] + 1) ÷ 2, Val(D)))
-        Jn  = CartesianIndex(ntuple(k -> neighbor_cell(isodd(I[k]) ? Jc[k] - 1 : Jc[k] + 1,
-                                                  size(coarse, k), periodic[k]), Val(D)))
-        offs = CartesianIndices(ntuple(_ -> 0:1, Val(D)))
-        acc = zero(T)
-        for o in offs
-            w = one(T);  idx = Jc
-            for k in 1:D
-                if o[k] == 1
-                    w *= T(0.25);  idx = replace_index(idx, k, Jn[k])
-                else
-                    w *= T(0.75)
-                end
+    D = length(I);  T = eltype(fine)
+    Jc  = CartesianIndex(ntuple(k -> (I[k] + 1) ÷ 2, Val(D)))
+    Jn  = CartesianIndex(ntuple(k -> neighbor_cell(isodd(I[k]) ? Jc[k] - 1 : Jc[k] + 1,
+                                              size(coarse, k), periodic[k]), Val(D)))
+    offs = CartesianIndices(ntuple(_ -> 0:1, Val(D)))
+    acc = zero(T)
+    for o in offs
+        w = one(T);  idx = Jc
+        for k in 1:D
+            if o[k] == 1
+                w *= T(0.25);  idx = replace_index(idx, k, Jn[k])
+            else
+                w *= T(0.75)
             end
-            acc += w * coarse[idx]
         end
-        fine[I] = acc
+        acc += w * coarse[idx]
     end
+    fine[I] = acc
 end
 
 """
@@ -117,31 +111,29 @@ end
 
 @kernel function prolong_face_kernel!(fine, @Const(coarse), comp, periodic, sds, top_cnv, bot_cnv)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        d = unval(comp);  D = length(I);  T = eltype(fine)
-        ed = unit_index(I, d)
-        odd = isodd(I[d])
-        # coarse index of the cell-shaped (transverse) position, face along d
-        Jc = CartesianIndex(ntuple(k -> k == d ? (odd ? (I[k] + 1) ÷ 2 : I[k] ÷ 2) : (I[k] + 1) ÷ 2, Val(D)))
-        nb = ntuple(k -> neighbor_face(k, d, I, Jc, size(coarse, k), periodic, sds, top_cnv, bot_cnv),
-                    Val(D))
-        along(J) = @inbounds odd ? coarse[J] : T(0.5) * (coarse[J] + coarse[J + ed])
-        offs = CartesianIndices(ntuple(k -> k == d ? (0:0) : (0:1), Val(D)))
-        acc = zero(T)
-        for o in offs
-            w = one(T);  idx = Jc
-            for k in 1:D
-                k == d && continue
-                if o[k] == 1
-                    w *= T(0.25) * nb[k][2];  idx = replace_index(idx, k, nb[k][1])
-                else
-                    w *= T(0.75)
-                end
+    d = unval(comp);  D = length(I);  T = eltype(fine)
+    ed = unit_index(I, d)
+    odd = isodd(I[d])
+    # coarse index of the cell-shaped (transverse) position, face along d
+    Jc = CartesianIndex(ntuple(k -> k == d ? (odd ? (I[k] + 1) ÷ 2 : I[k] ÷ 2) : (I[k] + 1) ÷ 2, Val(D)))
+    nb = ntuple(k -> neighbor_face(k, d, I, Jc, size(coarse, k), periodic, sds, top_cnv, bot_cnv),
+                Val(D))
+    along(J) = odd ? coarse[J] : T(0.5) * (coarse[J] + coarse[J + ed])
+    offs = CartesianIndices(ntuple(k -> k == d ? (0:0) : (0:1), Val(D)))
+    acc = zero(T)
+    for o in offs
+        w = one(T);  idx = Jc
+        for k in 1:D
+            k == d && continue
+            if o[k] == 1
+                w *= T(0.25) * nb[k][2];  idx = replace_index(idx, k, nb[k][1])
+            else
+                w *= T(0.75)
             end
-            acc += w * along(idx)
         end
-        fine[I] = acc
+        acc += w * along(idx)
     end
+    fine[I] = acc
 end
 
 """

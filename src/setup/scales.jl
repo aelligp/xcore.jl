@@ -57,99 +57,85 @@ struct Scales{T<:AbstractFloat}
 end
 
 """
-    compute_scales(par::Parameters{T}, grid::Grid{T}; tol=1e-9, maxiter=200) -> Scales{T}
+    compute_scales(par::Parameters{T}, grid::Grid{T}) -> Scales{T}
 
-Solve the coupled `(W0, w0)` fixed point with Re-dependent drag, then derive all
-secondary scales. The iteration uses the closed-form quadratic solution from
-`scales.m` (lines 47–50) at every step. Converges in a handful of iterations for
-all parameter ranges we care about.
+Solve the coupled `(W0, w0)` fixed point with Re-dependent drag (scales.m
+lines 47-50), then derive all secondary scales.
 
-Float32 note: the MATLAB code uses `vpa` (24-digit variable precision) inside the
-loop to avoid cancellation near `eta0`-dominated limits. We don't have vpa in Julia
-stdlib, so for `T == Float32` we do the iteration in Float64 internally and narrow
-at the end. This costs nothing and avoids a class of stagnation bugs.
+The computation runs in `Float64` for every `T` and the result is narrowed to
+`T` at the end. MATLAB uses `vpa` (24 digits) inside the loop to avoid
+cancellation near the `eta0`-dominated limit; `Float64` plays that role here.
 """
-function compute_scales(par::Parameters{T}, grid::Grid{T};
-                        tol::Real = 1e-9, maxiter::Int = 200) where {T<:AbstractFloat}
-    # promote iteration to Float64 for numerical safety, narrow result at end
-    s = _compute_scales_inner(Float64(par.D), Float64(par.d0), Float64(par.L0),
-                              Float64(par.l0), Float64(par.x0), Float64(par.Da),
-                              Float64(par.rhom0), Float64(par.rhox0),
-                              Float64(par.etam0), Float64(par.g0),
-                              Float64(par.Xi), Float64(grid.h),
-                              Float64(tol), maxiter)
-    return _narrow_scales(s, T)
+function compute_scales(par::Parameters{T}, grid::Grid{T}) where {T<:AbstractFloat}
+    s = compute_scales_inner(map(Float64, (par.D, par.d0, par.L0, par.l0, par.x0, par.Da,
+                                           par.rhom0, par.rhox0, par.etam0, par.g0,
+                                           par.Xi, grid.h))...)
+    return Scales{T}((T(getfield(s, f)) for f in fieldnames(Scales))...)
 end
 
-# returns a NamedTuple of Float64 scales; narrowing happens in compute_scales
-function _compute_scales_inner(D, d0, L0_in, l0_in, x0, Da, rhom0, rhox0,
-                               etam0, g0, Xi, h, tol, maxiter)
-    # length scales
-    h0    = h
-    D0    = D / 10
-    L0    = L0_in;  L0h = (L0 + h0) / 2
-    l0    = l0_in;  l0h = (l0 + h0) / 2
-    bnd_w = l0/2 + D/100
-
-    # material scales
-    rho0  = rhom0
-    Drho0 = rhox0 - rhom0
-    if Da > 0
-        chi0  = Da
-        Dchi0 = Da / 10
-    else
-        chi0  = x0
-        Dchi0 = x0 / 10
-    end
-    eta0 = etam0
-
-    # initial guesses: laminar speeds
-    W0l = Dchi0 * Drho0 * g0 * D0^2 / eta0
-    w0l =          Drho0 * g0 * d0^2 / eta0
-
-    w0t = sqrt(       Drho0 * g0 * d0^2 / (l0  * rho0))
-    W0t = sqrt(Dchi0 * Drho0 * g0 * D0^3 / (L0^2 * rho0))
-    W0i = sqrt(Dchi0 * Drho0 * g0 * D    /          rho0)
-    Ri0 = W0i / W0t
-
+# Fixed point of the drag-limited speeds `(W0, w0)`, started from the laminar
+# speeds. Returns the converged speeds with the ramp factors `fReL0`, `fRel0`
+# and Reynolds numbers `ReL0`, `Rel0` evaluated at the last iterate.
+function solve_speeds(W0l, w0l, Ri0, L0, l0, D0, d0, Dchi0, Drho0, rho0, eta0, g0)
+    tol     = 1e-9
+    maxiter = 200
     W0 = W0l
     w0 = w0l
-    ReL0 = W0 * L0 / (eta0 / rho0)
-    Rel0 = w0 * l0 / (eta0 / rho0)
-    # -expm1(-Re) == 1 - exp(-Re) without the cancellation: the closed-form W0/w0
-    # below divide by the ramp factor, so a factor that rounds to 0 at small Re
-    # turns the whole scale set into NaN.
-    fReL0 = -expm1(-ReL0)
-    fRel0 = -expm1(-Rel0)
-
-    converged = false
     res = Inf
+    ReL0 = Rel0 = fReL0 = fRel0 = NaN
     for _ in 1:maxiter
         W0prv = W0; w0prv = w0
         ReL0  = W0 * L0 / (eta0 / rho0)
         Rel0  = w0 * l0 / (eta0 / rho0)
+        # -expm1(-Re) == 1 - exp(-Re) without cancellation: the closed-form
+        # speeds below divide by the ramp factor, so a factor that rounds to 0
+        # at small Re would turn the whole scale set into NaN.
         fReL0 = -expm1(-ReL0)
         fRel0 = -expm1(-Rel0)
-        # Closed-form quadratic solution for the drag-limited speeds (scales.m
-        # lines 47-50), written via the exact identity
-        # √(A+η²) − η = A/(√(A+η²) + η). Dividing by the sum rather than
-        # subtracting is required, not cosmetic: A ≪ η² in the drag-free limit
-        # (Δχ → 0 at Da = 0), where the difference rounds to exactly zero and the
-        # ramp factor it would be divided by is itself ~0. In this form the ramp
-        # factor cancels analytically, so that limit returns the laminar speed.
+        # Closed-form quadratic solution (scales.m lines 47-50), written via the
+        # exact identity √(A+η²) − η = A/(√(A+η²) + η). Dividing by the sum
+        # rather than subtracting is required: A ≪ η² in the drag-free limit
+        # (Δχ → 0 at Da = 0), where the difference rounds to exactly zero and
+        # the ramp factor it would be divided by is itself ~0. In this form the
+        # ramp factor cancels analytically, so that limit returns the laminar
+        # speed.
         A_W = 4 / Ri0^2 * Dchi0 * Drho0 * g0 * rho0 * fReL0 * L0^2 * D0
         A_w = 4         * Drho0 * g0 * rho0 * fRel0 * l0   * d0^2
         W0 = 2 * Dchi0 * Drho0 * g0 * D0^2 / (sqrt(A_W + eta0^2) + eta0)
         w0 = 2         * Drho0 * g0 * d0^2 / (sqrt(A_w + eta0^2) + eta0)
         res = abs(W0 - W0prv)/W0 + abs(w0 - w0prv)/w0
-        if res <= tol
-            converged = true
-            break
-        end
+        res <= tol && return (; W0, w0, ReL0, Rel0, fReL0, fRel0)
     end
-    converged || error(
-        "compute_scales: the (W0, w0) fixed point did not reach tol=$tol in " *
-        "$maxiter iterations (last residual $res, W0=$W0, w0=$w0)")
+    error("compute_scales: the (W0, w0) fixed point did not reach tol=$tol in " *
+          "$maxiter iterations (last residual $res, W0=$W0, w0=$w0)")
+end
+
+# All scales as a NamedTuple of Float64 values, ordered like the fields of `Scales`.
+function compute_scales_inner(D, d0, L0, l0, x0, Da, rhom0, rhox0, etam0, g0, Xi, h)
+    # length scales
+    h0    = h
+    D0    = D / 10
+    L0h   = (L0 + h0) / 2
+    l0h   = (l0 + h0) / 2
+    bnd_w = l0/2 + D/100
+
+    # material scales
+    rho0  = rhom0
+    Drho0 = rhox0 - rhom0
+    chi0  = Da > 0 ? Da : x0
+    Dchi0 = chi0 / 10
+    eta0  = etam0
+
+    # laminar, turbulent and inertial speeds
+    W0l = Dchi0 * Drho0 * g0 * D0^2 / eta0
+    w0l =         Drho0 * g0 * d0^2 / eta0
+    w0t = sqrt(       Drho0 * g0 * d0^2 / (l0  * rho0))
+    W0t = sqrt(Dchi0 * Drho0 * g0 * D0^3 / (L0^2 * rho0))
+    W0i = sqrt(Dchi0 * Drho0 * g0 * D    /          rho0)
+    Ri0 = W0i / W0t
+
+    (; W0, w0, ReL0, Rel0, fReL0, fRel0) =
+        solve_speeds(W0l, w0l, Ri0, L0, l0, D0, d0, Dchi0, Drho0, rho0, eta0, g0)
 
     # diffusivities
     eII0 = W0 / D0
@@ -199,36 +185,6 @@ function _compute_scales_inner(D, d0, L0_in, l0_in, x0, Da, rhom0, rhox0,
             taue0, taus0, St0, xie0, xix0, xis0,
             G0, etae0, etat0, p0,
             Noe0, Nox0, Nos0, Rc0, Ra0, ReD0, Red0)
-end
-
-# narrow Float64 NamedTuple into Scales{T}
-function _narrow_scales(s::NamedTuple, ::Type{T}) where {T<:AbstractFloat}
-    return Scales{T}(
-        T(s.h0), T(s.D0), T(s.d0),
-        T(s.L0), T(s.L0h),
-        T(s.l0), T(s.l0h),
-        T(s.bnd_w),
-        T(s.rho0), T(s.Drho0),
-        T(s.chi0), T(s.Dchi0),
-        T(s.eta0),
-        T(s.W0), T(s.w0),
-        T(s.W0l), T(s.w0l),
-        T(s.W0t), T(s.w0t),
-        T(s.W0i),
-        T(s.Ri0),
-        T(s.ReL0), T(s.Rel0),
-        T(s.fReL0), T(s.fRel0),
-        T(s.eII0), T(s.ke0), T(s.ks0), T(s.kx0),
-        T(s.tW0), T(s.tw0), T(s.tk0), T(s.ti0), T(s.txi0),
-        T(s.t0), T(s.dt0),
-        T(s.taue0), T(s.taus0), T(s.St0),
-        T(s.xie0), T(s.xix0), T(s.xis0),
-        T(s.G0),
-        T(s.etae0), T(s.etat0), T(s.p0),
-        T(s.Noe0), T(s.Nox0), T(s.Nos0),
-        T(s.Rc0), T(s.Ra0),
-        T(s.ReD0), T(s.Red0),
-    )
 end
 
 """

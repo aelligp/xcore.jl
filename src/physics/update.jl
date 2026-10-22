@@ -1,71 +1,61 @@
 using KernelAbstractions
 using Statistics
 
-# Port of src/update.m. Splits the monolithic MATLAB script into focused KA
-# kernels so each piece is independently testable and so per-cell work stays
-# branch-free. The orchestrator `update!` runs them in the same order as
-# update.m.
+# Port of src/update.m, split into one function per block of the MATLAB script;
+# `update!` runs them in the order of update.m. Per-cell work is done by
+# KernelAbstractions kernels, index shuffling by broadcasts and `face_mean!`.
 #
 # Every function works for 2-D and 3-D states (`PhaseState{T,D}`), axes ordered
 # (z, x[, y]). Per-axis and per-edge-pair fields are reached as tuples
 # (`per_axis`, `per_pair`, `axis_pairs`); sums over the diagonal components run
-# horizontal axes first, then z. The phase velocities (`Wx`, `Ux`, `Wm`, `Um`, ...)
-# are set by `update_phase_velocities!` and the noise by `noise!`.
+# horizontal axes first, then z.
 
 # ----------------------------------------------------------------------------
 # volume fractions, bulk density, mass densities, phase indicators
 # ----------------------------------------------------------------------------
 
 @kernel function compute_volfrac_kernel!(rho, chi, mu, hasx, hasm,
-                                  @Const(x), @Const(m), rhom0, rhox0, eps_t, one_meps)
+                                         @Const(x), @Const(m), rhom0, rhox0, eps_t, one_meps)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        x_c = x[I];  m_c = m[I]
-        # bulk density from harmonic-mean mixing of phase densities
-        rho_c = one(eps_t) / (m_c / rhom0 + x_c / rhox0)
-        rho[I] = rho_c
-        # volume fractions, clamped to [eps, 1-eps]
-        chi_raw = x_c * rho_c / rhox0
-        mu_raw  = m_c * rho_c / rhom0
-        chi[I] = clamp(chi_raw, eps_t, one_meps)
-        mu[I] = clamp(mu_raw,  eps_t, one_meps)
-        # phase presence indicators (≥ √ε to match update.m)
-        hasx[I] = x_c >= sqrt(eps_t)
-        hasm[I] = m_c >= sqrt(eps_t)
-    end
+    x_c = x[I];  m_c = m[I]
+    # bulk density: harmonic mean of the phase densities
+    rho_c = one(eps_t) / (m_c / rhom0 + x_c / rhox0)
+    rho[I] = rho_c
+    # volume fractions, kept inside [eps, 1-eps] so powers and ratios stay finite
+    chi[I] = clamp(x_c * rho_c / rhox0, eps_t, one_meps)
+    mu[I]  = clamp(m_c * rho_c / rhom0, eps_t, one_meps)
+    # phase presence indicators
+    hasx[I] = x_c >= sqrt(eps_t)
+    hasm[I] = m_c >= sqrt(eps_t)
 end
 
 """
     update_volume_fractions!(phase, fluid, par) -> nothing
 
-Compute `chi`, `mu`, `rho`, `hasx`, `hasm` from primary `x`, `m` fields.
-Mirrors lines 5–35 of `src/update.m`. **Does not touch `X` or `M`** —
-those are the advected phase densities, owned and updated by `phsevo!`.
-Recomputing them here breaks the Picard iteration's WENO5 reconstruction
-because it injects the new `rho` into the field WENO5 sees on the next
-sweep, producing spot-wise undershoots at sharp fronts.
+Compute `chi`, `mu`, `rho`, `hasx`, `hasm` from the primary fields `x`, `m`.
+Mirrors lines 5–35 of `src/update.m`. Does not touch `X` or `M`: those are the
+advected phase densities, owned by `phsevo!`; overwriting them with the new
+`rho` would feed spot-wise undershoots at sharp fronts into the next WENO5
+reconstruction.
 """
 function update_volume_fractions!(phase::PhaseState{T}, fluid::FluidState{T},
                                   par::Parameters{T}) where {T<:AbstractFloat}
     backend = KernelAbstractions.get_backend(phase.x)
     compute_volfrac_kernel!(backend)(fluid.rho, phase.chi, phase.mu,
-                                        phase.hasx, phase.hasm,
-                                        phase.x, phase.m,
-                                        par.rhom0, par.rhox0,
-                                        eps(T), one(T) - eps(T);
-                                        ndrange = size(phase.x))
+                                     phase.hasx, phase.hasm,
+                                     phase.x, phase.m, par.rhom0, par.rhox0,
+                                     eps(T), one(T) - eps(T);
+                                     ndrange = size(phase.x))
     KernelAbstractions.synchronize(backend)
     return nothing
 end
 
 # ----------------------------------------------------------------------------
-# face/corner interpolations of densities and volume fractions
-# Done with broadcasting + ghost-index views so it stays simple — these are
-# index-shuffle operations, no per-cell math worth dedicated kernels.
+# face interpolations of densities and fractions (update.m lines 11-48)
 # ----------------------------------------------------------------------------
 
 """
-    update_interpolations!(phase, fluid, grid, par; xBC=:periodic, yBC=:periodic, zBC=:closed) -> nothing
+    update_interpolations!(phase, fluid, par; xBC=:periodic, yBC=:periodic, zBC=:closed) -> nothing
 
 Compute face-averaged densities (`rhow`, `rhou`[, `rhov`]) and the density
 anomaly `Drho` (`rhow` minus its horizontal mean), density contrasts (`Drhom`,
@@ -74,7 +64,7 @@ fractions (compact faces). Mirrors lines 11–48 of `src/update.m`. Default BCs
 match `init.m`; `yBC` is read only in 3-D.
 """
 function update_interpolations!(phase::PhaseState{T, D}, fluid::FluidState{T, D},
-                                grid::Grid{T, D}, par::Parameters{T};
+                                par::Parameters{T};
                                 xBC::Symbol = :periodic, yBC::Symbol = :periodic,
                                 zBC::Symbol = :closed) where {T<:AbstractFloat, D}
     periodic = periodic_axes("update_interpolations!", Val(D), xBC, yBC, zBC)
@@ -94,8 +84,8 @@ function update_interpolations!(phase::PhaseState{T, D}, fluid::FluidState{T, D}
     # density anomaly: rhow minus its mean over the horizontal axes
     fluid.Drho .= fluid.rhow .- mean(fluid.rhow, dims = horizontal_dims(Val(D)))
 
-    # density contrasts (phase density minus face-interpolated bulk) — drive
-    # the segregation speed in update_phase_velocities!
+    # density contrasts (phase density minus face-interpolated bulk) drive the
+    # segregation speed
     @. phase.Drhom = par.rhom0 - fluid.rhow
     @. phase.Drhox = par.rhox0 - fluid.rhow
     return nothing
@@ -111,38 +101,33 @@ horizontal_dims(::Val{D}) where {D} = ntuple(k -> k + 1, Val(D - 1))
 """
     update_pressure!(phase, fluid, grid, par) -> nothing
 
-Set `Pl` from the cumulative weight of the horizontal mean of `rhow`, then `Pt = max(Ptop/100,
-Pl + P_dyn)` using the interior of the dynamic pressure array `fluid.P`.
+Set `Pl` from the cumulative weight of the horizontal mean of `rhow`, then
+`Pt = max(Ptop/100, Pl + P_dyn)` with `P_dyn` the interior of `fluid.P`.
 """
 function update_pressure!(phase::PhaseState{T, D}, fluid::FluidState{T, D},
                           grid::Grid{T, D}, par::Parameters{T}) where {T<:AbstractFloat, D}
     Nz = grid.ni[1];  h = grid.h
-    # column build of Pl: top cell uses rhoref[1]·g·h/2, then the cumulative
-    # rhoref[2:Nz]·g·h. The horizontal-mean reduction of rhow runs on-device; the
-    # length-(Nz+1) column is then pulled to the host for the inherently
-    # sequential prefix sum (a single tiny vector — negligible vs the Stokes
-    # solve) and copied back. This avoids relying on a device 1-D scan
-    # (`cumsum`/`accumulate`), which not every KernelAbstractions backend
-    # implements, keeping the path portable across CPU/CUDA/AMD/Metal.
-    rhoref = Array(vec(mean(fluid.rhow, dims = horizontal_dims(Val(D)))))   # host, length Nz+1
+    # Pl[1] = Ptop + rhoref[1]·g·h/2, then Pl[j] = Pl[j-1] + rhoref[j]·g·h. The
+    # horizontal mean of rhow is reduced on the device; the short column is
+    # summed sequentially on the host, because not every KernelAbstractions
+    # backend implements a device scan (`cumsum`).
+    rhoref = Array(vec(mean(fluid.rhow, dims = horizontal_dims(Val(D)))))   # length Nz+1
     gh = par.g0 * h
     Pl_h = Vector{T}(undef, Nz)
     Pl_h[1] = rhoref[1] * gh / T(2) + par.Ptop
-    @inbounds for j in 2:Nz
+    for j in 2:Nz
         Pl_h[j] = Pl_h[j - 1] + rhoref[j] * gh
     end
-    Pl_d = similar(fluid.rhow, Nz)                            # device vector
-    copyto!(Pl_d, Pl_h)
+    Pl_d = copyto!(similar(fluid.rhow, Nz), Pl_h)
     phase.Pl .= reshape(Pl_d, Nz, ntuple(_ -> 1, Val(D - 1))...)
-    floor_p = par.Ptop / T(100)
-    phase.Pt .= max.(floor_p, phase.Pl .+ interior(fluid.P))
+    P_floor = par.Ptop / T(100)
+    phase.Pt .= max.(P_floor, phase.Pl .+ interior(fluid.P))
     return nothing
 end
 
 # ----------------------------------------------------------------------------
 # permission weights + mixture viscosity (update.m lines 55–71)
-# Per-cell scalar kernel. AA, BB, CC are 2x2 rheology parameter matrices
-# passed by value (KA copies the small array to each work item on CPU).
+# The 2x2 rheology matrices AA, BB, CC are passed as scalars.
 # ----------------------------------------------------------------------------
 
 @kernel function compute_rheology_kernel!(etamix, @Const(chi), @Const(mu),
@@ -151,33 +136,28 @@ end
                                    CC11, CC12, CC21, CC22,
                                    etax0, etam0)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        f1 = chi[I];  f2 = mu[I]
+    f1 = chi[I];  f2 = mu[I]
 
-        # Sf[i, j] = (f_j / BB[i,j])^(1/CC[i,j]), normalised so Σ_j Sf[i,j] = 1
-        s11 = (f1 / BB11)^(one(etax0) / CC11);  s12 = (f2 / BB12)^(one(etax0) / CC12)
-        s21 = (f1 / BB21)^(one(etax0) / CC21);  s22 = (f2 / BB22)^(one(etax0) / CC22)
-        n1 = s11 + s12
-        n2 = s21 + s22
-        Sf11 = s11 / n1;  Sf12 = s12 / n1
-        Sf21 = s21 / n2;  Sf22 = s22 / n2
+    # Sf[i, j] = (f_j / BB[i,j])^(1/CC[i,j]), normalized so Σ_j Sf[i,j] = 1
+    s11 = (f1 / BB11)^(one(etax0) / CC11);  s12 = (f2 / BB12)^(one(etax0) / CC12)
+    s21 = (f1 / BB21)^(one(etax0) / CC21);  s22 = (f2 / BB22)^(one(etax0) / CC22)
+    n1 = s11 + s12
+    n2 = s21 + s22
+    Sf11 = s11 / n1;  Sf12 = s12 / n1
+    Sf21 = s21 / n2;  Sf22 = s22 / n2
 
-        # Xf[i, j] = α_i * f_j + (1 - α_i) * Sf[i, j], with α_i = Σ_k AA[i,k] Sf[i,k]
-        a1 = AA11 * Sf11 + AA12 * Sf12
-        a2 = AA21 * Sf21 + AA22 * Sf22
-        Xf11 = a1 * f1 + (one(etax0) - a1) * Sf11
-        Xf12 = a1 * f2 + (one(etax0) - a1) * Sf12
-        Xf21 = a2 * f1 + (one(etax0) - a2) * Sf21
-        Xf22 = a2 * f2 + (one(etax0) - a2) * Sf22
+    # Xf[i, j] = α_i * f_j + (1 - α_i) * Sf[i, j], with α_i = Σ_k AA[i,k] Sf[i,k]
+    a1 = AA11 * Sf11 + AA12 * Sf12
+    a2 = AA21 * Sf21 + AA22 * Sf22
+    Xf11 = a1 * f1 + (one(etax0) - a1) * Sf11
+    Xf12 = a1 * f2 + (one(etax0) - a1) * Sf12
+    Xf21 = a2 * f1 + (one(etax0) - a2) * Sf21
+    Xf22 = a2 * f2 + (one(etax0) - a2) * Sf22
 
-        # thtv[i] = Π_j (η_j / η_i)^Xf[i,j]; etaf[i] = η_i · thtv[i] (= geometric mean of η_j^Xf)
-        thtv1 = (etax0 / etax0)^Xf11 * (etam0 / etax0)^Xf12
-        thtv2 = (etax0 / etam0)^Xf21 * (etam0 / etam0)^Xf22
-        etaf1 = etax0 * thtv1
-        etaf2 = etam0 * thtv2
-
-        etamix[I] = f1 * etaf1 + f2 * etaf2
-    end
+    # thtv[i] = Π_j (η_j / η_i)^Xf[i,j]; etaf[i] = η_i · thtv[i] (= geometric mean of η_j^Xf)
+    thtv1 = (etax0 / etax0)^Xf11 * (etam0 / etax0)^Xf12
+    thtv2 = (etax0 / etam0)^Xf21 * (etam0 / etam0)^Xf22
+    etamix[I] = f1 * (etax0 * thtv1) + f2 * (etam0 * thtv2)
 end
 
 """
@@ -190,11 +170,11 @@ function update_rheology!(phase::PhaseState{T}, par::Parameters{T}) where {T<:Ab
     backend = KernelAbstractions.get_backend(phase.etamix)
     AA = par.AA;  BB = par.BB;  CC = par.CC
     compute_rheology_kernel!(backend)(phase.etamix, phase.chi, phase.mu,
-                                         AA[1,1], AA[1,2], AA[2,1], AA[2,2],
-                                         BB[1,1], BB[1,2], BB[2,1], BB[2,2],
-                                         CC[1,1], CC[1,2], CC[2,1], CC[2,2],
-                                         par.etax0, par.etam0;
-                                         ndrange = size(phase.etamix))
+                                     AA[1,1], AA[1,2], AA[2,1], AA[2,2],
+                                     BB[1,1], BB[1,2], BB[2,1], BB[2,2],
+                                     CC[1,1], CC[1,2], CC[2,1], CC[2,2],
+                                     par.etax0, par.etam0;
+                                     ndrange = size(phase.etamix))
     KernelAbstractions.synchronize(backend)
     return nothing
 end
@@ -255,13 +235,13 @@ end
     V[c] = sqrt(tuple_foldl(+, first(vsq), Base.tail(vsq)))
 end
 
+# cell-centered magnitude of the segregation speeds `wx`, `wm` from the two
+# flanking (ghosted) z-faces, offset by eps to stay strictly positive
 @kernel function compute_segspeed_kernel!(vx, vm, @Const(wx), @Const(wm), eps_t)
-    # cell-centered magnitude from the two flanking z-face segregation speeds
-    # (wx, wm on ghosted z-faces)
     c = @index(Global, Cartesian)
     lo = c + oneunit(c) - unit_index(c, 1);  hi = c + oneunit(c)
-    vx[c] = sqrt(((wx[lo] + wx[hi]) / 2)^2) + eps_t
-    vm[c] = sqrt(((wm[lo] + wm[hi]) / 2)^2) + eps_t
+    vx[c] = abs((wx[lo] + wx[hi]) / 2) + eps_t
+    vm[c] = abs((wm[lo] + wm[hi]) / 2) + eps_t
 end
 
 # diagonal and off-diagonal strain-rate and stress components as tuples
@@ -281,7 +261,7 @@ Mirrors lines 73–104 of `src/update.m`.
 function update_kinematics!(phase::PhaseState{T, D}, fluid::FluidState{T, D},
                             grid::Grid{T, D}) where {T<:AbstractFloat, D}
     backend = KernelAbstractions.get_backend(phase.eII)
-    invh = T(inv(grid.h))
+    invh = inv(grid.h)
     v = velocity(fluid)
     ediag = strain_diag(phase);  eshear = strain_shear(phase)
     compute_strain_kernel!(backend)(ediag, phase.Div_V, v, invh; ndrange = size(phase.Div_V))
@@ -300,19 +280,29 @@ end
 # diffusivities + viscosity blend  (update.m lines 106–134)
 # ----------------------------------------------------------------------------
 
-# The ramp factor fReL is the one left by the previous update (update.m:108-111
-# use it before update.m:147 refreshes it); `update!` refreshes it last.
+# fReL is the ramp factor left by the previous update (update.m:108-111 use it
+# before update.m:147 refreshes it); `update!` refreshes it last.
 @kernel function compute_viscblend_kernel!(etae, ke, @Const(fReL), @Const(eII), @Const(rho), L0)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        ke_c = eII[I] * L0 * L0
-        etae[I] = fReL[I] * ke_c * rho[I]
-        ke[I]   = ke_c
-    end
+    ke_c = eII[I] * L0 * L0
+    etae[I] = fReL[I] * ke_c * rho[I]
+    ke[I]   = ke_c
+end
+
+# Relax `eta` toward `etamix + extra`, whose contrast is capped at
+# `min(etamix + extra) * etacntr` by a harmonic blend (update.m:118-127):
+# eta = w·cap(etamix + extra) + (1 - w)·eta.
+function relax_capped!(eta, etamix, extra, etacntr, w)
+    T = eltype(eta)
+    total = Broadcast.instantiate(Broadcast.broadcasted(+, etamix, extra))
+    emax = minimum(total) * T(etacntr)
+    w = T(w)
+    @. eta = w * (T(1) / (T(1) / emax + T(1) / (etamix + extra))) + (T(1) - w) * eta
+    return eta
 end
 
 """
-    update_viscosity!(phase, fluid, grid, par, scales; xBC=:periodic, yBC=:periodic,
+    update_viscosity!(phase, fluid, par, scales; xBC=:periodic, yBC=:periodic,
                       zBC=:closed, relaxation = 1//2) -> nothing
 
 Blend `etamix + etae` into `eta` by the linear continuation
@@ -326,7 +316,7 @@ DYREL iteration is applied many times per solve and needs a proportionally
 smaller one.
 """
 function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
-                           grid::Grid{T}, par::Parameters{T},
+                           par::Parameters{T},
                            scales::Scales{T};
                            xBC::Symbol = :periodic, yBC::Symbol = :periodic,
                            zBC::Symbol = :closed,
@@ -336,21 +326,13 @@ function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
                                        scales.L0; ndrange = size(fluid.eta))
     KernelAbstractions.synchronize(backend)
 
-    # etai = etamix + etae; contrast cap etamax = min(etai)·etacntr by harmonic
-    # blend (update.m:118-120), then linear continuation against the previous
-    # iterate (update.m:126)
-    etai = Broadcast.instantiate(Broadcast.broadcasted(+, phase.etamix, phase.etae))
-    emax = minimum(etai) * T(par.etacntr)
-    blend_w = T(relaxation)
-    @. fluid.eta = blend_w * (T(1) / (T(1) / emax + T(1) / (phase.etamix + phase.etae))) +
-                   (T(1) - blend_w) * fluid.eta
-    # ReD uses the capped+blended eta
+    relax_capped!(fluid.eta, phase.etamix, phase.etae, par.etacntr, relaxation)
+    # ReD uses the capped and blended eta
     @. phase.ReD = phase.V * scales.D0 / (fluid.eta / fluid.rho)
 
-    # edge viscosities from the geometric mean over the 4 surrounding cells
-    # (matches update.m line 130). The ghost extension must match the one
-    # `update_interpolations!` uses for the face densities: wrapping the x-ghost of
-    # a walled domain averages in the viscosity of the opposite wall.
+    # Edge viscosities (update.m:130). The ghost extension must match the one
+    # `update_interpolations!` uses for the face densities: wrapping the x-ghost
+    # of a walled domain would average in the viscosity of the opposite wall.
     update_edge_viscosity!(fluid; xBC, yBC, zBC)
     return nothing
 end
@@ -360,16 +342,14 @@ end
                                           @Const(vx), @Const(V), @Const(rho), @Const(ke),
                                           @Const(fReL), @Const(fRel), l0)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        vx_c = vx[I]
-        # particle diffusivity from segregation speed; combined diffusivity
-        ks_c = vx_c * l0
-        ks[I] = ks_c
-        # turbulent drag viscosity contribution
-        etat[I] = fRel[I] * ks_c * rho[I]
-        kx[I] = ks_c + fReL[I] * ke[I]
-        Rc[I] = V[I] / vx_c
-    end
+    vx_c = vx[I]
+    # particle diffusivity from segregation speed; combined diffusivity
+    ks_c = vx_c * l0
+    ks[I] = ks_c
+    # turbulent drag viscosity contribution
+    etat[I] = fRel[I] * ks_c * rho[I]
+    kx[I] = ks_c + fReL[I] * ke[I]
+    Rc[I] = V[I] / vx_c
 end
 
 """
@@ -393,15 +373,9 @@ function update_segregation_viscosity!(phase::PhaseState{T, D}, fluid::FluidStat
                                      ndrange = size(phase.etas))
     KernelAbstractions.synchronize(backend)
 
-    # etasi = etamix + etat; contrast cap etamax = min(etasi)·etacntr
-    # (update.m:122-123), then Picard relaxation against the previous etas
-    # (update.m:127)
-    etasi = Broadcast.instantiate(Broadcast.broadcasted(+, phase.etamix, phase.etat))
-    emax = minimum(etasi) * T(par.etacntr)
-    blend_w = T(0.5)
-    @. phase.etas = blend_w * (T(1) / (T(1) / emax + T(1) / (phase.etamix + phase.etat))) +
-                    (T(1) - blend_w) * phase.etas
-    # Red uses the capped+blended etas
+    # fixed 50/50 Picard relaxation (update.m:122-123, 127)
+    relax_capped!(phase.etas, phase.etamix, phase.etat, par.etacntr, 1//2)
+    # Red uses the capped and blended etas
     @. phase.Red = phase.vx * par.d0 / (phase.etas / fluid.rho)
 
     # etasw: geometric mean of etas across the compact z-faces
@@ -441,14 +415,14 @@ end
 end
 
 """
-    update_stresses!(phase, fluid, grid, scales) -> nothing
+    update_stresses!(phase, fluid, scales) -> nothing
 
 Compute the deviatoric stresses (diagonal at cells with `eta`, shear on edges
 with the edge viscosities), the cell-center stress invariant `tII`, and the
 Rayleigh number `Ra = V D0 / kx`.
 """
 function update_stresses!(phase::PhaseState{T, D}, fluid::FluidState{T, D},
-                          grid::Grid{T, D}, scales::Scales{T}) where {T<:AbstractFloat, D}
+                          scales::Scales{T}) where {T<:AbstractFloat, D}
     backend = KernelAbstractions.get_backend(phase.txx)
     tshear = stress_shear(phase)
     for (t, η, e) in zip(tshear, edge_viscosity(fluid), strain_shear(phase))
@@ -466,7 +440,7 @@ end
 # ----------------------------------------------------------------------------
 
 """
-    update_dt(phase, fluid, grid, par, dt_prev; dtmax = par.dtmax) -> T
+    update_dt(phase, grid, par, dt_prev) -> T
 
 CFL-limited time step from the current `kx` and the **phase** velocities
 (`Wx`, `Ux`[, `Vx`] and `Wm`, `Um`[, `Vm`]). Matches `update.m` line 162 exactly:
@@ -475,7 +449,7 @@ CFL-limited time step from the current `kx` and the **phase** velocities
 The phase velocities, not the bulk `(W, U)`, are what advect `X`/`M`; they
 include segregation (`wx`, `wm`) and noise (`ξ`).
 """
-function update_dt(phase::PhaseState{T, D}, fluid::FluidState{T, D}, grid::Grid{T, D},
+function update_dt(phase::PhaseState{T, D}, grid::Grid{T, D},
                    par::Parameters{T}, dt_prev::Real) where {T<:AbstractFloat, D}
     h = grid.h
     dtk = (h / T(2))^2 / maximum(phase.kx)
@@ -485,6 +459,18 @@ function update_dt(phase::PhaseState{T, D}, fluid::FluidState{T, D}, grid::Grid{
     vmax = maximum(v -> maximum(vabs, v), vel)
     dta = (h / T(2)) / vmax
     return min(T(1.5) * T(dt_prev), min(dtk, par.CFL * dta), par.dtmax)
+end
+
+# Reynolds numbers on the eddy (L0) and particle (l0) scales and the ramp
+# factors 1 - exp(-Re) that switch on the eddy and particle contributions in the
+# next update (update.m:136-137, 147-148).
+function update_ramp_factors!(phase::PhaseState, fluid::FluidState, scales::Scales)
+    L0 = scales.L0;  l0 = scales.l0
+    @. phase.ReL = phase.V  * L0 / (phase.etamix / fluid.rho)
+    @. phase.Rel = phase.vx * l0 / (phase.etamix / fluid.rho)
+    @. phase.fReL = 1 - exp(-phase.ReL)
+    @. phase.fRel = 1 - exp(-phase.Rel)
+    return nothing
 end
 
 # ----------------------------------------------------------------------------
@@ -504,7 +490,7 @@ Run the full constitutive pipeline:
   6. `update_viscosity!`              — eddy regularization, blended `eta`, edge viscosities, `ReD`
   7. `update_segregation_viscosity!`  — `ks`, `kx`, `etat`, blended `etas`, `etasw`, `Red`, `Rc`
   8. `update_stresses!`               — deviatoric stresses, `tII`, `Ra`
-  9. `ReL`, `Rel` and the ramp factors `fReL`, `fRel` used by the next update
+  9. `update_ramp_factors!`           — `ReL`, `Rel`, `fReL`, `fRel` for the next update
 
 `update_dt` is called separately by `run!`, after `update!` in every sweep.
 """
@@ -513,19 +499,13 @@ function update!(phase::PhaseState{T}, fluid::FluidState{T}, grid::Grid{T},
                  xBC::Symbol = :periodic, yBC::Symbol = :periodic,
                  zBC::Symbol = :closed) where {T<:AbstractFloat}
     update_volume_fractions!(phase, fluid, par)
-    update_interpolations!(phase, fluid, grid, par; xBC, yBC, zBC)
+    update_interpolations!(phase, fluid, par; xBC, yBC, zBC)
     update_pressure!(phase, fluid, grid, par)
     update_rheology!(phase, par)
     update_kinematics!(phase, fluid, grid)
-    update_viscosity!(phase, fluid, grid, par, scales; xBC, yBC, zBC)
+    update_viscosity!(phase, fluid, par, scales; xBC, yBC, zBC)
     update_segregation_viscosity!(phase, fluid, par, scales; xBC, yBC, zBC)
-    update_stresses!(phase, fluid, grid, scales)
-    # Reynolds numbers on the eddy and particle scales and their ramp factors,
-    # used by the next update (update.m:136-137, 147-148)
-    L0 = T(scales.L0);  l0 = T(scales.l0)
-    @. phase.ReL = phase.V  * L0 / (phase.etamix / fluid.rho)
-    @. phase.Rel = phase.vx * l0 / (phase.etamix / fluid.rho)
-    @. phase.fReL = 1 - exp(-phase.ReL)
-    @. phase.fRel = 1 - exp(-phase.Rel)
+    update_stresses!(phase, fluid, scales)
+    update_ramp_factors!(phase, fluid, scales)
     return nothing
 end

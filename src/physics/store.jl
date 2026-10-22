@@ -1,7 +1,6 @@
-# Per-step "store the previous solution" — mirrors src/store.m.
-# In MATLAB this is `[Xoo, Xo] = deal(Xo, X);` for each pair; the equivalent
-# in Julia is a two-step copy that walks `Xo → Xoo` first so we don't clobber
-# the older buffer before snapshotting the newer one.
+# Port of src/store.m, which does `[Xoo, Xo] = deal(Xo, X);` for each pair.
+# Here each pair is copied oldest first (`Xo → Xoo`, then `X → Xo`) so the older
+# buffer is saved before it is overwritten.
 
 """
     store_previous!(fluid::FluidState, phase::PhaseState) -> nothing
@@ -30,7 +29,7 @@ function store_previous!(fluid::FluidState{T}, phase::PhaseState{T}) where {T<:A
 end
 
 """
-    update_segregation_speed!(phase, grid, par; xBC=:periodic, yBC=:periodic) -> nothing
+    update_segregation_speed!(phase, par; xBC=:periodic, yBC=:periodic) -> nothing
 
 Update the terminal segregation speed `wx` (crystal) and corresponding melt
 speed `wm` on the ghosted z-faces. Mirrors lines 348–359 of `src/fluidmech.m`:
@@ -43,8 +42,7 @@ speed `wm` on the ghosted z-faces. Mirrors lines 348–359 of `src/fluidmech.m`:
 `Drhox`, `etasw`, `x_w`, `m_w`, and `bndtaperw` are precomputed by `update!`
 and `initialize!` respectively. `yBC` is read only in 3-D.
 """
-function update_segregation_speed!(phase::PhaseState{T, D}, grid::Grid{T, D},
-                                   par::Parameters{T};
+function update_segregation_speed!(phase::PhaseState{T, D}, par::Parameters{T};
                                    xBC::Symbol = :periodic,
                                    yBC::Symbol = :periodic) where {T<:AbstractFloat, D}
     periodic = periodic_axes("update_segregation_speed!", Val(D), xBC, yBC, :closed)
@@ -78,7 +76,7 @@ end
 end
 
 """
-    update_phase_velocities!(phase, fluid, ns, grid, par; xBC=:periodic, yBC=:periodic,
+    update_phase_velocities!(phase, fluid, ns, par; xBC=:periodic, yBC=:periodic,
                              zBC=:closed) -> nothing
 
 Set the phase velocities from the bulk velocity plus segregation and noise.
@@ -91,11 +89,10 @@ Computes `wx`, `wm` first, then on the ghosted faces of each axis d
 with the segregation speeds `wx`, `wm` on z only. `yBC` is read only in 3-D.
 """
 function update_phase_velocities!(phase::PhaseState{T, D}, fluid::FluidState{T, D},
-                                  ns::NoiseState{T, D},
-                                  grid::Grid{T, D}, par::Parameters{T};
+                                  ns::NoiseState{T, D}, par::Parameters{T};
                                   xBC::Symbol = :periodic, yBC::Symbol = :periodic,
                                   zBC::Symbol = :closed) where {T<:AbstractFloat, D}
-    update_segregation_speed!(phase, grid, par; xBC, yBC)
+    update_segregation_speed!(phase, par; xBC, yBC)
     periodic = periodic_axes("update_phase_velocities!", Val(D), xBC, yBC, zBC)
     backend = KernelAbstractions.get_backend(phase.Wx)
     args = zip(per_axis(Val(D), phase.Wx, phase.Ux, phase.Vx), per_axis(Val(D), phase.Wm, phase.Um, phase.Vm),

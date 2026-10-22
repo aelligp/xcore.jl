@@ -195,21 +195,19 @@ function vcycle!(hier::MGHierarchy{T}, l::Int, par::Parameters, op::StokesOp{D};
     vcycle!(hier, l + 1, par, op; P0, mfs_mean0)
     @timeit_debug TO "L$l prolong + correct" begin
     v = velocity(lvl.fluid);  vc = velocity(cl.fluid)
+    # residual convention b − A·v: the coarse solve returns e ≈ A⁻¹·r, v += γ·e
+    γ = hier.γ_mg
     foreach_axis(Val(D)) do comp
         d = unval(comp)
         prolong_face!(lvl.cache.Rv[d], face_interior(vc[d], d), comp, op)
+        vd = face_interior(v[d], d)
+        @. vd += γ * lvl.cache.Rv[d]
     end
     eP = lvl.cache.R_P
     prolong_cell!(eP, interior(cl.fluid.P), op.periodic)
     # The pressure correction carries the null mode; no velocity component has
     # one (Dirichlet or reflected at z), so only P is made mean-free.
     remove_mean!(eP)
-    # residual convention b − A·v: the coarse solve returns e ≈ A⁻¹·r, v += γ·e
-    γ = hier.γ_mg
-    for d in 1:D
-        vd = face_interior(v[d], d)
-        @. vd += γ * lvl.cache.Rv[d]
-    end
     Pint = interior(lvl.fluid.P)
     @. Pint += γ * eP
     apply_velocity_bcs!(lvl.fluid, lvl.grid, op; mfs_mean, Ddom)

@@ -183,9 +183,9 @@ end
         end
         @test fluid3.rhov ≈ lift(fluid2.rho, Ny + 1) rtol = 1e-14
         @test maximum(abs, phase3.eyy) < 1e-14 && all(iszero, phase3.eyz) && all(iszero, phase3.exy)
-        @test update_dt(phase3, fluid3, grid3, par, 1e6) == update_dt(phase2, fluid2, grid2, par, 1e6)
+        @test update_dt(phase3, grid3, par, 1e6) == update_dt(phase2, grid2, par, 1e6)
         phase3.Vx .= 1e3
-        @test update_dt(phase3, fluid3, grid3, par, 1e6) < update_dt(phase2, fluid2, grid2, par, 1e6)
+        @test update_dt(phase3, grid3, par, 1e6) < update_dt(phase2, grid2, par, 1e6)
     end
 end
 
@@ -242,10 +242,10 @@ end
         for (phase, fluid) in ((phase2, fluid2), (phase3, fluid3))
             phase.X .= phase.x .* fluid.rho;  phase.M .= phase.m .* fluid.rho
         end
-        for (phase, fluid, ns, grid, kw) in ((phase2, fluid2, ns2, grid2, (; xBC)),
-                                             (phase3, fluid3, ns3, grid3, (; xBC, yBC)))
+        for (phase, fluid, ns, kw) in ((phase2, fluid2, ns2, (; xBC)),
+                                       (phase3, fluid3, ns3, (; xBC, yBC)))
             store_previous!(fluid, phase)
-            update_phase_velocities!(phase, fluid, ns, grid, par; kw...)
+            update_phase_velocities!(phase, fluid, ns, par; kw...)
         end
         n2 = phsevo!(phase2, fluid2, grid2, par, scales; xBC, coefs...)
         n3 = phsevo!(phase3, fluid3, grid3, par, scales; xBC, yBC, coefs...)

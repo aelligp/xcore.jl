@@ -8,37 +8,33 @@ using KernelAbstractions
 # e.g. a lazy product `Broadcast.instantiate(Broadcast.broadcasted(*, X, kx))`.
 
 # cell value A[c + m·e_k] under the ghost rule of axis k
-Base.@propagate_inbounds @inline _ghosted(A, c, k, m, periodic) =
+@inline ghosted(A, c, k, m, periodic) =
     A[replace_index(c, k, ghost_index(c[k] + m, length(axes(A, k)), periodic[k]))]
 
-@kernel function _diffus_kernel!(dff, @Const(f), k, periodic, invh2, half)
+@kernel function diffus_kernel!(dff, @Const(f), k, periodic, invh2, half)
     c = @index(Global, Cartesian)
-    @inbounds begin
-        ax = hz_vaxes(Val(length(c)))
-        # face-averaged k times the face gradient on the high and low faces;
-        # the factor 1/2 of the face average is folded into `half * invh2`
-        function flux(a)
-            d = unval(a)
-            fc = f[c];  kc = k[c]
-            hi = (_ghosted(k, c, d, 1, periodic) + kc) * (_ghosted(f, c, d, 1, periodic) - fc)
-            lo = (kc + _ghosted(k, c, d, -1, periodic)) * (fc - _ghosted(f, c, d, -1, periodic))
-            (hi, lo)
-        end
-        q1 = flux(ax[1])
-        acc = tuple_foldl((s, a) -> (q = flux(a); s + q[1] - q[2]), q1[1] - q1[2], Base.tail(ax))
-        dff[c] = half * invh2 * acc
+    ax = hz_vaxes(Val(length(c)))
+    # face-averaged k times the face gradient on the high and low faces;
+    # the factor 1/2 of the face average is folded into `half * invh2`
+    function flux(a)
+        d = unval(a)
+        fc = f[c];  kc = k[c]
+        hi = (ghosted(k, c, d, 1, periodic) + kc) * (ghosted(f, c, d, 1, periodic) - fc)
+        lo = (kc + ghosted(k, c, d, -1, periodic)) * (fc - ghosted(f, c, d, -1, periodic))
+        (hi, lo)
     end
+    q1 = flux(ax[1])
+    acc = tuple_foldl((s, a) -> (q = flux(a); s + q[1] - q[2]), q1[1] - q1[2], Base.tail(ax))
+    dff[c] = half * invh2 * acc
 end
 
 # q: fluxes through the faces normal to `axis`, the face I between cells I − e and I
-@kernel function _diffus_flux_kernel!(q, @Const(f), k, axis, periodic, invh, half)
+@kernel function diffus_flux_kernel!(q, @Const(f), k, axis, periodic, invh, half)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        d = unval(axis)
-        fL = _ghosted(f, I, d, -1, periodic);  fR = _ghosted(f, I, d, 0, periodic)
-        kL = _ghosted(k, I, d, -1, periodic);  kR = _ghosted(k, I, d, 0, periodic)
-        q[I] = -(kL + kR) * half * (fR - fL) * invh
-    end
+    d = unval(axis)
+    fL = ghosted(f, I, d, -1, periodic);  fR = ghosted(f, I, d, 0, periodic)
+    kL = ghosted(k, I, d, -1, periodic);  kR = ghosted(k, I, d, 0, periodic)
+    q[I] = -(kL + kR) * half * (fR - fL) * invh
 end
 
 function diffusion_setup(name, dff, f, k)
@@ -63,7 +59,7 @@ function diffus!(dff::AbstractArray, f::AbstractArray, k, h::Real;
     diffusion_setup("diffus!", dff, f, k)
     periodic = periodic_axes("diffus!", Val(ndims(f)), xBC, yBC, zBC)
     T = eltype(dff);  backend = KernelAbstractions.get_backend(dff)
-    _diffus_kernel!(backend)(dff, f, k, periodic, T(inv(h)^2), T(0.5); ndrange = size(dff))
+    diffus_kernel!(backend)(dff, f, k, periodic, T(inv(h)^2), T(0.5); ndrange = size(dff))
     KernelAbstractions.synchronize(backend)
     return dff
 end
@@ -83,7 +79,7 @@ function diffus_with_flux!(dff::AbstractArray, q::Tuple, f::AbstractArray, k, h:
     T = eltype(dff);  backend = KernelAbstractions.get_backend(dff)
     for d in eachindex(q)
         qd = face_interior(q[d], d)
-        _diffus_flux_kernel!(backend)(qd, f, k, Val(d), periodic, T(inv(h)), T(0.5); ndrange = size(qd))
+        diffus_flux_kernel!(backend)(qd, f, k, Val(d), periodic, T(inv(h)), T(0.5); ndrange = size(qd))
     end
     KernelAbstractions.synchronize(backend)
     fill_face_ghosts!(q, periodic)

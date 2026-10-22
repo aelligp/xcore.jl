@@ -75,7 +75,27 @@ function update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
     return nothing
 end
 
-dims_val(grid) = Val(length(cells(grid)))
+# Multiplier update P += ω·γ_eff·R_P on a refreshed R_P (the last velocity update
+# landed after the last continuity evaluation), Anderson-accelerated when
+# `par.anderson_PH > 0`.
+function multiplier_update!(cache, fluid, grid, op, par, P0arr; bnchm)
+    residual_continuity!(cache, fluid, grid, P0arr, Inf)
+    Pint = interior(fluid.P)
+    if par.anderson_PH > 0
+        # P_num = γ_eff·R_P serves as the update scratch: the next dr = true
+        # residual rebuilds it first.
+        f = cache.P_num
+        f .*= par.pres_relax_PT
+        # The gauge removes the constant mode, so the history must not fit it.
+        bnchm || (f .-= sum(f) / length(f))
+        anderson_pressure_update!(cache.anderson, Pint, f, par.anderson_PH)
+    else
+        @. Pint += par.pres_relax_PT * cache.γ_eff * cache.R_P
+    end
+    bnchm || pressure_gauge!(fluid, P0arr)
+    apply_pressure_bcs!(fluid, op)
+    return nothing
+end
 
 """
     fluidmech_dyrel!(fluid, phase, cache, grid, par, scales;
@@ -88,9 +108,10 @@ dims_val(grid) = Val(length(cells(grid)))
 
 Solve one momentum + continuity system with dynamic relaxation inside a
 Powell-Hestenes iteration, writing the velocity and pressure into `fluid`
-(`FluidState{T,D}`/`Grid{T,D}`, D = 2 or 3; `yBC` is read only in 3-D). Full compressible Navier–Stokes terms: BD2 inertia (`a1, a2, a3` and
-the lagged momentum flux on `fluid`), momentum advection frozen at the entry
-velocity (scheme `par.ADVN`), drunken-sailor stabilization, continuity
+(`FluidState{T,D}`/`Grid{T,D}`, D = 2 or 3; `yBC` is read only in 3-D). The
+system has the full compressible Navier–Stokes terms: BD2 inertia (`a1, a2, a3`
+and the lagged momentum flux on `fluid`), momentum advection frozen at the entry
+velocity (scheme `par.ADVN`), drunken-sailor stabilization, and continuity
 `∇·(ρv) = MFS` with MFS updated once from `phase.advn_rho` (skipped with
 `bnchm`). `dt` must be finite: the drunken-sailor term scales with it.
 
@@ -119,8 +140,8 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
                           verbose::Bool = false) where {D, T}
     isfinite(dt) || throw(ArgumentError(
         "fluidmech_dyrel!: dt must be finite (got $dt); the drunken-sailor term ∂ρ·g0·dt scales with dt"))
-    m_aa = par.anderson_PH
-    m_aa >= 0 || throw(ArgumentError("fluidmech_dyrel!: anderson_PH must be ≥ 0 (got $m_aa)"))
+    par.anderson_PH >= 0 || throw(ArgumentError(
+        "fluidmech_dyrel!: anderson_PH must be ≥ 0 (got $(par.anderson_PH))"))
     par.rheology_in_PT && D != 2 && throw(ArgumentError(
         "fluidmech_dyrel!: rheology_in_PT is implemented for D = 2 only"))
     op = StokesOp(T, Val(D), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
@@ -235,7 +256,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
         itPT = 0
         @timeit_debug TO "DR iterations" while itPT < par.maxit_PT
             itPT += 1;  total_iter += 1
-            # Rv_old feeds only the Rayleigh quotient at the retune iterations
+            # Rv_old feeds only the Rayleigh quotient of the retune iterations.
             if itPT % par.n_tune_PT == 0
                 foreach(copyto!, cache.Rv_old, cache.Rv)
             end
@@ -260,7 +281,7 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
                 # the retune so the preconditioner sees the residual's η.
                 if par.rheology_in_PT
                     update_kinematics!(phase, fluid, grid)
-                    update_viscosity!(phase, fluid, grid, par, scales; xBC, yBC, zBC,
+                    update_viscosity!(phase, fluid, par, scales; xBC, yBC, zBC,
                                       relaxation = par.visc_relax_PT)
                 end
                 @timeit_debug TO "retune (Rayleigh + Gershgorin)" begin
@@ -272,25 +293,8 @@ function fluidmech_dyrel!(fluid, phase, cache::StokesCache{D, T}, grid, par::Par
             end
         end
 
-        # Multiplier update P += ω·γ_eff·R_P on a refreshed R_P (the last velocity
-        # update landed after the last continuity evaluation).
-        @timeit_debug TO "PH multiplier update" begin
-        residual_continuity!(cache, fluid, grid, P0arr, Inf)
-        Pint = interior(fluid.P)
-        if m_aa > 0
-            # P_num = γ_eff·R_P serves as the update scratch: the next dr = true
-            # residual rebuilds it first.
-            f = cache.P_num
-            f .*= par.pres_relax_PT
-            # the gauge removes the constant mode, so the history should not fit it
-            bnchm || (f .-= sum(f) / length(f))
-            anderson_pressure_update!(cache.anderson, Pint, f, m_aa)
-        else
-            @. Pint += par.pres_relax_PT * cache.γ_eff * cache.R_P
-        end
-        bnchm || pressure_gauge!(fluid, P0arr)
-        apply_pressure_bcs!(fluid, op)
-        end
+        @timeit_debug TO "PH multiplier update" multiplier_update!(
+            cache, fluid, grid, op, par, P0arr; bnchm)
         total_iter > par.total_iterMax_PT && break
     end
     cache.γfact = γfact

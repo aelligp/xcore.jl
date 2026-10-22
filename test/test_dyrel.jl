@@ -85,7 +85,7 @@ function _operator_setup(case::Symbol)
     XC.update_edge_viscosity!(fluid; xBC = :closed, zBC = :closed)
     fluid.rho .= [1 + 0.1 * sin(2π * grid.xci[2][i]) * cos(π * grid.xci[1][j])
                   for j in 1:grid.ni[1], i in 1:grid.ni[2]]
-    XC.update_interpolations!(phase, fluid, grid, par; xBC = :closed)
+    XC.update_interpolations!(phase, fluid, par; xBC = :closed)
     return fluid, phase, grid, par, compute_scales(par, grid)
 end
 
@@ -244,7 +244,7 @@ end
         fluid.eta .= [1 + 0.5 * sinpi(2 * i / Nx) * cospi(j / Nz) for j in 1:Nz, i in 1:Nx]
         XC.update_edge_viscosity!(fluid; xBC, zBC = :closed)
         fluid.rho .= [1 + 0.3 * sinpi(2 * (i + 0.3) / Nx) * sinpi(3 * (j + 0.2) / Nz) for j in 1:Nz, i in 1:Nx]
-        XC.update_interpolations!(phase, fluid, grid, par; xBC)
+        XC.update_interpolations!(phase, fluid, par; xBC)
         dyrel = DyrelCache(T, CPU(), grid)
         op = StokesOp(T, Val(2), par; a1 = 1, a2 = 0, a3 = 0, gamma = par.gamma, dt = 1.0e3,
                       xBC, sds, top_cnv = -1, bot_cnv = -1)
@@ -282,7 +282,7 @@ end
         Nz, Nx = grid.ni[1], grid.ni[2]
         fluid.rho .= [hypot((i - 0.5) / Nx - 0.5, (j - 0.5) / Nz - 0.5) < 0.2 ? ratio : 1.0
                       for j in 1:Nz, i in 1:Nx]
-        XC.update_interpolations!(phase, fluid, grid, par; xBC = :periodic)
+        XC.update_interpolations!(phase, fluid, par; xBC = :periodic)
         # a2 = 1 with ρ_old = ρ keeps the BD2 mass source zero
         fluid.rhoo .= fluid.rho;  fluid.rhooo .= fluid.rho
         return fluid, phase, dyrel, grid, par, scales

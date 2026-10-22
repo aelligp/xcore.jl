@@ -20,35 +20,33 @@
 @kernel function velocity_bc_z_kernel!(v, ρf, @Const(MFS), top_cnv, bot_cnv,
                                         mfs_mean, Ddom, mode, h)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        D = length(I)
-        for d in 2:D
-            A = v[d]
-            if inside_except(I, A, 1)
-                n = size(A, 1)
-                A[replace_index(I, 1, 1)] = -top_cnv * A[replace_index(I, 1, 2)]
-                A[replace_index(I, 1, n)] = -bot_cnv * A[replace_index(I, 1, n - 1)]
-            end
+    D = length(I)
+    for d in 2:D
+        A = v[d]
+        if inside_except(I, A, 1)
+            n = size(A, 1)
+            A[replace_index(I, 1, 1)] = -top_cnv * A[replace_index(I, 1, 2)]
+            A[replace_index(I, 1, n)] = -bot_cnv * A[replace_index(I, 1, n - 1)]
         end
-        W = v[1]
-        if all(ntuple(k -> k == 1 || 2 <= I[k] <= size(W, k) - 1, Val(D)))
-            nb = size(W, 1)
-            W[I] = zero(eltype(W))
-            o  = oneunit(I)
-            Ib = replace_index(I, 1, nb)                 # bottom W face
-            cb = replace_index(I - o, 1, nb - 1)         # bottom cell row, compact
-            if mode == 0
-                W[Ib] = zero(eltype(W))
-            elseif mode == 1
-                W[Ib] = mfs_mean * Ddom / ρf[1][cb + unit_index(cb, 1)]
-            elseif mode == 2
-                s = tuple_foldl(MFS[cb] * h + ρf[1][cb] * W[cb + o - unit_index(cb, 1)],
-                            ntuple(k -> k + 1, Val(D - 1))) do acc, k
-                    ek = unit_index(cb, k)
-                    @inbounds acc - ρf[k][cb + ek] * v[k][cb + o] + ρf[k][cb] * v[k][cb + o - ek]
-                end
-                W[Ib] = s / ρf[1][cb + unit_index(cb, 1)]
+    end
+    W = v[1]
+    if all(ntuple(k -> k == 1 || 2 <= I[k] <= size(W, k) - 1, Val(D)))
+        nb = size(W, 1)
+        W[I] = zero(eltype(W))
+        o  = oneunit(I)
+        Ib = replace_index(I, 1, nb)                 # bottom W face
+        cb = replace_index(I - o, 1, nb - 1)         # bottom cell row, compact
+        if mode == 0
+            W[Ib] = zero(eltype(W))
+        elseif mode == 1
+            W[Ib] = mfs_mean * Ddom / ρf[1][cb + unit_index(cb, 1)]
+        elseif mode == 2
+            s = tuple_foldl(MFS[cb] * h + ρf[1][cb] * W[cb + o - unit_index(cb, 1)],
+                        ntuple(k -> k + 1, Val(D - 1))) do acc, k
+                ek = unit_index(cb, k)
+                acc - ρf[k][cb + ek] * v[k][cb + o] + ρf[k][cb] * v[k][cb + o - ek]
             end
+            W[Ib] = s / ρf[1][cb + unit_index(cb, 1)]
         end
     end
 end
@@ -56,28 +54,26 @@ end
 # horizontal pass along axis a over its boundary plane (I[a] = 1)
 @kernel function velocity_bc_h_kernel!(v, axis, periodic::Bool, sds)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        a = unval(axis)
-        for d in 1:length(I)
-            A = v[d]
-            if inside_except(I, A, a)
-                n = size(A, a)
-                i1 = replace_index(I, a, 1);  i2 = replace_index(I, a, 2)
-                im = replace_index(I, a, n - 1);  in_ = replace_index(I, a, n)
-                if d == a
-                    if periodic
-                        A[in_] = A[i1]
-                    else
-                        A[i1]  = zero(eltype(A))
-                        A[in_] = zero(eltype(A))
-                    end
-                elseif periodic
-                    A[i1]  = A[im]
-                    A[in_] = A[i2]
+    a = unval(axis)
+    for d in 1:length(I)
+        A = v[d]
+        if inside_except(I, A, a)
+            n = size(A, a)
+            i1 = replace_index(I, a, 1);  i2 = replace_index(I, a, 2)
+            im = replace_index(I, a, n - 1);  in_ = replace_index(I, a, n)
+            if d == a
+                if periodic
+                    A[in_] = A[i1]
                 else
-                    A[i1]  = -sds * A[i2]
-                    A[in_] = -sds * A[im]
+                    A[i1]  = zero(eltype(A))
+                    A[in_] = zero(eltype(A))
                 end
+            elseif periodic
+                A[i1]  = A[im]
+                A[in_] = A[i2]
+            else
+                A[i1]  = -sds * A[i2]
+                A[in_] = -sds * A[im]
             end
         end
     end
@@ -110,15 +106,13 @@ end
 
 @kernel function pressure_bc_kernel!(P, axis, periodic::Bool)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        a = unval(axis);  n = size(P, a)
-        if periodic
-            P[replace_index(I, a, 1)] = P[replace_index(I, a, n - 1)]
-            P[replace_index(I, a, n)] = P[replace_index(I, a, 2)]
-        else
-            P[replace_index(I, a, 1)] = P[replace_index(I, a, 2)]
-            P[replace_index(I, a, n)] = P[replace_index(I, a, n - 1)]
-        end
+    a = unval(axis);  n = size(P, a)
+    if periodic
+        P[replace_index(I, a, 1)] = P[replace_index(I, a, n - 1)]
+        P[replace_index(I, a, n)] = P[replace_index(I, a, 2)]
+    else
+        P[replace_index(I, a, 1)] = P[replace_index(I, a, 2)]
+        P[replace_index(I, a, n)] = P[replace_index(I, a, n - 1)]
     end
 end
 

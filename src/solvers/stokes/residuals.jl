@@ -16,6 +16,10 @@
 #   R_P = (fscale·MFS − ∇·(ρv) − (P − P0)/(η_b·dt))/ρ + bext_P.
 # The last term is the multigrid smoother's pseudo-transient regularizer; the
 # single-grid solver passes dt = Inf, which removes it.
+#
+# These kernels keep `@inbounds`: they run every pseudo-transient iteration, and
+# bounds checks here slow :dyrel/:gmg/:vmg by ~19%. Each launch's ndrange is the
+# size of its compact output, and all reads go through ghosted inputs.
 
 # normal strain rates ∂_k v_k at cell c, all k
 Base.@propagate_inbounds @inline function strain_rates(v, c::CartesianIndex{D}, invh) where {D}

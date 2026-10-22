@@ -82,16 +82,15 @@ pressure_change_norm(ΔP, fluid, h::Real) =
     relative_to_pressure_scale(deviation_rms(ΔP), fluid, h)
 
 function relative_to_pressure_scale(dP::T, fluid, h::Real) where {T}
-    scale = max(pressure_deviation_rms(fluid.P), deviatoric_stress_rms(fluid, T(inv(h))))
+    scale = max(deviation_rms(interior(fluid.P)), deviatoric_stress_rms(fluid, T(inv(h))))
     return scale > zero(T) ? dP / scale : dP
 end
 
-# RMS of an array about its mean (two passes: the mean can dominate)
+# RMS of an array about its mean (two passes: the mean can dominate).
 function deviation_rms(A)
     m = sum(A) / length(A)
     return sqrt(sum(lazy_broadcast(a -> abs2(a - m), A)) / length(A))
 end
-pressure_deviation_rms(P) = deviation_rms(interior(P))
 
 # view of a ghosted velocity component: `r_along` along axis `along`, the full
 # range along every axis in `full`, the interior (ghosts removed) elsewhere

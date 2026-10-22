@@ -3,8 +3,8 @@ using KernelAbstractions
 """
     xcore_zeros(backend, T, dims...) -> array
 
-Backend-aware zero allocation. Thin wrapper around `KernelAbstractions.zeros`
-so call sites in the package don't need to import KA directly.
+Zero-filled array on `backend`, a wrapper around `KernelAbstractions.zeros`
+that checks the backend first.
 
 Pick `backend = CPU()` for host arrays; pass a GPU backend (e.g. `CUDABackend()`)
 for device arrays. Throws if the backend reports itself non-functional (broken
@@ -23,10 +23,9 @@ end
 """
     adapt_backend(backend, A::AbstractArray) -> array
 
-Move a host array `A` onto `backend`, preserving element type (incl. complex).
-Used for setup-time constants (e.g. the noise Gaussian FFT filters) that are
-cheaper to build on the CPU and then transfer once. For `backend = CPU()` this
-is a copy; for a GPU backend it allocates a device array and copies into it.
+Copy the host array `A` onto `backend`, preserving the element type (including
+complex). For setup-time constants such as the noise FFT filters, which are
+built on the CPU and transferred once. For `backend = CPU()` this is a copy.
 """
 function adapt_backend(backend, A::AbstractArray{S}) where {S}
     d = KernelAbstractions.allocate(backend, S, size(A))
@@ -38,8 +37,7 @@ end
     interior(f::AbstractArray, halo::Integer = 1) -> SubArray
 
 View into the interior of a halo'd field, excluding `halo` rings on every
-side. Used both to read interior values for comparison and to assign into the
-interior from MATLAB-sized arrays.
+side.
 """
 interior(f::AbstractArray{<:Any, D}, halo::Integer = 1) where {D} =
     view(f, ntuple(k -> (halo + 1):(size(f, k) - halo), Val(D))...)

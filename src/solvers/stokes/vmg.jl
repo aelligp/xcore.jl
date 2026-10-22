@@ -86,36 +86,32 @@ end
 
 @kernel function cc_residual_kernel!(r, @Const(p), @Const(f), w, periodic, invh2)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        D = length(I);  pc = p[I]
-        acc = zero(pc)
-        for k in 1:D
-            n = size(p, k);  ek = unit_index(I, k)
-            if I[k] > 1
-                acc += w[k] * (pc - p[I - ek])
-            elseif periodic[k]
-                acc += w[k] * (pc - p[replace_index(I, k, n)])
-            end
-            if I[k] < n
-                acc += w[k] * (pc - p[I + ek])
-            elseif periodic[k]
-                acc += w[k] * (pc - p[replace_index(I, k, 1)])
-            end
+    D = length(I);  pc = p[I]
+    acc = zero(pc)
+    for k in 1:D
+        n = size(p, k);  ek = unit_index(I, k)
+        if I[k] > 1
+            acc += w[k] * (pc - p[I - ek])
+        elseif periodic[k]
+            acc += w[k] * (pc - p[replace_index(I, k, n)])
         end
-        r[I] = f[I] - acc * invh2
+        if I[k] < n
+            acc += w[k] * (pc - p[I + ek])
+        elseif periodic[k]
+            acc += w[k] * (pc - p[replace_index(I, k, 1)])
+        end
     end
+    r[I] = f[I] - acc * invh2
 end
 
 @kernel function cc_jacobi_kernel!(p, @Const(r), w, periodic, invh2, ω)
     I = @index(Global, Cartesian)
-    @inbounds begin
-        D = length(I)
-        diag = tuple_foldl(zero(eltype(p)), ntuple(identity, Val(D))) do s, k
-            n = size(p, k)
-            s + (periodic[k] ? 2 : (I[k] > 1) + (I[k] < n)) * w[k]
-        end
-        p[I] += ω * r[I] / (diag * invh2)
+    D = length(I)
+    diag = tuple_foldl(zero(eltype(p)), ntuple(identity, Val(D))) do s, k
+        n = size(p, k)
+        s + (periodic[k] ? 2 : (I[k] > 1) + (I[k] < n)) * w[k]
     end
+    p[I] += ω * r[I] / (diag * invh2)
 end
 
 function cc_sweeps!(w, n, wk, periodic)
@@ -153,11 +149,11 @@ function cc_update!(ws, fluid, c::StokesCache{D, T}, ω, op::StokesOp{D}) where 
     wk = map(inv, op.cin)
     f = ws[1].f
     @. f = fluid.rho * c.R_P
-    f .-= sum(f) / length(f)
+    remove_mean!(f)
     fill!(ws[1].p, 0)
     cc_vcycle!(ws, 1, wk, op.periodic)
     p = ws[1].p
-    p .-= sum(p) / length(p)
+    remove_mean!(p)
     Pint = interior(fluid.P)
     @. Pint += T(ω / op.dt) * p
     return nothing
@@ -197,9 +193,9 @@ function fluidmech_vmg!(fluid, phase, hier::MGHierarchy{T}, grid, par::Parameter
     isfinite(dt) || throw(ArgumentError(
         "fluidmech_vmg!: dt must be finite (got $dt); the drunken-sailor term ∂ρ·g0·dt scales with dt"))
     op = StokesOp(T, dims_val(grid), par; a1, a2, a3, gamma, dt, xBC, yBC, zBC, sds, top_cnv, bot_cnv)
-    lvl1 = hier.levels[1];  c = lvl1.cache
+    c = hier.levels[1].cache
     @timeit_debug TO "setup" begin
-    P0arr = P0 === nothing ? copyto!(hier.levels[1].cache.P0, fluid.P) : P0
+    P0arr = P0 === nothing ? copyto!(c.P0, fluid.P) : P0
     bnchm || update_mass_source!(fluid, phase, par, dt; a1, a2, a3, b1, b2, b3)
     momentum_advection!(c, fluid, grid, par, op)
     mfs_mean = bnchm ? zero(T) : T(sum(fluid.MFS) / length(fluid.MFS))

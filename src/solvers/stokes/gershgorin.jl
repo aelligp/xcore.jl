@@ -24,47 +24,45 @@
                                      @Const(ρf), @Const(rho), periodic,
                                      invh2, invh, cn, cc, cs, iner, g0dt)
     J = @index(Global, Cartesian)
-    @inbounds begin
-        d  = unval(comp)
-        D  = length(J)
-        Nd = size(η, d)
-        ed = unit_index(J, d)
-        ρd = ρf[d]
-        wall = d != 1 && !periodic[d] && (J[d] == 1 || J[d] == Nd + 1)
-        lo = J[d] == 1      ? (d == 1 ? J : replace_index(J, d, Nd)) : J - ed
-        hi = J[d] == Nd + 1 ? (d == 1 ? J - ed : replace_index(J, d, 1)) : J
-        η_hi = η[hi];  η_lo = η[lo]
-        gρ_hi = γ_eff[hi] / rho[hi];  gρ_lo = γ_eff[lo] / rho[lo]
-        γ_diag = ρd[J] * (gρ_hi + gρ_lo)
-        ks = other_axes(comp, Val(D))
-        shear2 = tuple_foldl(zero(η_hi), ks) do s, k
-            @inbounds s + cs * (ηe[pair_index(d, k, D)][J + unit_index(J, k)] + ηe[pair_index(d, k, D)][J]) * invh2
-        end
-        shear1 = tuple_foldl(zero(η_hi), ks) do s, k
-            @inbounds s + cs * (ηe[pair_index(d, k, D)][J + unit_index(J, k)] + ηe[pair_index(d, k, D)][J]) * invh
-        end
-        # cross coupling to component k: the k-faces of cells hi and lo; the
-        # upper face shares the upper edge viscosity, the lower face the lower
-        cross = tuple_foldl(zero(η_hi), ks) do s, k
-            @inbounds begin
-                ek = unit_index(J, k);  ηp = ηe[pair_index(d, k, D)]
-                e1 = ηp[J + ek];  e2 = ηp[J];  ρk = ρf[k]
-                s + (abs(gρ_hi * ρk[hi + ek] - cc * η_hi + cs * e1) +
-                     abs(gρ_hi * ρk[hi]      - cc * η_hi + cs * e2) +
-                     abs(gρ_lo * ρk[lo + ek] - cc * η_lo + cs * e1) +
-                     abs(gρ_lo * ρk[lo]      - cc * η_lo + cs * e2)) * invh2
-            end
-        end
-        diagv  = (shear1 + cn * (η_hi + η_lo) * invh) * invh
-        # same-component neighbors: the d-faces across cells hi and lo
-        C_same = shear2 + (gρ_hi * ρd[hi + ed] + cn * η_hi) * invh2 +
-                 (gρ_lo * ρd[lo] + cn * η_lo) * invh2 + diagv + γ_diag * invh2
-        δ = iner * ρd[J]
-        σ = (rho[hi] - rho[lo]) * invh * g0dt
-        Dv = diagv + γ_diag * invh2 + δ + max(σ, zero(σ))
-        Dd[J] = wall ? one(Dv) : Dv
-        λd[J] = wall ? one(Dv) : (C_same + cross + δ + abs(σ)) / Dv
+    d  = unval(comp)
+    D  = length(J)
+    Nd = size(η, d)
+    ed = unit_index(J, d)
+    ρd = ρf[d]
+    wall = d != 1 && !periodic[d] && (J[d] == 1 || J[d] == Nd + 1)
+    lo = J[d] == 1      ? (d == 1 ? J : replace_index(J, d, Nd)) : J - ed
+    hi = J[d] == Nd + 1 ? (d == 1 ? J - ed : replace_index(J, d, 1)) : J
+    η_hi = η[hi];  η_lo = η[lo]
+    gρ_hi = γ_eff[hi] / rho[hi];  gρ_lo = γ_eff[lo] / rho[lo]
+    γ_diag = ρd[J] * (gρ_hi + gρ_lo)
+    ks = other_axes(comp, Val(D))
+    shear2 = tuple_foldl(zero(η_hi), ks) do s, k
+        s + cs * (ηe[pair_index(d, k, D)][J + unit_index(J, k)] + ηe[pair_index(d, k, D)][J]) * invh2
     end
+    shear1 = tuple_foldl(zero(η_hi), ks) do s, k
+        s + cs * (ηe[pair_index(d, k, D)][J + unit_index(J, k)] + ηe[pair_index(d, k, D)][J]) * invh
+    end
+    # cross coupling to component k: the k-faces of cells hi and lo; the
+    # upper face shares the upper edge viscosity, the lower face the lower
+    cross = tuple_foldl(zero(η_hi), ks) do s, k
+        begin
+            ek = unit_index(J, k);  ηp = ηe[pair_index(d, k, D)]
+            e1 = ηp[J + ek];  e2 = ηp[J];  ρk = ρf[k]
+            s + (abs(gρ_hi * ρk[hi + ek] - cc * η_hi + cs * e1) +
+                 abs(gρ_hi * ρk[hi]      - cc * η_hi + cs * e2) +
+                 abs(gρ_lo * ρk[lo + ek] - cc * η_lo + cs * e1) +
+                 abs(gρ_lo * ρk[lo]      - cc * η_lo + cs * e2)) * invh2
+        end
+    end
+    diagv  = (shear1 + cn * (η_hi + η_lo) * invh) * invh
+    # same-component neighbors: the d-faces across cells hi and lo
+    C_same = shear2 + (gρ_hi * ρd[hi + ed] + cn * η_hi) * invh2 +
+             (gρ_lo * ρd[lo] + cn * η_lo) * invh2 + diagv + γ_diag * invh2
+    δ = iner * ρd[J]
+    σ = (rho[hi] - rho[lo]) * invh * g0dt
+    Dv = diagv + γ_diag * invh2 + δ + max(σ, zero(σ))
+    Dd[J] = wall ? one(Dv) : Dv
+    λd[J] = wall ? one(Dv) : (C_same + cross + δ + abs(σ)) / Dv
 end
 
 """
@@ -95,20 +93,18 @@ end
 # exactly in the boundary cells.
 @kernel function penalty_kernel!(γ_eff, @Const(Dv), @Const(ρf), @Const(rho), periodic, invh2, γ)
     c = @index(Global, Cartesian)
-    @inbounds begin
-        D = length(c);  Z = zero(eltype(γ_eff))
-        sfac = tuple_foldl(Z, hz_axes(Val(D))) do s, k
-            ek = unit_index(c, k)
-            fixed = k == 1 || !periodic[k]
-            @inbounds begin
-                lo = fixed && c[k] == 1            ? Z : ρf[k][c] / Dv[k][c]
-                hi = fixed && c[k] == size(γ_eff, k) ? Z : ρf[k][c + ek] / Dv[k][c + ek]
-            end
-            s + lo + hi
+    D = length(c);  Z = zero(eltype(γ_eff))
+    sfac = tuple_foldl(Z, hz_axes(Val(D))) do s, k
+        ek = unit_index(c, k)
+        fixed = k == 1 || !periodic[k]
+        begin
+            lo = fixed && c[k] == 1            ? Z : ρf[k][c] / Dv[k][c]
+            hi = fixed && c[k] == size(γ_eff, k) ? Z : ρf[k][c + ek] / Dv[k][c + ek]
         end
-        s_P = sfac * invh2 / rho[c]
-        γ_eff[c] = γ / s_P
+        s + lo + hi
     end
+    s_P = sfac * invh2 / rho[c]
+    γ_eff[c] = γ / s_P
 end
 
 """
@@ -133,8 +129,7 @@ function penalty!(cache::StokesCache{D, T}, fluid, grid, op::StokesOp{D};
     penalty_kernel!(KernelAbstractions.get_backend(cache.γ_eff))(
         cache.γ_eff, cache.Dv, face_density(fluid), fluid.rho, op.periodic,
         T(inv(grid.h)^2), T(γfact); ndrange = size(cache.γ_eff))
-    dtT = op.dt
-    @. cache.η_b = cache.γ_eff * max(one(T), inv(fluid.rho * dtT))
+    @. cache.η_b = cache.γ_eff * max(one(T), inv(fluid.rho * op.dt))
     gershgorin!(cache, fluid, grid, op)
     return nothing
 end

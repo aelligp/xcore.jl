@@ -8,9 +8,8 @@ using TOML, Crayons
 using TimerOutputs
 using WriteVTK: vtk_grid, VTKCellData, VTKPointData, paraview_collection, collection_add_timestep
 
-# Module-level timer for solver profiling. All timed regions use
-# `@timeit_debug TO "..."`, which compiles to a no-op unless debug timings are
-# enabled — so the default (production) path carries ZERO overhead. To profile:
+# Solver profiling timer. Timed regions use `@timeit_debug TO "..."`, a no-op
+# unless debug timings are enabled. To profile:
 #
 #   xcore.enable_solver_timings(); reset_timer!(xcore.TO)
 #   ... run solves ...
@@ -18,9 +17,9 @@ using WriteVTK: vtk_grid, VTKCellData, VTKPointData, paraview_collection, collec
 #
 const TO = TimerOutput()
 
-"""Enable `@timeit_debug` regions in xcore and its Stokes submodule (all solver phases)."""
+"""Enable the `@timeit_debug` regions of xcore and its Stokes submodule."""
 enable_solver_timings()  = (foreach(TimerOutputs.enable_debug_timings, (@__MODULE__, Stokes)); nothing)
-"""Disable `@timeit_debug` regions, restoring zero-overhead production behaviour."""
+"""Disable the `@timeit_debug` regions."""
 disable_solver_timings() = (foreach(TimerOutputs.disable_debug_timings, (@__MODULE__, Stokes)); nothing)
 
 include("setup/parameters.jl")
@@ -45,13 +44,12 @@ include("io/output.jl")
 include("io/vtk.jl")
 include("io/restart.jl")
 include("driver/run.jl")
-# Matrix-free Stokes/Navier–Stokes solvers (:dyrel, :gmg, :vmg), one
-# implementation for D = 2 and D = 3. Included after update.jl/phsevo.jl, whose
-# kernels it imports.
+# Matrix-free solvers (:dyrel, :gmg, :vmg) for D = 2 and 3; they import kernels
+# from update.jl and phsevo.jl, so they are included after those.
 include("solvers/stokes/Stokes.jl")
 using .Stokes: StokesCache, DyrelCache, fluidmech_dyrel!, fluidmech_gmg!, fluidmech_vmg!,
                build_hierarchy
-# Solver-strategy dispatch; `run!` uses `make_solver`/`solve_fluidmech!` from here.
+# Solver dispatch: `make_solver` and `solve_fluidmech!`, used by `run!`.
 include("solvers/dispatch.jl")
 include("io/plotting.jl")
 
@@ -78,7 +76,7 @@ export save_vtk
 export StokesCache, DyrelCache, fluidmech_dyrel!, fluidmech_gmg!, fluidmech_vmg!, build_hierarchy
 export TO, enable_solver_timings, disable_solver_timings
 
-function _print_banner(io::IO)
+function print_banner(io::IO)
     x = string(Crayon(foreground = (26, 12, 100)))
     c = string(Crayon(foreground = (44, 81, 146)))
     o = string(Crayon(foreground = (90, 139, 163)))
@@ -104,11 +102,10 @@ Commit date: $(try strip(read(`git log -1 --pretty=%cd`, String)) catch _ "N/A" 
 end
 
 function __init__(io::IO = stdout)
-    # Threaded BLAS — UMFPACK's dense kernels pick this up automatically;
-    # 1.3-2× speedup on the Stokes factor at medium grids.
+    # UMFPACK's dense kernels use the BLAS threads.
     LinearAlgebra.BLAS.set_num_threads(max(1, Threads.nthreads()))
     isa(stdout, Base.TTY) || return
-    _print_banner(io)
+    print_banner(io)
     return nothing
 end
 

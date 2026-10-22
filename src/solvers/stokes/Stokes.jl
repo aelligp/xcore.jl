@@ -1,8 +1,8 @@
 # Dimension-generic matrix-free Stokes/Navier–Stokes solvers: one implementation
-# for D = 2 and D = 3 (`FluidState{T,D}`, `Grid{T,D}`). Kernels
-# run over `CartesianIndex{D}` with compile-time unit offsets; the velocity is the
-# tuple `velocity(fluid)` with one component per axis. See `layout.jl` for the
-# axis conventions and array shapes.
+# for D = 2 and D = 3 (`FluidState{T,D}`, `Grid{T,D}`). Kernels run over
+# `CartesianIndex{D}` with compile-time unit offsets; the velocity is the tuple
+# `velocity(fluid)` with one component per axis. See `layout.jl` for the axis
+# conventions and array shapes.
 #
 #   fluidmech_dyrel!  dynamic relaxation inside a Powell–Hestenes iteration
 #   fluidmech_gmg!    coupled geometric-multigrid V-cycles, DR sweep as smoother
@@ -22,7 +22,7 @@ using ..xcore: TO, Grid, Parameters, Scales, FluidState,
                face_mean!, edge_geomean!, foreach_axis,
                update_kinematics!, update_viscosity!,
                ADVN_SCHEMES, face_fluxes, ghost_index, ghost_face_index,
-               unval, unit_index, replace_index, hz_axes, hz_vaxes, tuple_foldl
+               unval, unit_index, replace_index, hz_axes, tuple_foldl
 
 import ..xcore: cells
 
