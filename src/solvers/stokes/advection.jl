@@ -106,8 +106,9 @@ function momentum_advection!(cache::StokesCache{D, T}, fluid, grid, op::StokesOp
     foreach_axis(Val(D)) do comp
         d = unval(comp);  own = op.periodic[d]
         n = ntuple(k -> k == d ? (own ? N[k] + 1 : N[k] - 1) : N[k], Val(D))
-        momentum_advection_kernel!(backend)(cache.advn[d], comp, v, ρf[d], scheme, op.periodic,
-                                             N, n, S === :tvdim, invh, T(0.5); ndrange = n)
+        # fixed workgroup: PoCL (KA 0.10 CPU) crashes on this kernel at large auto-tuned workgroups
+        momentum_advection_kernel!(backend, 256)(cache.advn[d], comp, v, ρf[d], scheme, op.periodic,
+                                                 N, n, S === :tvdim, invh, T(0.5); ndrange = n)
         advection_boundary_kernel!(backend)(cache.advn[d], comp, own;
                                              ndrange = ntuple(k -> k == d ? 1 : size(cache.advn[d], k), Val(D)))
     end

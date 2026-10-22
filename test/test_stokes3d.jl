@@ -223,3 +223,18 @@ end
     @test res.PH_iters <= 12
     @test maximum(abs, fluid.W) > 0
 end
+
+# The default PoCL workgroup on this grid crashes the process in the weno5
+# momentum-advection kernel; the test guards the fixed workgroup size.
+@testset "momentum advection launches on a 32×48×48 grid" begin
+    Random.seed!(7)
+    par = Parameters(Float64; D = 1e1, N = 32, L = 1e1 * 1.5, ADVN = :weno5, solver = :dyrel)
+    grid = Grid(par, Val(3))
+    fluid = FluidState(Float64, CPU(), grid)
+    foreach(a -> a .= randn(size(a)), XC.velocity(fluid))
+    foreach(a -> a .= 1 .+ rand(size(a)...), XC.face_density(fluid))
+    cache = XC.make_solver(par, fluid, PhaseState(Float64, CPU(), grid), grid).cache
+    op = S3.StokesOp(Float64, Val(3), par; a1 = 1, a2 = 1, a3 = 0, gamma = par.gamma, dt = 1.0)
+    S3.momentum_advection!(cache, fluid, grid, par, op)
+    @test all(a -> all(isfinite, a), cache.advn)
+end

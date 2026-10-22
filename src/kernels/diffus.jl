@@ -22,7 +22,7 @@ Base.@propagate_inbounds @inline _ghosted(A, c, k, m, periodic) =
             fc = f[c];  kc = k[c]
             hi = (_ghosted(k, c, d, 1, periodic) + kc) * (_ghosted(f, c, d, 1, periodic) - fc)
             lo = (kc + _ghosted(k, c, d, -1, periodic)) * (fc - _ghosted(f, c, d, -1, periodic))
-            return hi, lo
+            (hi, lo)
         end
         q1 = flux(ax[1])
         acc = tuple_foldl((s, a) -> (q = flux(a); s + q[1] - q[2]), q1[1] - q1[2], Base.tail(ax))
