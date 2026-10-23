@@ -53,7 +53,9 @@ function save_output(phase::PhaseState, fluid::FluidState,
         frame_path = restart_path(outdir, runID; frame)
         cont_path  = restart_path(outdir, runID; frame = -1)
         save_checkpoint(frame_path, phase, fluid, ns, hst; time, dt, step)
-        cp(frame_path, cont_path; force = true)
+        # a hard link: the continuation file shares the frame's data on disk
+        rm(cont_path; force = true)
+        hardlink(frame_path, cont_path)
     end
 
     return nothing

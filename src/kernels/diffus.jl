@@ -60,7 +60,6 @@ function diffus!(dff::AbstractArray, f::AbstractArray, k, h::Real;
     periodic = periodic_axes("diffus!", Val(ndims(f)), xBC, yBC, zBC)
     T = eltype(dff);  backend = KernelAbstractions.get_backend(dff)
     diffus_kernel!(backend)(dff, f, k, periodic, T(inv(h)^2), T(0.5); ndrange = size(dff))
-    KernelAbstractions.synchronize(backend)
     return dff
 end
 
@@ -81,7 +80,6 @@ function diffus_with_flux!(dff::AbstractArray, q::Tuple, f::AbstractArray, k, h:
         qd = face_interior(q[d], d)
         diffus_flux_kernel!(backend)(qd, f, k, Val(d), periodic, T(inv(h)), T(0.5); ndrange = size(qd))
     end
-    KernelAbstractions.synchronize(backend)
     fill_face_ghosts!(q, periodic)
     return dff
 end

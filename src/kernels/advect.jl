@@ -189,7 +189,6 @@ function advect!(adv::AbstractArray, f::AbstractArray, v::Tuple, h::Real, scheme
     s, periodic = advection_setup("advect!", adv, f, v, scheme, xBC, yBC, zBC)
     T = eltype(adv);  backend = KernelAbstractions.get_backend(adv)
     advect_kernel!(backend)(adv, f, v, s, periodic, T(inv(h)), T(0.5); ndrange = size(adv))
-    KernelAbstractions.synchronize(backend)
     return adv
 end
 
@@ -213,7 +212,6 @@ function advect_with_flux!(adv::AbstractArray, q::Tuple, f::AbstractArray, v::Tu
         advective_flux_kernel!(backend)(qi[d], f, v[d], Val(d), s, periodic, T(0.5); ndrange = size(qi[d]))
     end
     flux_divergence_kernel!(backend)(adv, qi, T(inv(h)); ndrange = size(adv))
-    KernelAbstractions.synchronize(backend)
     fill_face_ghosts!(q, periodic)
     return adv
 end

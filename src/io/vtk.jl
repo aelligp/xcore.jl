@@ -6,6 +6,9 @@
 # VTK arrays are ordered (x[, y], elevation) with elevation = -z, so the top
 # boundary sits at 0 and up is up in ParaView.
 
+# Host array holding the values of `x`; a host `Array` is returned as is.
+host(x) = x isa Array ? x : Array(x)
+
 """
     pack_velocity(velocity::Tuple, precision)
 
@@ -23,7 +26,7 @@ function pack_velocity(velocity::Tuple, precision)
     end
     velocity_field = zeros(precision, 3, size(first(velocity))...)
     for (i, v) in enumerate(velocity)
-        selectdim(velocity_field, 1, i) .= precision.(Array(v))
+        selectdim(velocity_field, 1, i) .= host(v)
     end
     return velocity_field
 end
@@ -37,7 +40,7 @@ A vertex grid holds one cell fewer than it has nodes per dimension, so the two
 sizes are always distinguishable.
 """
 function vtk_field(name, array, npoints, ncells, precision)
-    data = precision.(Array(array))
+    data = convert(Array{precision}, host(array))
     location = if size(data) == npoints
         VTKPointData()
     elseif size(data) == ncells
@@ -99,7 +102,7 @@ end
 Host copy of the (z, x[, y]) array `A`, reordered to (x[, y], elevation).
 """
 vtk_order(A::AbstractArray{<:Any, D}) where {D} =
-    reverse(permutedims(Array(A), (2:D..., 1)); dims = D)
+    reverse!(permutedims(host(A), (2:D..., 1)); dims = D)
 
 """
     vtk_coordinates(grid) -> (xvi, xci)

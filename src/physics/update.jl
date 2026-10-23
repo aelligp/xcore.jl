@@ -46,7 +46,6 @@ function update_volume_fractions!(phase::PhaseState{T}, fluid::FluidState{T},
                                      phase.x, phase.m, par.rhom0, par.rhox0,
                                      eps(T), one(T) - eps(T);
                                      ndrange = size(phase.x))
-    KernelAbstractions.synchronize(backend)
     return nothing
 end
 
@@ -175,7 +174,6 @@ function update_rheology!(phase::PhaseState{T}, par::Parameters{T}) where {T<:Ab
                                      CC[1,1], CC[1,2], CC[2,1], CC[2,2],
                                      par.etax0, par.etam0;
                                      ndrange = size(phase.etamix))
-    KernelAbstractions.synchronize(backend)
     return nothing
 end
 
@@ -272,7 +270,6 @@ function update_kinematics!(phase::PhaseState{T, D}, fluid::FluidState{T, D},
                                    ndrange = size(phase.eII))
     compute_segspeed_kernel!(backend)(phase.vx, phase.vm, phase.wx, phase.wm, eps(T);
                                       ndrange = size(phase.vx))
-    KernelAbstractions.synchronize(backend)
     return nothing
 end
 
@@ -324,7 +321,6 @@ function update_viscosity!(phase::PhaseState{T}, fluid::FluidState{T},
     backend = KernelAbstractions.get_backend(phase.etamix)
     compute_viscblend_kernel!(backend)(phase.etae, phase.ke, phase.fReL, phase.eII, fluid.rho,
                                        scales.L0; ndrange = size(fluid.eta))
-    KernelAbstractions.synchronize(backend)
 
     relax_capped!(fluid.eta, phase.etamix, phase.etae, par.etacntr, relaxation)
     # ReD uses the capped and blended eta
@@ -371,7 +367,6 @@ function update_segregation_viscosity!(phase::PhaseState{T, D}, fluid::FluidStat
                                      phase.vx, phase.V, fluid.rho, phase.ke,
                                      phase.fReL, phase.fRel, scales.l0;
                                      ndrange = size(phase.etas))
-    KernelAbstractions.synchronize(backend)
 
     # fixed 50/50 Picard relaxation (update.m:122-123, 127)
     relax_capped!(phase.etas, phase.etamix, phase.etat, par.etacntr, 1//2)
@@ -381,7 +376,6 @@ function update_segregation_viscosity!(phase::PhaseState{T, D}, fluid::FluidStat
     # etasw: geometric mean of etas across the compact z-faces
     periodic = periodic_axes("update_segregation_viscosity!", Val(D), xBC, yBC, zBC)
     face_mean!(phase.etasw, phase.etas, 1, periodic; mean2 = geometric_mean)
-    KernelAbstractions.synchronize(backend)
     return nothing
 end
 
@@ -395,7 +389,6 @@ function update_edge_viscosity!(fluid::FluidState{T, D}; xBC::Symbol = :periodic
                                 yBC::Symbol = :periodic, zBC::Symbol = :closed) where {T, D}
     periodic = periodic_axes("update_edge_viscosity!", Val(D), xBC, yBC, zBC)
     edge_geomean!(edge_viscosity(fluid), fluid.eta, periodic)
-    KernelAbstractions.synchronize(KernelAbstractions.get_backend(fluid.eta))
     return nothing
 end
 
@@ -431,7 +424,6 @@ function update_stresses!(phase::PhaseState{T, D}, fluid::FluidState{T, D},
     compute_stress_kernel!(backend)(stress_diag(phase), phase.tII, phase.Ra, fluid.eta,
                                     strain_diag(phase), tshear, phase.V, phase.kx,
                                     scales.D0, eps(T); ndrange = size(phase.tII))
-    KernelAbstractions.synchronize(backend)
     return nothing
 end
 

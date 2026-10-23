@@ -119,7 +119,6 @@ function ddx!(out::AbstractMatrix, f::AbstractMatrix, h::Real)
     backend = KernelAbstractions.get_backend(out)
     T = eltype(out)
     ddx_kernel!(backend)(out, f, T(inv(h)); ndrange = size(out))
-    KernelAbstractions.synchronize(backend)
     return out
 end
 
@@ -135,6 +134,5 @@ function ddz!(out::AbstractMatrix, f::AbstractMatrix, h::Real)
     backend = KernelAbstractions.get_backend(out)
     T = eltype(out)
     ddz_kernel!(backend)(out, f, T(inv(h)); ndrange = size(out))
-    KernelAbstractions.synchronize(backend)
     return out
 end
