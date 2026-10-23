@@ -35,8 +35,8 @@ par = Parameters(T;
     Da    = 0.01,
     Xi    = 0.5,
 
-    # :dyrel runs at any N; :vmg needs every side a multiple of 32 (N a multiple of 64)
-    solver = :dyrel,
+    # :dyrel runs at any N; :vmg needs every side even with half ≥ mg_minlvl
+    solver = :vmg,
     atol   = 1e-6,
 )
 

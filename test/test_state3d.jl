@@ -34,7 +34,10 @@ let T = Float64, Nz = 8, Nx = 6, Ny = 4
         hier = build_hierarchy(fl, g, par; minlvl = 16)
         @test [S.cells(l.grid) for l in hier.levels] == [(64, 64, 64), (32, 32, 32), (16, 16, 16)]
         @test hier.levels[1].fluid === fl
-        @test_throws ArgumentError build_hierarchy(FluidState(T, CPU(), 48, 48, 48),
-                                                   Grid((48, 48, 48), (1.0, 1.0, 1.0)), par)
+        g48 = Grid((32, 48, 48), (1.0, 1.5, 1.5))
+        hier = build_hierarchy(FluidState(T, CPU(), 32, 48, 48), g48, par)
+        @test [S.cells(l.grid) for l in hier.levels] == [(32, 48, 48), (16, 24, 24)]
+        @test_throws "at least two levels" build_hierarchy(FluidState(T, CPU(), 30, 48, 48),
+                                                           Grid((30, 48, 48), (1.0, 1.6, 1.6)), par)
     end
 end

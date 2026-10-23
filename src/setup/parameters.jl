@@ -103,7 +103,7 @@ Base.@kwdef struct Parameters{T<:AbstractFloat}
 
     # --- geometric multigrid (:gmg): the dyrel sweep smooths each level, only the
     # coarsest level is solved to tolerance ---
-    mg_minlvl::Int      = 16  # coarsen until min(Nz,Nx) would drop below this; the coarsest grid must still resolve the nonlinear rheology. Resolution must be a multiple of 32 (checked in build_hierarchy)
+    mg_minlvl::Int      = 16  # coarsen until min(Nz,Nx) would drop below this; the coarsest grid must still resolve the nonlinear rheology. Every side must be even with half ≥ mg_minlvl (checked in build_hierarchy)
     mg_npre::Int        = 2                  # pre-smooth PH steps per level (V-cycle down)
     mg_npost::Int       = 2                  # post-smooth PH steps per level (V-cycle up)
     mg_ncoarse::Int     = 20                 # max coarsest-level PH steps (solve-to-tolerance budget)

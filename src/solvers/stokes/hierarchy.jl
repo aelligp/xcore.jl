@@ -56,7 +56,7 @@ end
 Level 1 wraps `fluid` with a fresh cache; coarse levels own zero-initialized
 states down to the coarsest grid with every dimension ≥ `minlvl`. Coefficients
 are filled per solve by `refresh_coefficients!`. Defaults from `par.mg_*`.
-Every dimension must be a multiple of 32 (clean coarsening, GPU warps).
+The grid must coarsen at least once: every dimension even with half ≥ `minlvl`.
 """
 function build_hierarchy(fluid, grid, par::Parameters{T};
                          minlvl::Int = par.mg_minlvl, npre::Int = par.mg_npre,
@@ -64,12 +64,11 @@ function build_hierarchy(fluid, grid, par::Parameters{T};
                          coarse_rtol::Real = par.mg_coarse_rtol, inner::Int = par.mg_inner,
                          γ_mg::Real = par.mg_gamma) where {T}
     N = cells(grid)
-    all(n -> n % 32 == 0, N) || throw(ArgumentError(
-        "multigrid solvers need every grid dimension to be a multiple of 32 for clean " *
-        "coarsening and GPU-friendly sizes (got $(join(N, "×"))); e.g. N = 128/192/256 " *
-        "(with L = 1.5·D choose N a multiple of 64 so that Nx = 1.5N is a multiple of 32)"))
-    backend = KernelAbstractions.get_backend(fluid.P)
     nlev = n_levels(N; minlvl)
+    nlev ≥ 2 || throw(ArgumentError(
+        "multigrid needs at least two levels: every grid dimension must be even with " *
+        "half ≥ minlvl = $minlvl (got $(join(N, "×")))"))
+    backend = KernelAbstractions.get_backend(fluid.P)
     # Level 1's cache.P0 is set per solve. Coarse levels keep cache.P0 = 0:
     # their P is the pressure correction (started at 0 each cycle), so
     # (P − 0)/(η_b·dt) is the linearized pseudo-transient term the fine operator
