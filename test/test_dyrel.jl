@@ -485,10 +485,7 @@ end
         return (; res, nlev = length(hier.levels), par,
                 norms = _flat_norms(hier.levels[1].cache, fluid.rho))
     end
-    single = blob_gmg(1.0; mg_minlvl = 32, mg_ncoarse = 100)
-    @test single.nlev == 1
-    @test single.res.converged
-    @test all(<(single.par.atol_PH), single.norms)
+    @test_throws "multigrid needs at least two levels" blob_gmg(1.0; mg_minlvl = 32)
     for dt in (1.0, 0.1, 0.01)
         two = blob_gmg(dt)
         @test two.nlev == 2
