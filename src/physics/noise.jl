@@ -202,13 +202,14 @@ end
 forward_diff(A, k) = Broadcast.broadcasted(-, selectdim(A, k, 2:size(A, k)), selectdim(A, k, 1:size(A, k) - 1))
 
 # ξ = −∇×A on the compact faces of each axis, from the edge components of A
-# (h = 1 convention, as MATLAB `ddz(f, 1)`; the grid spacing is in the amplitude)
-function eddy_curl!(ξ::NTuple{2}, (Ay,)::Tuple)
+# (h = 1 convention, as MATLAB `ddz(f, 1)`; the grid spacing is in the amplitude).
+# `ξ` is a Tuple, not an NTuple: on GPUs a contiguous face view is a plain device array.
+function eddy_curl!(ξ::Tuple{AbstractArray, AbstractArray}, (Ay,)::Tuple)
     ξ[1] .= .-forward_diff(Ay, 2)
     ξ[2] .= forward_diff(Ay, 1)
     return ξ
 end
-function eddy_curl!(ξ::NTuple{3}, (Az, Ax, Ay)::Tuple)
+function eddy_curl!(ξ::Tuple{AbstractArray, AbstractArray, AbstractArray}, (Az, Ax, Ay)::Tuple)
     ξ[1] .= .-(forward_diff(Ay, 2) .- forward_diff(Ax, 3))
     ξ[2] .= .-(forward_diff(Az, 3) .- forward_diff(Ay, 1))
     ξ[3] .= .-(forward_diff(Ax, 1) .- forward_diff(Az, 2))

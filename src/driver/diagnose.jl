@@ -7,14 +7,12 @@ using LinearAlgebra: norm
 #   report_iter   — one line per Picard iteration (residual convergence)
 #   print_step!   — full per-step diagnostic block printed after each outer step
 
-geomean64(A) = exp(sum(log, max.(vec(Float64.(A)), 1e-300)) / length(A))
-
 # One "min / mean / max" line with numeric format `fmt` (a printf spec); the
-# centre statistic is `center(A)`, `unit` is shown in brackets, and `blank`
-# adds a trailing empty line to close a group.
-function print_stats(name, A, fmt, center = geomean64; unit = "", blank = false)
+# centre statistic is `center(A)`, all three are divided by `scale`, `unit` is
+# shown in brackets, and `blank` adds a trailing empty line to close a group.
+function print_stats(name, A, fmt, center = geomean; scale = 1, unit = "", blank = false)
     f = Printf.Format("    min %-4s= $fmt;  mean %-4s= $fmt;  max %-4s= $fmt")
-    Printf.format(stdout, f, name, minimum(A), name, center(A), name, maximum(A))
+    Printf.format(stdout, f, name, minimum(A) / scale, name, center(A) / scale, name, maximum(A) / scale)
     println(isempty(unit) ? "" : "  [$unit]", blank ? "\n" : "")
     return nothing
 end
@@ -117,35 +115,34 @@ function print_step!(step::Int, time::Real, dt::Real,
         @printf("    coefficients update   = %1.3e s/iter\n\n", Float64(t_upd) / n)
     end
 
-    f64(A, s = 1) = Float64.(A) ./ s
     # crystallinity & melt fraction (arithmetic means)
-    print_stats("x", f64(phase.x), "%.6f", mean)
-    print_stats("m", f64(phase.m), "%.6f", mean; blank = true)
+    print_stats("x", phase.x, "%.6f", mean)
+    print_stats("m", phase.m, "%.6f", mean; blank = true)
 
     # diffusivities (each normalised by its own scale)
-    print_stats("ks", f64(phase.ks, ks0), "%1.2e"; unit = "ks0")
-    print_stats("kx", f64(phase.kx, kx0), "%1.2e"; unit = "kx0")
-    print_stats("ke", f64(phase.ke, ke0), "%1.2e"; unit = "ke0", blank = true)
+    print_stats("ks", phase.ks, "%1.2e"; scale = ks0, unit = "ks0")
+    print_stats("kx", phase.kx, "%1.2e"; scale = kx0, unit = "kx0")
+    print_stats("ke", phase.ke, "%1.2e"; scale = ke0, unit = "ke0", blank = true)
 
     # density and viscosity
-    print_stats("rho", f64(fluid.rho, r0), "%.4f";  unit = "r0")
-    print_stats("eta", f64(fluid.eta, E0), "%1.2e"; unit = "E0", blank = true)
+    print_stats("rho", fluid.rho, "%.4f";  scale = r0, unit = "r0")
+    print_stats("eta", fluid.eta, "%1.2e"; scale = E0, unit = "E0", blank = true)
 
     # velocities
-    print_stats("V",  f64(phase.V,  W0), "%1.2e"; unit = "W0")
-    print_stats("vx", f64(phase.vx, w0), "%1.2e"; unit = "w0")
-    print_stats("vm", f64(phase.vm, w0), "%1.2e"; unit = "w0", blank = true)
+    print_stats("V",  phase.V,  "%1.2e"; scale = W0, unit = "W0")
+    print_stats("vx", phase.vx, "%1.2e"; scale = w0, unit = "w0")
+    print_stats("vm", phase.vm, "%1.2e"; scale = w0, unit = "w0", blank = true)
 
     # noise
-    print_stats("xie", f64(ns.xie, W0), "%1.2e"; unit = "W0")
-    print_stats("xix", f64(ns.xix, W0), "%1.2e"; unit = "W0")
-    print_stats("xis", f64(ns.xis, W0), "%1.2e"; unit = "W0", blank = true)
+    print_stats("xie", ns.xie, "%1.2e"; scale = W0, unit = "W0")
+    print_stats("xix", ns.xix, "%1.2e"; scale = W0, unit = "W0")
+    print_stats("xis", ns.xis, "%1.2e"; scale = W0, unit = "W0", blank = true)
 
     # dimensionless numbers
-    print_stats("Rc",  f64(phase.Rc),  "%1.2e"; unit = "-")
-    print_stats("Ra",  f64(phase.Ra),  "%1.2e"; unit = "-")
-    print_stats("ReD", f64(phase.ReD), "%1.2e"; unit = "-")
-    print_stats("Red", f64(phase.Red), "%1.2e"; unit = "-", blank = true)
+    print_stats("Rc",  phase.Rc,  "%1.2e"; unit = "-")
+    print_stats("Ra",  phase.Ra,  "%1.2e"; unit = "-")
+    print_stats("ReD", phase.ReD, "%1.2e"; unit = "-")
+    print_stats("Red", phase.Red, "%1.2e"; unit = "-", blank = true)
 
     return nothing
 end

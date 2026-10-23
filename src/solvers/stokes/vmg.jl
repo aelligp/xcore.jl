@@ -124,7 +124,7 @@ function cc_sweeps!(w, n, wk, periodic)
     return nothing
 end
 
-function cc_vcycle!(ws, l, wk, periodic; ν = 2)
+function cc_vcycle!(ws, l, wk, periodic; ν = 3)
     w = ws[l]
     if l == length(ws)
         cc_sweeps!(w, 20 * maximum(size(w.p)), wk, periodic)   # coarsest: Jacobi to near-convergence

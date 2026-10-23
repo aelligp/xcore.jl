@@ -39,7 +39,7 @@ end
 
 struct MGHierarchy{T, L, W}
     levels::Vector{L}     # levels[1] = finest
-    cc::Vector{W}         # per-level (p, f, r, h) of the Cahouet–Chabard Poisson V-cycle
+    cc::Vector{W}         # per-level (p, f, r, h) of the Cahouet–Chabard Poisson V-cycle (may be deeper than `levels`)
     minlvl::Int
     npre::Int
     npost::Int
@@ -79,8 +79,14 @@ function build_hierarchy(fluid, grid, par::Parameters{T};
         g = coarsen(g)
         push!(levels, MGLevel(g, similar_fluid(fluid, backend, cells(g)), StokesCache(T, backend, g)))
     end
-    cell(l) = xcore_zeros(backend, T, cells(l.grid)...)
-    cc = [(p = cell(l), f = cell(l), r = cell(l), h = T(l.grid.h)) for l in levels]
+    # The Cahouet–Chabard Poisson operator has constant coefficients, so its
+    # V-cycle continues below the Stokes levels down to two cells per side.
+    cc_dims = [cells(l.grid) for l in levels]
+    while all(n -> iseven(n) && n ≥ 4, last(cc_dims))
+        push!(cc_dims, last(cc_dims) .÷ 2)
+    end
+    cell(n) = xcore_zeros(backend, T, n...)
+    cc = [(p = cell(n), f = cell(n), r = cell(n), h = T(grid.h) * 2^(i - 1)) for (i, n) in enumerate(cc_dims)]
     return MGHierarchy{T, eltype(levels), eltype(cc)}(levels, cc, minlvl, npre, npost, ncoarse,
                                                       T(coarse_rtol), inner, T(γ_mg))
 end

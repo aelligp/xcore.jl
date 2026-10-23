@@ -5,7 +5,7 @@ using Statistics
 # 4 = std where present) is kept as `_min`, `_mean`/`_rms`/`_gm`, `_max` fields.
 
 rms(A)     = sqrt(mean(x -> x^2, A))
-geomean(A) = exp(mean(log, max.(A, eps(eltype(A)))))
+geomean(A) = exp(mean(log, A))
 
 # Append min, `center(A)` and max of `A` to the three history vectors.
 function push_range!(vmin, vcenter, vmax, A, center)

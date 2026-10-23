@@ -98,21 +98,24 @@ function slab_view(A::AbstractArray{<:Any, D}, along, r_along::UnitRange{Int}, f
     return view(A, ntuple(k -> k == along ? r_along : (k in full ? (1:size(A, k)) : (2:size(A, k) - 1)), Val(D))...)
 end
 
+# ½Σ τ_dd² in one cell from the upper/lower face velocities (x = hi₁, lo₁, hi₂, lo₂, …).
+# Vararg{Any, N}: an untyped `x...` is not specialized and allocates per cell.
+function normal_stress_sq(invh::T, η, x::Vararg{Any, N}) where {T, N}
+    g = ntuple(d -> (x[2d - 1] - x[2d]) * invh, Val(N ÷ 2))
+    dv = hz_sum(g) * T(1//3)
+    return T(1//2) * sum(map(gd -> abs2(η * (gd - dv)), g))
+end
+
 # RMS of τ_II = √(½Σ τ_dd² + Σ_{a<b} τ_ab²): normal stresses at cells, shear at
 # edges (boundary ghosts carry the BCs), with the residual kernels' stencils.
 function deviatoric_stress_rms(fluid, invh::T) where {T}
     v = velocity(fluid);  ηe = edge_viscosity(fluid)
     D = length(v)
-    third = T(1//3);  half = T(1//2)
+    half = T(1//2)
     hi(d) = slab_view(v[d], d, 2:size(v[d], d), ())
     lo(d) = slab_view(v[d], d, 1:size(v[d], d) - 1, ())
     args = ntuple(i -> isodd(i) ? hi((i + 1) ÷ 2) : lo(i ÷ 2), Val(2D))
-    normal = sum(lazy_broadcast(fluid.eta, args...) do η, x...
-        n = Val(length(x) ÷ 2)
-        g = ntuple(d -> (x[2d - 1] - x[2d]) * invh, n)
-        dv = hz_sum(g) * third
-        half * sum(ntuple(d -> abs2(η * (g[d] - dv)), n))
-    end) / length(fluid.eta)
+    normal = sum(lazy_broadcast(normal_stress_sq, invh, fluid.eta, args...)) / length(fluid.eta)
     shear = zero(T)
     for a in 1:D-1, b in a+1:D
         η = ηe[pair_index(a, b, D)]
